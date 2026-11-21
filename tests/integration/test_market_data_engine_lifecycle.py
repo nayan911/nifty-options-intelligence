@@ -13,7 +13,7 @@ sys.path.insert(0, str(scripts_dir))
 
 from run_market_data import MarketDataEngine
 
-from nifty_engine.core.interfaces import Tick
+from nifty_engine.core.interfaces import Candle, Tick
 from nifty_engine.data.fyers.instrument_master import NSE_FO_COLUMNS
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 
@@ -116,3 +116,83 @@ def test_market_data_engine_dynamic_option_rotation():
     assert "NSE:NIFTY25100PE" in engine.subscribed_option_symbols
 
     store.close()
+
+
+def test_market_data_engine_mixed_timeframe_handling():
+    """Verify that MarketDataEngine handles 1m, 5m, and 15m candles cleanly:
+    - 1m, 5m, and 15m bars are saved to DuckDB with exact timeframes.
+    - TechnicalAnalysisEngine maintains isolated histories for 1m, 5m, and 15m.
+    - Cross-timeframe pollution is completely eliminated.
+    """
+    store = DuckDBStore(db_path=":memory:")
+    engine = MarketDataEngine(store=store)
+
+    sym = "NSE:NIFTY26NOVFUT"
+    t1 = IST.localize(datetime(2026, 11, 23, 9, 15))
+
+    c1m = Candle(
+        symbol=sym,
+        timeframe="1m",
+        timestamp=t1,
+        open=25000.0,
+        high=25010.0,
+        low=24995.0,
+        close=25005.0,
+        volume=1000,
+        is_closed=True,
+    )
+    c5m = Candle(
+        symbol=sym,
+        timeframe="5m",
+        timestamp=t1,
+        open=25000.0,
+        high=25040.0,
+        low=24990.0,
+        close=25035.0,
+        volume=5000,
+        is_closed=True,
+    )
+    c15m = Candle(
+        symbol=sym,
+        timeframe="15m",
+        timestamp=t1,
+        open=25000.0,
+        high=25060.0,
+        low=24980.0,
+        close=25050.0,
+        volume=15000,
+        is_closed=True,
+    )
+
+    # Process all three closed timeframes
+    engine._on_candle_closed(c1m)
+    engine._on_candle_closed(c5m)
+    engine._on_candle_closed(c15m)
+
+    # Verify DuckDB persistence has 1 row per timeframe
+    with store._lock:
+        cnt_1m = store._conn.execute(
+            "SELECT COUNT(*) FROM candles WHERE symbol = ? AND timeframe = '1m'", [sym]
+        ).fetchone()[0]
+        cnt_5m = store._conn.execute(
+            "SELECT COUNT(*) FROM candles WHERE symbol = ? AND timeframe = '5m'", [sym]
+        ).fetchone()[0]
+        cnt_15m = store._conn.execute(
+            "SELECT COUNT(*) FROM candles WHERE symbol = ? AND timeframe = '15m'", [sym]
+        ).fetchone()[0]
+
+    assert cnt_1m == 1
+    assert cnt_5m == 1
+    assert cnt_15m == 1
+
+    # Verify TechnicalAnalysisEngine state isolation
+    state = engine.technical_engine.states[sym]
+    assert len(state.candles_1m) == 1
+    assert len(state.candles_5m) == 1
+    assert len(state.candles_15m) == 1
+    assert state.candles_1m[0].timeframe == "1m"
+    assert state.candles_5m[0].timeframe == "5m"
+    assert state.candles_15m[0].timeframe == "15m"
+
+    store.close()
+

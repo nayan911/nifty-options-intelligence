@@ -51,7 +51,7 @@ class MarketDataEngine:
         self.technical_engine = TechnicalAnalysisEngine(
             primary_index=settings.PRIMARY_INDEX,
             primary_futures="NSE:NIFTY26NOVFUT",
-            on_setup_eligible=self._on_setup_eligible,
+            on_setup_candidate=self._on_setup_candidate,
         )
         self.ws_client = FyersWebSocketClient(
             auth_provider=self.auth,
@@ -173,26 +173,30 @@ class MarketDataEngine:
         if snap.nearest_resistance:
             sr_str += f" | Res: {snap.nearest_resistance.nominal_price:.1f}"
 
-        vwap_str = f" | VWAP: {snap.vwap:.1f}" if snap.vwap else ""
-        rsi_str = f" | RSI: {snap.rsi:.1f}" if snap.rsi else ""
-        rvol_str = f" | RVOL: {snap.rvol:.2f}x" if snap.rvol else ""
+        vwap_str = f" | VWAP: {snap.vwap:.1f}" if snap.vwap is not None else ""
+        rsi_str = f" | RSI: {snap.rsi:.1f}" if snap.rsi is not None else ""
+        rvol_str = f" | RVOL: {snap.rvol:.2f}x" if snap.rvol is not None else ""
+        ema9_str = f" | EMA9: {snap.ema_9:.1f}" if snap.ema_9 is not None else " | EMA9: (warmup)"
+        atr_str = f" | ATR: {snap.atr:.1f}" if snap.atr is not None else " | ATR: (warmup)"
 
         sym_tag = snap.symbol.split(":")[-1]
+        warmup_tag = "READY" if snap.is_warmed_up else "WARMING_UP"
         print(
-            f"[TECH {sym_tag}] C: {snap.close:.2f} | Trend: {snap.trend_bias} | "
-            f"EMA9: {snap.ema_9:.1f}{vwap_str}{rsi_str}{rvol_str}{sr_str}"
+            f"[TECH {sym_tag} {snap.timeframe}] [{warmup_tag}] C: {snap.close:.2f} | Trend: {snap.trend_bias}"
+            f"{ema9_str}{atr_str}{vwap_str}{rsi_str}{rvol_str}{sr_str}"
         )
 
-    def _on_setup_eligible(self, setup: BreakoutContext, snap: TechnicalSnapshot) -> None:
+    def _on_setup_candidate(self, setup: BreakoutContext, snap: TechnicalSnapshot) -> None:
         """Invoked when a high-probability technical breakout & retest completes."""
         print(
-            f"\n{'='*70}\n"
-            f"  [ACTIONABLE BREAKOUT SETUP ELIGIBLE: {setup.direction.value}]\n"
-            f"{'='*70}\n"
-            f"Asset: {snap.symbol} | Level: {setup.level_id} ({setup.nominal_price:.1f})\n"
+            f"\n{'='*75}\n"
+            f"  [TECHNICAL_SETUP_CANDIDATE: {setup.direction.value}]\n"
+            f"  *** CANDIDATE ONLY: Options OI Flow, Greeks & Risk Validation Pending ***\n"
+            f"{'='*75}\n"
+            f"Asset: {snap.symbol} ({snap.timeframe}) | Level: {setup.level_id} ({setup.nominal_price:.1f})\n"
             f"Confirmed At: {snap.timestamp.strftime('%H:%M:%S')} | Trigger Price: {snap.close:.2f}\n"
-            f"Stop Loss: {setup.stop_loss} | Target: {setup.target_price} | Trend: {snap.trend_bias}\n"
-            f"{'='*70}\n"
+            f"Technical SL: {setup.stop_loss} | Technical Target: {setup.target_price} | Trend: {snap.trend_bias}\n"
+            f"{'='*75}\n"
         )
 
     def _get_initial_spot(self) -> float:
