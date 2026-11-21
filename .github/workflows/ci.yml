@@ -32,4 +32,4 @@ jobs:
 
     - name: Run Tests & Coverage
       run: |
-        PYTHONPATH=src pytest tests/ -v --cov=nifty_engine --cov-report=term-missing
+        PYTHONPATH=src:scripts pytest tests/ -v --cov=nifty_engine --cov-report=term-missing
