@@ -10,7 +10,8 @@ Strictly adheres to:
 """
 
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional
+
 import pytz
 
 from nifty_engine.core.interfaces import Candle, Tick

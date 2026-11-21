@@ -2,7 +2,7 @@
 
 import asyncio
 import time
-from typing import Optional
+
 from nifty_engine.core.config import settings
 from nifty_engine.core.interfaces import IRateLimiter
 

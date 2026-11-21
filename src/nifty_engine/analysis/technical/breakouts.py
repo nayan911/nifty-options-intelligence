@@ -11,10 +11,9 @@ All volume confirmation metrics strictly mandate NIFTY Futures RVOL (never 0-vol
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from nifty_engine.analysis.technical.support_resistance import PriceZone
-from nifty_engine.analysis.technical.trendlines import Trendline
 from nifty_engine.core.interfaces import BreakoutState, Candle
 
 
@@ -77,7 +76,6 @@ class BreakoutStateMachine:
     ) -> BreakoutContext:
         """Processes a newly closed candle against a PriceZone and transitions state."""
         approach_dist = max(self.approach_buffer_atr * atr_value, 4.0)
-        invalidation_dist = max(self.invalidation_buffer_atr * atr_value, 3.0)
 
         # 1. Initialize context if starting from scratch
         if context is None:

@@ -3,6 +3,7 @@
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional, Union
+
 import duckdb
 import pandas as pd
 
@@ -19,7 +20,11 @@ from nifty_engine.data.storage.schemas import CREATE_TABLES_SQL
 class DuckDBStore(IStorageEngine):
     """Local embedded columnar storage engine for ticks, candles, and option chains."""
 
-    def __init__(self, db_path: Optional[Union[str, Path]] = None) -> None:
+    def __init__(
+        self,
+        db_path: Optional[Union[str, Path]] = None,
+        batch_size: int = 50,
+    ) -> None:
         if db_path == ":memory:":
             self.db_path = ":memory:"
         else:
@@ -27,6 +32,8 @@ class DuckDBStore(IStorageEngine):
             path.parent.mkdir(parents=True, exist_ok=True)
             self.db_path = str(path)
 
+        self.batch_size = batch_size
+        self._tick_buffer: List[Tick] = []
         self._conn = duckdb.connect(self.db_path)
         self._init_schemas()
 
@@ -35,28 +42,19 @@ class DuckDBStore(IStorageEngine):
         self._conn.execute(CREATE_TABLES_SQL)
 
     def insert_tick(self, tick: Tick) -> None:
-        """Insert a single tick."""
-        self._conn.execute(
-            """
-            INSERT INTO ticks (
-                symbol, exchange_timestamp, local_timestamp, ltp, volume,
-                bid, ask, bid_qty, ask_qty, oi, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                tick.symbol,
-                tick.exchange_timestamp,
-                tick.local_timestamp,
-                tick.ltp,
-                tick.incremental_volume,
-                tick.bid,
-                tick.ask,
-                tick.bid_qty,
-                tick.ask_qty,
-                tick.oi,
-                tick.source,
-            ]
-        )
+        """Buffer a single tick for high-throughput single-writer batch insert."""
+        self._tick_buffer.append(tick)
+        if len(self._tick_buffer) >= self.batch_size:
+            self.flush_ticks()
+
+    def flush_ticks(self) -> int:
+        """Flush buffered ticks into DuckDB in a single batch."""
+        if not self._tick_buffer:
+            return 0
+        batch = list(self._tick_buffer)
+        self._tick_buffer.clear()
+        self.insert_ticks_bulk(batch)
+        return len(batch)
 
     def insert_ticks_bulk(self, ticks: List[Tick]) -> None:
         """High-performance bulk insert of ticks via Apache Arrow / Pandas DataFrame."""
@@ -263,5 +261,6 @@ class DuckDBStore(IStorageEngine):
             self._conn.unregister("strikes_staging")
 
     def close(self) -> None:
-        """Close connection to release file lock."""
+        """Flush any pending buffered ticks and close connection."""
+        self.flush_ticks()
         self._conn.close()

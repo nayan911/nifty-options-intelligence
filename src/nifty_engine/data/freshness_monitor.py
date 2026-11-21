@@ -9,6 +9,7 @@ Explicitly separates:
 
 from datetime import datetime, timedelta
 from typing import Dict, Optional
+
 import pytz
 
 from nifty_engine.core.interfaces import Tick

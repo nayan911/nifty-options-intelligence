@@ -1,8 +1,9 @@
 """Unit tests for ExchangeCalendar and market session transitions."""
 
 from datetime import date, datetime
-import pytz
+
 import pytest
+import pytz
 
 from nifty_engine.core.calendar import ExchangeCalendar
 from nifty_engine.core.interfaces import SessionState
@@ -65,9 +66,9 @@ def test_session_state_after_derivatives_close(calendar):
 
 
 def test_muhurat_trading_session(calendar):
-    # Muhurat trading test: 2026-11-01 between 18:15 and 19:15
-    dt_during = IST.localize(datetime(2026, 11, 1, 18, 30, 0))
-    dt_before = IST.localize(datetime(2026, 11, 1, 15, 0, 0))
+    # Official NSE Muhurat trading 2026: 2026-11-08 between 18:15 and 19:15
+    dt_during = IST.localize(datetime(2026, 11, 8, 18, 30, 0))
+    dt_before = IST.localize(datetime(2026, 11, 8, 15, 0, 0))
 
     assert calendar.get_session_state(dt_during) == SessionState.SPECIAL_SESSION
     assert calendar.is_market_open(dt_during) is True

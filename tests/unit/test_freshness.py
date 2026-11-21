@@ -1,10 +1,7 @@
 """Unit tests for DataFreshnessMonitor multi-policy tracking."""
 
-from datetime import datetime, timedelta
 import pytz
-import pytest
 
-from nifty_engine.core.interfaces import Tick
 from nifty_engine.data.freshness_monitor import DataFreshnessMonitor
 
 IST = pytz.timezone("Asia/Kolkata")

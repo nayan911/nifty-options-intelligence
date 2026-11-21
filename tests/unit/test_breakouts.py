@@ -1,12 +1,10 @@
 """Unit Tests for Breakout State Machine Engine."""
 
 from datetime import datetime, timedelta
-import pytest
+
 import pytz
 
 from nifty_engine.analysis.technical.breakouts import (
-    BreakoutContext,
-    BreakoutDirection,
     BreakoutStateMachine,
 )
 from nifty_engine.analysis.technical.support_resistance import LevelType, PriceZone

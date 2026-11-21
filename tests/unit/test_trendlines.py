@@ -1,12 +1,13 @@
 """Unit Tests and Micro-Benchmarks for Trendline Engine."""
 
-from datetime import datetime, timedelta
 import time
+from datetime import datetime, timedelta
+
 import pytest
 import pytz
 
 from nifty_engine.analysis.technical.swings import SwingDetector
-from nifty_engine.analysis.technical.trendlines import TrendlineDetector, Trendline
+from nifty_engine.analysis.technical.trendlines import TrendlineDetector
 from nifty_engine.core.interfaces import Candle
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -112,8 +113,33 @@ def test_trendline_micro_benchmark():
     detector = TrendlineDetector(window_size=150, min_touches=2)
 
     start_time = time.perf_counter()
-    lines = detector.find_trendlines(candles, swings, atr_value=25.0)
+    _ = detector.find_trendlines(candles, swings, atr_value=25.0)
     elapsed_ms = (time.perf_counter() - start_time) * 1000.0
 
     print(f"\n[BENCHMARK] Trendline calculation for 150 bars took: {elapsed_ms:.2f} ms")
     assert elapsed_ms < 50.0, f"Trendline detection exceeded 50ms: {elapsed_ms:.2f} ms"
+
+
+def test_trendline_as_of_time_isolation():
+    """Verify that passing future candles with an as_of_time does not leak future data."""
+    base_time = datetime(2026, 11, 23, 9, 15, tzinfo=IST)
+    candles = []
+    for i in range(50):
+        low = 24000.0 + (1.5 * i)
+        candles.append(create_mock_candle(i, low + 5, low + 15, low, low + 10, base_time))
+
+    swing_detector = SwingDetector(timeframe="5m", left_bars=2, right_bars=2)
+    for c in candles:
+        swing_detector.on_candle(c)
+
+    # Set as_of_time at bar 25
+    as_of = candles[25].timestamp
+    swings = swing_detector.get_visible_swings(as_of)
+    detector = TrendlineDetector(window_size=30, min_touches=2, min_touch_spacing=3)
+
+    # Pass all 50 candles, but restrict with as_of_time
+    lines = detector.find_trendlines(candles, swings, atr_value=20.0, as_of_time=as_of)
+    for l in lines:
+        # None of the trendlines should have end_index > 25
+        assert l.end_index <= 25
+        assert l.end_timestamp <= as_of

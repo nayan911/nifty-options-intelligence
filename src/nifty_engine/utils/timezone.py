@@ -1,6 +1,7 @@
 """Timezone utilities for Indian Standard Time (IST, UTC+5:30)."""
 
-from datetime import datetime, timezone
+from datetime import datetime
+
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")

@@ -1,15 +1,13 @@
 """Unit Tests for Dynamic Support and Resistance Zones Engine."""
 
-from datetime import datetime, timedelta, time
-import pytest
+from datetime import datetime, timedelta
+
 import pytz
 
 from nifty_engine.analysis.technical.support_resistance import (
     LevelType,
-    PriceZone,
     SupportResistanceEngine,
 )
-from nifty_engine.analysis.technical.swings import SwingPoint, SwingType
 from nifty_engine.core.interfaces import Candle
 
 IST = pytz.timezone("Asia/Kolkata")

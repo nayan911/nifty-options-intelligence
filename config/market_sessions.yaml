@@ -20,8 +20,8 @@ future_revisions:
 
 # Special Sessions (Muhurat Trading, DR Drills)
 special_sessions:
-  # Example: Muhurat Trading (Diwali)
-  "2026-11-01":
+  # Official NSE Muhurat Trading 2026 (Diwali Laxmi Pujan: Nov 8, 2026)
+  "2026-11-08":
     name: "Muhurat Trading 2026"
     session_start: "18:15:00"
     session_end: "19:15:00"

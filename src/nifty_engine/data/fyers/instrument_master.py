@@ -4,9 +4,13 @@ Parses official NSE_FO.csv published by FYERS to resolve verified exchange contr
 without relying on synthetic string concatenation.
 """
 
+import ssl
+import urllib.request
 from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional
+
+import certifi
 import pandas as pd
 import pytz
 
@@ -52,8 +56,49 @@ class FyersInstrumentMaster(IInstrumentMaster):
         self._df: Optional[pd.DataFrame] = None
         self._nifty_options_cache: Optional[pd.DataFrame] = None
 
-    def load_master(self, fo_csv_path: Optional[str] = None) -> None:
+    def download_master(self, force: bool = False) -> Path:
+        """Download and validate official NSE_FO.csv from FYERS.
+
+        Avoids redundant downloads if already cached and updated today.
+        """
+        if self.fo_cache_file.exists() and not force:
+            file_mtime = datetime.fromtimestamp(self.fo_cache_file.stat().st_mtime, tz=IST).date()
+            if file_mtime >= date.today():
+                return self.fo_cache_file
+
+        url = "https://public.fyers.in/sym_details/NSE_FO.csv"
+        temp_file = self.cache_dir / "NSE_FO.csv.tmp"
+
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        req = urllib.request.Request(url, headers={"User-Agent": "Antigravity-Agent"})
+
+        try:
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=30) as response:
+                with open(temp_file, "wb") as f:
+                    f.write(response.read())
+
+            # Validate that downloaded file contains rows and 21 columns
+            test_df = pd.read_csv(temp_file, header=None, nrows=10)
+            if test_df.shape[1] < 21:
+                raise ValueError(f"Downloaded file has unexpected column count: {test_df.shape[1]} (expected 21)")
+
+            # Atomic swap
+            temp_file.replace(self.fo_cache_file)
+            return self.fo_cache_file
+
+        except Exception as e:
+            if temp_file.exists():
+                temp_file.unlink()
+            if self.fo_cache_file.exists():
+                # Fallback to existing cache if available
+                return self.fo_cache_file
+            raise RuntimeError(f"Failed to download FYERS instrument master: {e}")
+
+    def load_master(self, fo_csv_path: Optional[str] = None, auto_download: bool = False) -> None:
         """Load instrument master into memory from a local CSV file."""
+        if auto_download and not fo_csv_path and not self.fo_cache_file.exists():
+            self.download_master()
+
         path_to_load = Path(fo_csv_path) if fo_csv_path else self.fo_cache_file
 
         if not path_to_load.exists():

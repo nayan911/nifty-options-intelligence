@@ -10,7 +10,8 @@ Implements mathematically exact, un-repainting technical indicators:
 7. Volatility-Adjusted Price Movement (Normalized ATR Multiples)
 """
 
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
+
 import numpy as np
 import pandas as pd
 
@@ -28,24 +29,43 @@ def update_ema_streaming(current_price: float, previous_ema: float, period: int)
 
 
 def compute_rsi(close_series: Union[pd.Series, np.ndarray], period: int = 14) -> pd.Series:
-    """Wilder's Smoothed Relative Strength Index (RSI)."""
-    s = pd.Series(close_series) if not isinstance(close_series, pd.Series) else close_series
+    """Wilder's Smoothed Relative Strength Index (RSI).
+
+    Mathematically exact implementation adhering to J. Welles Wilder Jr. (1978):
+    1. Initial baseline over first `period` bars uses Simple Moving Average (SMA).
+    2. Subsequent values use Wilder's recursive smoothing:
+       AvgGain = ((prev_AvgGain * (period - 1)) + current_gain) / period
+    """
+    s = pd.Series(close_series, dtype=float) if not isinstance(close_series, pd.Series) else close_series.astype(float)
+    n = len(s)
+    if n < period + 1:
+        return pd.Series(np.nan, index=s.index)
+
     delta = s.diff()
+    gain = delta.clip(lower=0.0).values
+    loss = (-delta.clip(upper=0.0)).values
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    avg_gain = np.full(n, np.nan)
+    avg_loss = np.full(n, np.nan)
 
-    # Wilder's smoothing uses alpha = 1 / period (equivalent to com = period - 1)
-    avg_gain = gain.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+    # Initial SMA baseline across bars 1 through period
+    avg_gain[period] = np.mean(gain[1:period + 1])
+    avg_loss[period] = np.mean(loss[1:period + 1])
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    # If loss is 0 and gain > 0 -> RSI = 100
-    rsi = rsi.fillna(100.0).where(avg_loss != 0, 100.0)
-    # If gain is 0 and loss > 0 -> RSI = 0
-    rsi = rsi.where((avg_gain != 0) | (avg_loss != 0), 50.0)
-    return rsi
+    # Wilder's recursive smoothing
+    for i in range(period + 1, n):
+        avg_gain[i] = ((avg_gain[i - 1] * (period - 1)) + gain[i]) / period
+        avg_loss[i] = ((avg_loss[i - 1] * (period - 1)) + loss[i]) / period
+
+    rsi = np.full(n, np.nan)
+    for i in range(period, n):
+        if avg_loss[i] == 0:
+            rsi[i] = 100.0 if avg_gain[i] > 0 else 50.0
+        else:
+            rs = avg_gain[i] / avg_loss[i]
+            rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+
+    return pd.Series(rsi, index=s.index)
 
 
 def compute_atr(
@@ -98,18 +118,22 @@ def compute_vwap(
         # Grouped by anchor session (e.g., date)
         cum_tp_vol = (typical_price * vol).groupby(df[anchor_col]).cumsum()
         cum_vol = vol.groupby(df[anchor_col]).cumsum()
+        vwap = cum_tp_vol / cum_vol.replace(0, np.nan)
+
+        # Standard deviation bands correctly grouped by anchor
+        price_variance = (typical_price - vwap) ** 2
+        cum_var_vol = (price_variance * vol).groupby(df[anchor_col]).cumsum()
+        variance = cum_var_vol / cum_vol.replace(0, np.nan)
     else:
         cum_tp_vol = (typical_price * vol).cumsum()
         cum_vol = vol.cumsum()
+        vwap = cum_tp_vol / cum_vol.replace(0, np.nan)
 
-    vwap = cum_tp_vol / cum_vol.replace(0, np.nan)
+        price_variance = (typical_price - vwap) ** 2
+        cum_var_vol = (price_variance * vol).cumsum()
+        variance = cum_var_vol / cum_vol.replace(0, np.nan)
 
-    # Standard deviation bands
-    price_variance = (typical_price - vwap) ** 2
-    cum_var_vol = (price_variance * vol).cumsum()
-    variance = cum_var_vol / cum_vol.replace(0, np.nan)
     std_dev = np.sqrt(variance.clip(lower=0))
-
     upper_1sigma = vwap + std_dev
     lower_1sigma = vwap - std_dev
 

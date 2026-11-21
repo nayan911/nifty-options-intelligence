@@ -12,10 +12,8 @@ optimized specifically for real-time intraday trading:
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional, Tuple
-import numpy as np
-import pandas as pd
 
-from nifty_engine.analysis.technical.swings import SwingPoint, SwingType
+from nifty_engine.analysis.technical.swings import SwingPoint
 from nifty_engine.core.interfaces import Candle
 
 
@@ -63,6 +61,10 @@ class TrendlineDetector:
         as_of_time: Optional[datetime] = None,
     ) -> List[Trendline]:
         """Detects active, non-violated trendlines from visible swing points."""
+        # Strict lookahead guard: truncate candles to as_of_time
+        if as_of_time is not None:
+            candles = [c for c in candles if c.timestamp <= as_of_time]
+
         if len(candles) < 10 or len(swings) < 2 or atr_value <= 0:
             return []
 
@@ -76,6 +78,7 @@ class TrendlineDetector:
             s for s in swings
             if (as_of_time is None or s.confirmation_timestamp <= as_of_time)
             and s.index >= start_idx
+            and s.index <= curr_idx
         ]
 
         tolerance = max(self.tolerance_atr_multiple * atr_value, 1.0)

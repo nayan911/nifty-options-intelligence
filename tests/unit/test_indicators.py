@@ -1,13 +1,11 @@
 """Unit tests for technical indicators engine."""
 
-import numpy as np
 import pandas as pd
 import pytest
 
 from nifty_engine.analysis.technical.indicators import (
     compute_atr,
     compute_ema,
-    compute_momentum_roc,
     compute_relative_volume,
     compute_rsi,
     compute_volatility_adjusted_move,
@@ -82,6 +80,24 @@ def test_vwap_with_volume_and_bands():
     assert (vwap >= df["low"]).all() and (vwap <= df["high"]).all()
     # Bands should envelope VWAP
     assert (upper_1s >= vwap).all() and (lower_1s <= vwap).all()
+
+
+def test_anchored_vwap_resets_variance_per_anchor():
+    """Verify that anchored VWAP and standard deviation bands reset across sessions."""
+    df = pd.DataFrame({
+        "session": ["2026-11-20", "2026-11-20", "2026-11-23", "2026-11-23"],
+        "high": [105.0, 110.0, 102.0, 106.0],
+        "low": [95.0, 100.0, 98.0, 100.0],
+        "close": [100.0, 105.0, 100.0, 104.0],
+        "volume": [1000, 1000, 1000, 1000],
+    })
+    vwap, upper, lower = compute_vwap(df, anchor_col="session")
+    assert len(vwap) == 4
+    # On the first bar of the new session (idx 2), typical price is (102 + 98 + 100)/3 = 100.0
+    # VWAP must be exactly 100.0 and variance must be 0
+    assert pytest.approx(vwap.iloc[2], rel=1e-4) == 100.0
+    assert pytest.approx(upper.iloc[2], rel=1e-4) == 100.0
+    assert pytest.approx(lower.iloc[2], rel=1e-4) == 100.0
 
 
 def test_relative_volume():

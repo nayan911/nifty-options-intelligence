@@ -7,11 +7,10 @@ Replays recorded ticks and OHLCV candles chronologically with strict lookahead i
 4. Simulated clock ensuring strategy logic cannot access future events.
 """
 
-from dataclasses import dataclass
-from datetime import datetime
-import heapq
 import time
-from typing import Callable, Dict, Generator, Iterator, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Callable, List, Optional, Union
 
 from nifty_engine.core.interfaces import Candle, Tick
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
@@ -52,6 +51,16 @@ class MarketReplayEngine:
         """Register a callback for live tick events."""
         self._tick_subscribers.append(callback)
 
+    @staticmethod
+    def get_timeframe_delta(timeframe: str) -> timedelta:
+        """Derive candle duration to establish exact bar finalization/availability time."""
+        tf = timeframe.lower()
+        if tf.endswith("m"):
+            return timedelta(minutes=int(tf[:-1]))
+        elif tf in ("1d", "d"):
+            return timedelta(days=1)
+        return timedelta(minutes=1)
+
     def load_candle_stream(
         self,
         symbols: List[str],
@@ -59,20 +68,29 @@ class MarketReplayEngine:
         start_time: datetime,
         end_time: datetime,
     ) -> List[ReplayEvent]:
-        """Loads and sorts candles for multiple symbols into an interleaved event list."""
+        """Loads and sorts candles into an interleaved event list.
+
+        CRITICAL LOOKAHEAD GUARD:
+        A candle with open timestamp T and timeframe 5m is only completed and visible
+        to strategy logic at T + 5m (the bar close). The ReplayEvent timestamp is strictly
+        set to this availability timestamp.
+        """
         all_events: List[ReplayEvent] = []
         for sym in symbols:
             candles = self.store.get_candles(sym, timeframe, start_time, end_time)
             for c in candles:
+                availability_time = c.timestamp + self.get_timeframe_delta(c.timeframe)
                 all_events.append(
                     ReplayEvent(
-                        timestamp=c.timestamp,
+                        timestamp=availability_time,
                         event_type="CANDLE",
                         payload=c,
                     )
                 )
 
-        # Sort strictly ascending by timestamp; if same timestamp, maintain deterministic order
+        # Sort strictly ascending by availability timestamp; if identical, maintain deterministic order
+        all_events.sort(key=lambda e: (e.timestamp, e.payload.symbol))
+        return all_events
         all_events.sort(key=lambda e: (e.timestamp, e.payload.symbol))
         return all_events
 

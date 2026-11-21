@@ -3,11 +3,12 @@
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Dict, Optional, Set
+
 import yaml
 
 from nifty_engine.core.config import settings
 from nifty_engine.core.interfaces import SessionState
-from nifty_engine.utils.timezone import IST, now_ist, to_ist
+from nifty_engine.utils.timezone import now_ist, to_ist
 
 
 class ExchangeCalendar:

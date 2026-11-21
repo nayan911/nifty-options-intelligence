@@ -10,8 +10,8 @@ and `confirmation_timestamp` (the exact moment the strategy became aware of it).
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional, Tuple, Union
-import numpy as np
+from typing import List, Optional
+
 import pandas as pd
 
 from nifty_engine.core.interfaces import Candle

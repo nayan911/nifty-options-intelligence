@@ -1,10 +1,10 @@
 """Unit tests for RealtimeCandleBuilder addressing volume, bar isolation, and duplicates."""
 
-from datetime import datetime, timedelta
-import pytz
-import pytest
+from datetime import datetime
 
-from nifty_engine.core.interfaces import Candle, Tick
+import pytz
+
+from nifty_engine.core.interfaces import Tick
 from nifty_engine.data.candle_builder import RealtimeCandleBuilder
 
 IST = pytz.timezone("Asia/Kolkata")

@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel, Field
 
 

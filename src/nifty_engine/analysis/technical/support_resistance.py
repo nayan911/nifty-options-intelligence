@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from enum import Enum
 from typing import List, Optional, Tuple
+
 import pytz
 
 from nifty_engine.analysis.technical.swings import SwingPoint

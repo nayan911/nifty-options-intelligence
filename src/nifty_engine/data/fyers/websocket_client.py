@@ -4,10 +4,11 @@ Encapsulates FyersDataSocket for live tick streaming, symbol budget tracking,
 and normalization of raw ticks into structured Tick models.
 """
 
-from datetime import datetime
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional, Set
+
 import certifi
 import pytz
 from fyers_apiv3.FyersWebsocket.data_ws import FyersDataSocket
@@ -37,19 +38,27 @@ class FyersWebSocketClient:
         self,
         auth_provider: Optional[FyersAuthProvider] = None,
         on_tick: Optional[Callable[[Tick], None]] = None,
+        on_ack: Optional[Callable[[dict], None]] = None,
         max_symbols: int = settings.MAX_WS_SYMBOLS,
     ) -> None:
         self.auth_provider = auth_provider or FyersAuthProvider()
         self.on_tick = on_tick
+        self.on_ack = on_ack
         self.max_symbols = max_symbols
 
         self.subscribed_symbols: Set[str] = set()
+        self.acknowledged_symbols: Set[str] = set()
+        self.subscription_acks: int = 0
         self._socket: Optional[FyersDataSocket] = None
         self._is_connected: bool = False
 
         # Ensure local logs directory exists for FyersDataSocket logger
         self.log_dir = Path("data/logs")
         self.log_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def is_connected(self) -> bool:
+        return self._is_connected
 
     def connect(self) -> None:
         """Establish WebSocket connection using cached daily access token."""
@@ -108,14 +117,25 @@ class FyersWebSocketClient:
         pass
 
     def _on_message(self, message: dict) -> None:
-        """Parse raw incoming FYERS WebSocket tick and dispatch normalized Tick."""
+        """Parse raw incoming FYERS WebSocket tick or system message and dispatch."""
         if not message or not isinstance(message, dict):
             return
 
+        # 1. Handle Subscription / System Acknowledgements
+        msg_type = message.get("type")
+        if msg_type in ("sub", "auth", "resume", "pause"):
+            if msg_type == "sub":
+                self.subscription_acks += 1
+            if self.on_ack:
+                self.on_ack(message)
+            return
+
+        # 2. Handle Market Quote Update
         symbol = message.get("symbol")
         ltp = message.get("ltp")
 
         if symbol and ltp is not None:
+            self.acknowledged_symbols.add(symbol)
             epoch = message.get("exch_feed_time")
             exch_dt = datetime.fromtimestamp(epoch, tz=IST) if epoch else None
             is_index_asset = symbol in INDEX_SYMBOLS or "-INDEX" in symbol
@@ -126,7 +146,7 @@ class FyersWebSocketClient:
                 local_timestamp=datetime.now(IST),
                 ltp=float(ltp),
                 cumulative_volume=int(message.get("vol_traded_today", 0)) if not is_index_asset else 0,
-                incremental_volume=0,  # Will be calculated by CandleBuilder from cumulative stream
+                incremental_volume=0,  # Will be calculated by TickNormalizer
                 is_index=is_index_asset,
                 bid=float(message.get("bid", 0)) if message.get("bid") else None,
                 ask=float(message.get("ask", 0)) if message.get("ask") else None,

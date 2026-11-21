@@ -7,6 +7,7 @@ Usage:
 
 import sys
 import webbrowser
+
 from nifty_engine.data.fyers.auth import FyersAuthProvider
 
 
@@ -54,7 +55,7 @@ def main():
 
     print("\nExchanging auth code for daily access token...")
     try:
-        token = auth.exchange_code_for_token(auth_code)
+        _ = auth.exchange_code_for_token(auth_code)
         print("\n[SUCCESS] Authentication complete!")
         print(f"Daily token cached at: {auth.token_file} (Mode 0600)")
         print("Valid until 6:30 AM IST tomorrow.")

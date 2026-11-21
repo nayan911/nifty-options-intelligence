@@ -1,7 +1,7 @@
 """Configuration management for the NIFTY Options Intelligence Engine."""
 
 from pathlib import Path
-from typing import Optional
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 

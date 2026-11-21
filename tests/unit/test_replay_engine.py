@@ -1,10 +1,10 @@
 """Unit Tests for Historical Market Replay Engine."""
 
 from datetime import datetime, timedelta
-import pytest
+
 import pytz
 
-from nifty_engine.backtest.replay_engine import MarketReplayEngine, ReplayEvent
+from nifty_engine.backtest.replay_engine import MarketReplayEngine
 from nifty_engine.core.interfaces import Candle, Tick
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 
@@ -57,12 +57,16 @@ def test_market_replay_interleaved_candles():
     assert processed == 10
     assert len(received_events) == 10
 
-    # Verify strictly monotonic non-decreasing timestamps
+    # Verify strictly monotonic non-decreasing timestamps and availability timing
     for i in range(1, len(seen_times)):
         assert seen_times[i] >= seen_times[i - 1]
 
-    # Verify final simulated time
-    assert replay.current_time == base_time + timedelta(minutes=20)
+    # Verify each candle was replayed exactly at bar close (availability time = open + 5m)
+    for c, seen_t in zip(received_events, seen_times):
+        assert seen_t == c.timestamp + timedelta(minutes=5)
+
+    # Verify final simulated time (09:15 + 4*5m + 5m = 09:40)
+    assert replay.current_time == base_time + timedelta(minutes=25)
 
 
 def test_market_replay_ticks_and_clock_isolation():

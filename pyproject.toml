@@ -33,24 +33,27 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"
 markers = [
     "unit: Unit tests",
-    "integration: Integration tests requiring FYERS connection",
+    "integration: Integration tests",
     "slow: Tests that take more than 10 seconds",
 ]
 
 [tool.ruff]
-target-version = "py311"
-line-length = 100
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501", "E741", "E402"]
 
 [tool.mypy]
 python_version = "3.11"

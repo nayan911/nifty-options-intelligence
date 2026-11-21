@@ -1,11 +1,11 @@
 """Unit Tests for Swing High/Low Detection Engine."""
 
 from datetime import datetime, timedelta
+
 import pandas as pd
-import pytest
 import pytz
 
-from nifty_engine.analysis.technical.swings import SwingDetector, SwingPoint, SwingType
+from nifty_engine.analysis.technical.swings import SwingDetector, SwingType
 from nifty_engine.core.interfaces import Candle
 
 IST = pytz.timezone("Asia/Kolkata")
