@@ -13,6 +13,11 @@ from typing import Dict, List, Optional, Set
 
 import pytz
 
+from nifty_engine.analysis.technical.breakouts import BreakoutContext
+from nifty_engine.analysis.technical.engine import (
+    TechnicalAnalysisEngine,
+    TechnicalSnapshot,
+)
 from nifty_engine.core.calendar import ExchangeCalendar
 from nifty_engine.core.config import settings
 from nifty_engine.core.interfaces import Candle, OptionType, SessionState, Tick
@@ -43,6 +48,11 @@ class MarketDataEngine:
         self.running = True
 
         self.builder = RealtimeCandleBuilder(on_candle_close=self._on_candle_closed)
+        self.technical_engine = TechnicalAnalysisEngine(
+            primary_index=settings.PRIMARY_INDEX,
+            primary_futures="NSE:NIFTY26NOVFUT",
+            on_setup_eligible=self._on_setup_eligible,
+        )
         self.ws_client = FyersWebSocketClient(
             auth_provider=self.auth,
             on_tick=self._on_tick_received,
@@ -147,6 +157,44 @@ class MarketDataEngine:
             f"({candle.timeframe}) C: {candle.close:.2f} | V: {candle.volume} | Bars Closed: {self.candle_count}"
         )
 
+        # Real-time quantitative technical analysis
+        try:
+            snapshot = self.technical_engine.on_candle(candle)
+            if snapshot and candle.symbol in (settings.PRIMARY_INDEX, self.technical_engine.primary_futures):
+                self._log_technical_status(snapshot)
+        except Exception as e:
+            print(f"[WARN] Technical analysis error for {candle.symbol}: {e}")
+
+    def _log_technical_status(self, snap: TechnicalSnapshot) -> None:
+        """Outputs concise quantitative technical telemetry for primary tracked assets."""
+        sr_str = ""
+        if snap.nearest_support:
+            sr_str += f" | Sup: {snap.nearest_support.nominal_price:.1f}"
+        if snap.nearest_resistance:
+            sr_str += f" | Res: {snap.nearest_resistance.nominal_price:.1f}"
+
+        vwap_str = f" | VWAP: {snap.vwap:.1f}" if snap.vwap else ""
+        rsi_str = f" | RSI: {snap.rsi:.1f}" if snap.rsi else ""
+        rvol_str = f" | RVOL: {snap.rvol:.2f}x" if snap.rvol else ""
+
+        sym_tag = snap.symbol.split(":")[-1]
+        print(
+            f"[TECH {sym_tag}] C: {snap.close:.2f} | Trend: {snap.trend_bias} | "
+            f"EMA9: {snap.ema_9:.1f}{vwap_str}{rsi_str}{rvol_str}{sr_str}"
+        )
+
+    def _on_setup_eligible(self, setup: BreakoutContext, snap: TechnicalSnapshot) -> None:
+        """Invoked when a high-probability technical breakout & retest completes."""
+        print(
+            f"\n{'='*70}\n"
+            f"  [ACTIONABLE BREAKOUT SETUP ELIGIBLE: {setup.direction.value}]\n"
+            f"{'='*70}\n"
+            f"Asset: {snap.symbol} | Level: {setup.level_id} ({setup.nominal_price:.1f})\n"
+            f"Confirmed At: {snap.timestamp.strftime('%H:%M:%S')} | Trigger Price: {snap.close:.2f}\n"
+            f"Stop Loss: {setup.stop_loss} | Target: {setup.target_price} | Trend: {snap.trend_bias}\n"
+            f"{'='*70}\n"
+        )
+
     def _get_initial_spot(self) -> float:
         """Determines reference NIFTY spot price from fresh DB records, live REST quotes, or master."""
         try:
@@ -215,6 +263,7 @@ class MarketDataEngine:
             nifty_fut = self.master.resolve_future("NIFTY")
             bnf_fut = self.master.resolve_future("BANKNIFTY")
             watchlist.extend([nifty_fut, bnf_fut])
+            self.technical_engine.set_futures_ticker(nifty_fut)
         except Exception as e:
             print(f"[WARN] Futures resolution: {e}")
 

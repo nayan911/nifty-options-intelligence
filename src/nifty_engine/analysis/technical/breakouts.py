@@ -79,11 +79,11 @@ class BreakoutStateMachine:
 
         # 1. Initialize context if starting from scratch
         if context is None:
-            # If zone is above candle, it is resistance -> candidate BULLISH breakout
-            # If zone is below candle, it is support -> candidate BEARISH breakdown
+            # If zone is above candle open, it was resistance -> candidate BULLISH breakout
+            # If zone is below candle open, it was support -> candidate BEARISH breakdown
             direction = (
                 BreakoutDirection.BULLISH
-                if zone.nominal_price >= candle.close
+                if zone.nominal_price >= candle.open
                 else BreakoutDirection.BEARISH
             )
             context = BreakoutContext(
