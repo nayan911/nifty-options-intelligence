@@ -119,12 +119,12 @@ class RealtimeCandleBuilder:
 
     def process_tick(self, tick: Tick) -> List[Candle]:
         """Ingest a tick thread-safely. If a bar boundary is crossed, close old bar and emit."""
+        closed_candles: List[Candle] = []
         with self._lock:
             if self.is_duplicate(tick):
                 return []
 
             tick_time = tick.exchange_timestamp or tick.local_timestamp
-            closed_candles: List[Candle] = []
 
             for tf, interval_mins in self.TIMEFRAMES_MINUTES.items():
                 key = (tick.symbol, tf)
@@ -141,9 +141,6 @@ class RealtimeCandleBuilder:
                     closed_candle = active.to_candle(is_closed=True)
                     closed_candles.append(closed_candle)
 
-                    if self.on_candle_close:
-                        self.on_candle_close(closed_candle)
-
                     # Start fresh bar
                     new_bar = ActiveCandle(symbol=tick.symbol, timeframe=tf, start_time=bar_start)
                     new_bar.update(tick)
@@ -155,7 +152,12 @@ class RealtimeCandleBuilder:
                     # Tick belongs to current active bar
                     active.update(tick)
 
-            return closed_candles
+        # Dispatch callbacks outside lock to prevent deadlocks and ensure exactly-once handling
+        if self.on_candle_close and closed_candles:
+            for closed in closed_candles:
+                self.on_candle_close(closed)
+
+        return closed_candles
 
     def flush_closed_bars(self, current_time: datetime) -> List[Candle]:
         """Finalize and emit pending bars whose interval has expired even if no tick arrived."""
@@ -168,14 +170,15 @@ class RealtimeCandleBuilder:
                 if current_time >= bar_end_time and active.tick_count > 0:
                     closed_candle = active.to_candle(is_closed=True)
                     closed_candles.append(closed_candle)
-
-                    if self.on_candle_close:
-                        self.on_candle_close(closed_candle)
-
                     # Remove from active
                     del self._active_bars[(symbol, tf)]
 
-            return closed_candles
+        # Dispatch callbacks outside lock to prevent deadlocks and ensure exactly-once handling
+        if self.on_candle_close and closed_candles:
+            for closed in closed_candles:
+                self.on_candle_close(closed)
+
+        return closed_candles
 
     def get_current_candle(self, symbol: str, timeframe: str = "1m") -> Optional[Candle]:
         """Peek at currently building unclosed candle."""

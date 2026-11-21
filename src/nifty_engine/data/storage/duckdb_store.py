@@ -1,5 +1,6 @@
 """DuckDB high-performance embedded storage engine."""
 
+import shutil
 import threading
 import uuid
 from datetime import datetime
@@ -45,10 +46,26 @@ class DuckDBStore(IStorageEngine):
         return self._conn.cursor()
 
     def _init_schemas(self) -> None:
-        """Create tables and indexes if they do not exist, and migrate missing columns."""
+        """Create tables and indexes if they do not exist, and migrate missing columns with automated backup."""
+        if self.db_path != ":memory:":
+            db_file = Path(self.db_path)
+            if db_file.exists() and db_file.stat().st_size > 0:
+                bak_file = db_file.with_suffix(".duckdb.bak")
+                try:
+                    shutil.copy2(db_file, bak_file)
+                except Exception:
+                    pass
+
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(CREATE_TABLES_SQL)
+
+            # Idempotently migrate event_class for ticks
+            try:
+                cur.execute("ALTER TABLE ticks ADD COLUMN IF NOT EXISTS event_class VARCHAR DEFAULT 'LIVE'")
+            except Exception:
+                pass
+
             # Idempotently migrate columns for option_chain_strikes if already existing from prior runs
             for col, dtype in [
                 ("call_oi_change", "BIGINT"),
@@ -68,6 +85,12 @@ class DuckDBStore(IStorageEngine):
                     cur.execute(f"ALTER TABLE option_chain_strikes ADD COLUMN IF NOT EXISTS {col} {dtype}")
                 except Exception:
                     pass
+
+            # Create index on event_class now that column is guaranteed to exist
+            try:
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_ticks_provenance ON ticks(symbol, event_class, local_timestamp)")
+            except Exception:
+                pass
 
     def insert_tick(self, tick: Tick) -> None:
         """Buffer a single tick for high-throughput single-writer batch insert."""
@@ -119,6 +142,7 @@ class DuckDBStore(IStorageEngine):
                 "ask_qty": t.ask_qty,
                 "oi": t.oi,
                 "source": t.source,
+                "event_class": getattr(t, "event_class", "LIVE"),
             }
             for t in ticks
         ]
@@ -126,7 +150,17 @@ class DuckDBStore(IStorageEngine):
         cur = self._conn.cursor()
         cur.register("staging_ticks_df", df)
         try:
-            cur.execute("INSERT INTO ticks SELECT * FROM staging_ticks_df")
+            cur.execute(
+                """
+                INSERT INTO ticks (
+                    symbol, exchange_timestamp, local_timestamp, ltp, volume,
+                    bid, ask, bid_qty, ask_qty, oi, source, event_class
+                ) SELECT
+                    symbol, exchange_timestamp, local_timestamp, ltp, volume,
+                    bid, ask, bid_qty, ask_qty, oi, source, event_class
+                FROM staging_ticks_df
+                """
+            )
         finally:
             cur.unregister("staging_ticks_df")
 
@@ -206,7 +240,7 @@ class DuckDBStore(IStorageEngine):
         where_clause = " AND ".join(conditions)
         query = f"""
             SELECT symbol, exchange_timestamp, local_timestamp, ltp, volume,
-                   bid, ask, bid_qty, ask_qty, oi, source
+                   bid, ask, bid_qty, ask_qty, oi, source, event_class
             FROM ticks
             WHERE {where_clause}
             ORDER BY local_timestamp ASC
@@ -227,6 +261,7 @@ class DuckDBStore(IStorageEngine):
                 ask_qty=r[8],
                 oi=r[9],
                 source=r[10],
+                event_class=r[11] if len(r) > 11 else "LIVE",
             )
             for r in rows
         ]
@@ -236,9 +271,14 @@ class DuckDBStore(IStorageEngine):
         symbol: str,
         interval_minutes: int = 1,
         start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None
+        end_time: Optional[datetime] = None,
+        event_class: str = "LIVE",
     ) -> pd.DataFrame:
-        """Vectorized SQL aggregation of ticks into OHLC bars using DuckDB time_bucket."""
+        """Vectorized SQL aggregation of ticks into OHLC bars using DuckDB time_bucket.
+
+        Strictly filters on event_class (defaults to 'LIVE') so off-market holiday
+        snapshots never contaminate candlestick reconstruction.
+        """
         query = f"""
             SELECT
                 symbol,
@@ -250,13 +290,13 @@ class DuckDBStore(IStorageEngine):
                 SUM(volume) AS volume,
                 LAST(oi) AS oi
             FROM ticks
-            WHERE symbol = ?
+            WHERE symbol = ? AND event_class = ?
             {"AND local_timestamp >= ?" if start_time else ""}
             {"AND local_timestamp <= ?" if end_time else ""}
             GROUP BY symbol, timestamp
             ORDER BY timestamp ASC
         """
-        params = [symbol]
+        params = [symbol, event_class]
         if start_time:
             params.append(start_time)
         if end_time:
@@ -328,7 +368,23 @@ class DuckDBStore(IStorageEngine):
                     df = pd.DataFrame(rows)
                     cur.register("staging_strikes_df", df)
                     try:
-                        cur.execute("INSERT INTO option_chain_strikes SELECT * FROM staging_strikes_df")
+                        cur.execute(
+                            """
+                            INSERT INTO option_chain_strikes (
+                                snapshot_id, strike,
+                                call_ltp, call_oi, call_oi_change, call_volume, call_bid, call_ask,
+                                call_iv, call_delta, call_gamma, call_theta, call_vega,
+                                put_ltp, put_oi, put_oi_change, put_volume, put_bid, put_ask,
+                                put_iv, put_delta, put_gamma, put_theta, put_vega
+                            ) SELECT
+                                snapshot_id, strike,
+                                call_ltp, call_oi, call_oi_change, call_volume, call_bid, call_ask,
+                                call_iv, call_delta, call_gamma, call_theta, call_vega,
+                                put_ltp, put_oi, put_oi_change, put_volume, put_bid, put_ask,
+                                put_iv, put_delta, put_gamma, put_theta, put_vega
+                            FROM staging_strikes_df
+                            """
+                        )
                     finally:
                         cur.unregister("staging_strikes_df")
 

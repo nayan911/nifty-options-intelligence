@@ -54,6 +54,7 @@ class Tick(BaseModel):
     ask_qty: Optional[int] = None
     oi: Optional[int] = None
     source: str = "FYERS"
+    event_class: str = "LIVE"
 
 
 class Candle(BaseModel):

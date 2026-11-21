@@ -10,7 +10,7 @@ Guarantees data integrity before database persistence and candle construction:
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from typing import Dict, Optional, Tuple
 
@@ -57,7 +57,9 @@ class TickNormalizer:
         # Per-symbol state tracking
         self._last_fingerprint: Dict[str, Tuple] = {}
         self._last_exchange_time: Dict[str, datetime] = {}
-        self._last_cum_volume: Dict[str, int] = {}
+        # Session-isolated volume baselines
+        self._live_session_date: Dict[str, date] = {}
+        self._live_session_cum_volume: Dict[str, int] = {}
 
     def normalize(
         self,
@@ -92,27 +94,8 @@ class TickNormalizer:
 
         self._last_fingerprint[sym] = fingerprint
 
-        # 4. Volume Normalization
-        incremental_vol = 0
-        cum_vol = 0 if is_index else raw_tick.cumulative_volume
-
-        if not is_index and cum_vol > 0:
-            if sym not in self._last_cum_volume:
-                # First tick for this symbol in this run: baseline established
-                self._last_cum_volume[sym] = cum_vol
-                incremental_vol = 0
-            else:
-                prev_cum = self._last_cum_volume[sym]
-                if cum_vol >= prev_cum:
-                    incremental_vol = cum_vol - prev_cum
-                else:
-                    # Daily or session reset: cum_vol dropped below previous
-                    incremental_vol = cum_vol
-                self._last_cum_volume[sym] = cum_vol
-
-        # 5. Session & Live vs Snapshot Classification
-        # Dual-gate validation:
-        # A. Current real-world wall-clock time must be an open trading session
+        # 4. Session & Live vs Snapshot Classification (Dual-Gate Validation)
+        # Gate A: Current real-world wall-clock time must be an open trading session
         current_wall_time = current_time or now_ist()
         current_session = self.calendar.get_session_state(current_wall_time, is_derivative=True)
         is_market_currently_open = current_session in (
@@ -136,6 +119,32 @@ class TickNormalizer:
 
         status = TickStatus.VALID_LIVE if is_live_trading else TickStatus.VALID_SNAPSHOT
 
+        # 5. Session-Specific Volume Normalization
+        incremental_vol = 0
+        cum_vol = 0 if is_index else raw_tick.cumulative_volume
+
+        if not is_index and cum_vol > 0:
+            if status == TickStatus.VALID_LIVE:
+                session_date = current_wall_time.date()
+                last_session = self._live_session_date.get(sym)
+
+                if last_session != session_date or sym not in self._live_session_cum_volume:
+                    # First live observation of this trading session: establish baseline without false surge
+                    self._live_session_cum_volume[sym] = cum_vol
+                    self._live_session_date[sym] = session_date
+                    incremental_vol = 0
+                else:
+                    prev_cum = self._live_session_cum_volume[sym]
+                    if cum_vol >= prev_cum:
+                        incremental_vol = cum_vol - prev_cum
+                    else:
+                        # Exchange/broker counter reset mid-session: establish new baseline safely
+                        incremental_vol = 0
+                    self._live_session_cum_volume[sym] = cum_vol
+            else:
+                # Off-market / holiday snapshots never contaminate live session baselines
+                incremental_vol = 0
+
         # Construct sanitized, normalized tick model
         normalized_tick = Tick(
             symbol=sym,
@@ -151,6 +160,7 @@ class TickNormalizer:
             ask_qty=raw_tick.ask_qty,
             oi=raw_tick.oi,
             source=raw_tick.source,
+            event_class="LIVE" if status == TickStatus.VALID_LIVE else "SNAPSHOT",
         )
 
         return NormalizationResult(

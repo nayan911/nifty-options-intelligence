@@ -5,8 +5,10 @@ Runs locally, streams WebSocket market ticks, applies TickNormalizer for volume
 and out-of-order quarantine, builds 1m/5m/15m OHLCV bars, and persists data into DuckDB.
 """
 
+import asyncio
 import sys
 import time
+from datetime import datetime
 from typing import Dict, List, Optional, Set
 
 import pytz
@@ -18,6 +20,7 @@ from nifty_engine.data.candle_builder import RealtimeCandleBuilder
 from nifty_engine.data.freshness_monitor import DataFreshnessMonitor
 from nifty_engine.data.fyers.auth import FyersAuthProvider
 from nifty_engine.data.fyers.instrument_master import FyersInstrumentMaster
+from nifty_engine.data.fyers.rest_client import FyersRestClient
 from nifty_engine.data.fyers.websocket_client import FyersWebSocketClient
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.data.tick_normalizer import TickNormalizer, TickStatus
@@ -29,13 +32,14 @@ IST = pytz.timezone("Asia/Kolkata")
 class MarketDataEngine:
     """Orchestrates live market data streaming, volume normalization, and storage."""
 
-    def __init__(self):
+    def __init__(self, store: Optional[DuckDBStore] = None):
         self.calendar = ExchangeCalendar()
         self.auth = FyersAuthProvider()
-        self.store = DuckDBStore()
+        self.store = store or DuckDBStore()
         self.freshness = DataFreshnessMonitor()
         self.master = FyersInstrumentMaster()
         self.normalizer = TickNormalizer(self.calendar)
+        self.rest_client = FyersRestClient(self.auth)
         self.running = True
 
         self.builder = RealtimeCandleBuilder(on_candle_close=self._on_candle_closed)
@@ -61,11 +65,21 @@ class MarketDataEngine:
         self.subscribed_option_symbols: Set[str] = set()
         self.active_paper_trade_symbols: Set[str] = set()
 
+        # Telemetry: Feed Age vs Exchange Network Latency
+        self.last_primary_tick_time: Optional[datetime] = None
+        self.last_primary_network_latency: Optional[float] = None
+
+        # Scheduled Option Chain Snapshot Collection
+        self.last_option_chain_time: Optional[datetime] = None
+        self.latest_option_chain_pcr: Optional[float] = None
+        self.latest_total_call_oi: Optional[int] = None
+        self.latest_total_put_oi: Optional[int] = None
+
     def _on_ws_ack(self, ack_msg: dict):
         """Callback on WebSocket subscription and status acknowledgements."""
         print(f"[WS ACK] {ack_msg.get('type')}: {ack_msg.get('message', 'OK')}")
 
-    def _on_tick_received(self, raw_tick: Tick):
+    def _on_tick_received(self, raw_tick: Tick, current_time: Optional[datetime] = None):
         """Processes raw tick through normalizer, sanitizes volume, persists, and builds bars."""
         sym = raw_tick.symbol
         self.total_ticks_received += 1
@@ -81,7 +95,7 @@ class MarketDataEngine:
             }
         self.symbol_stats[sym]["received"] += 1
 
-        res = self.normalizer.normalize(raw_tick)
+        res = self.normalizer.normalize(raw_tick, current_time=current_time)
 
         if res.status == TickStatus.DUPLICATE:
             self.duplicates_dropped += 1
@@ -106,9 +120,12 @@ class MarketDataEngine:
         self.store.insert_tick(tick)
         self.ticks_persisted += 1
 
-        # 2. Track NIFTY spot price
+        # 2. Track NIFTY spot price and telemetry
         if tick.symbol == settings.PRIMARY_INDEX:
             self.current_spot_price = tick.ltp
+            self.last_primary_tick_time = now_ist()
+            if tick.exchange_timestamp:
+                self.last_primary_network_latency = (tick.local_timestamp - tick.exchange_timestamp).total_seconds()
 
         # 3. Only pass live trading ticks to CandleBuilder (holiday snapshots are saved but do not form bars)
         if res.status == TickStatus.VALID_LIVE:
@@ -120,7 +137,7 @@ class MarketDataEngine:
             self.symbol_stats[sym]["snapshot"] += 1
 
     def _on_candle_closed(self, candle: Candle):
-        """Invoked when a 1m/5m/15m bar closes."""
+        """Invoked when a 1m/5m/15m bar closes (guaranteed exactly once per closed candle)."""
         self.candle_count += 1
         self.store.insert_candle(candle)
         # Flush DuckDB buffer on candle close
@@ -131,23 +148,27 @@ class MarketDataEngine:
         )
 
     def _get_initial_spot(self) -> float:
-        """Determines reference NIFTY spot price from database, live REST quotes, or master."""
+        """Determines reference NIFTY spot price from fresh DB records, live REST quotes, or master."""
         try:
             with self.store._lock:
                 cur = self.store._conn.cursor()
                 res = cur.execute(
-                    "SELECT close FROM candles WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1",
+                    "SELECT close, timestamp FROM candles WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1",
                     [settings.PRIMARY_INDEX],
                 ).fetchall()
                 if res and res[0][0] > 0:
-                    return float(res[0][0])
+                    cand_ts = res[0][1]
+                    # Verify candle is from today if current session is regular trading
+                    if cand_ts.date() == now_ist().date():
+                        return float(res[0][0])
 
                 res_tick = cur.execute(
-                    "SELECT ltp FROM ticks WHERE symbol = ? ORDER BY local_timestamp DESC LIMIT 1",
+                    "SELECT ltp, local_timestamp FROM ticks WHERE symbol = ? ORDER BY local_timestamp DESC LIMIT 1",
                     [settings.PRIMARY_INDEX],
                 ).fetchall()
                 if res_tick and res_tick[0][0] > 0:
-                    return float(res_tick[0][0])
+                    if res_tick[0][1].date() == now_ist().date():
+                        return float(res_tick[0][0])
         except Exception:
             pass
 
@@ -245,9 +266,6 @@ class MarketDataEngine:
         if new_atm == self.active_atm_strike:
             return
 
-        print(f"\n[ATM ROTATION] Spot moved to {self.current_spot_price:.2f}. Shifting ATM {self.active_atm_strike} -> {new_atm}")
-        self.active_atm_strike = new_atm
-
         try:
             expiries = self.master.get_active_expiries("NIFTY")
             if not expiries:
@@ -268,17 +286,49 @@ class MarketDataEngine:
             to_subscribe = new_opt_symbols - self.subscribed_option_symbols
 
             if to_unsubscribe:
-                print(f"[ROTATION] Unsubscribing {len(to_unsubscribe)} stale strikes: {to_unsubscribe}")
                 self.ws_client.unsubscribe(list(to_unsubscribe))
                 self.subscribed_option_symbols -= to_unsubscribe
 
             if to_subscribe:
-                print(f"[ROTATION] Subscribing {len(to_subscribe)} new ATM strikes: {to_subscribe}")
                 self.ws_client.subscribe(list(to_subscribe))
                 self.subscribed_option_symbols |= to_subscribe
 
+            # Only commit new ATM strike after subscription requests succeed
+            print(f"\n[ATM ROTATION] Spot moved to {self.current_spot_price:.2f}. Shifted ATM {self.active_atm_strike} -> {new_atm}")
+            self.active_atm_strike = new_atm
+
         except Exception as e:
-            print(f"[WARN] Option rotation error: {e}")
+            print(f"[WARN] Option rotation error (will retry next interval): {e}")
+
+    def _poll_option_chain_if_due(self, is_open: bool) -> None:
+        """Polls full FYERS option chain matrix and persists to DuckDB."""
+        now = now_ist()
+        if self.last_option_chain_time is not None:
+            elapsed = (now - self.last_option_chain_time).total_seconds()
+            if elapsed < 180.0:
+                return
+
+        # Fetch option chain
+        try:
+            loop = asyncio.new_event_loop()
+            chain = loop.run_until_complete(
+                self.rest_client.get_option_chain(symbol=settings.PRIMARY_INDEX, strikecount=10)
+            )
+            loop.close()
+
+            self.store.save_option_chain_snapshot(chain)
+            self.last_option_chain_time = now
+            self.latest_option_chain_pcr = chain.pcr
+            self.latest_total_call_oi = chain.total_call_oi
+            self.latest_total_put_oi = chain.total_put_oi
+
+            print(
+                f"[OPTION CHAIN SNAPSHOT] Expiry: {chain.expiry} | PCR: {chain.pcr:.3f} | "
+                f"Call OI: {chain.total_call_oi:,} | Put OI: {chain.total_put_oi:,}"
+            )
+        except Exception:
+            # During weekend/holiday, broker endpoint may be unavailable
+            pass
 
     def start(self):
         """Starts streaming and monitoring pipeline."""
@@ -326,10 +376,8 @@ class MarketDataEngine:
                 # 1. Flush DuckDB buffer periodically
                 self.store.flush_ticks()
 
-                # 2. Clock-driven candle finalization (emits bars on boundary even without immediate ticks)
-                closed_bars = self.builder.flush_closed_bars(now_ist())
-                for bar in closed_bars:
-                    self._on_candle_closed(bar)
+                # 2. Clock-driven candle finalization (emits bars on boundary; callback handles persistence once)
+                self.builder.flush_closed_bars(now_ist())
 
                 # 3. Dynamic option rotation if ATM shifted
                 self.check_and_rotate_options()
@@ -338,24 +386,35 @@ class MarketDataEngine:
                 curr_state = self.calendar.get_session_state(is_derivative=True)
                 is_open = curr_state in (SessionState.REGULAR_CASH, SessionState.DERIVATIVES_EXT, SessionState.SPECIAL_SESSION)
 
+                # 5. Scheduled Option Chain Snapshot
+                self._poll_option_chain_if_due(is_open)
+
                 ws_status = "CONNECTED" if self.ws_client.is_connected else "DISCONNECTED"
                 quote_count = len(self.ws_client.quote_observed_symbols)
                 sub_count = len(watchlist)
+
+                # Differentiate Feed Age from Exchange Network Latency
+                now = now_ist()
+                feed_age = (now - self.last_primary_tick_time).total_seconds() if self.last_primary_tick_time else None
+                net_latency = self.last_primary_network_latency
+
+                feed_age_str = f"{feed_age:.2f}s" if feed_age is not None else "N/A"
+                net_lat_str = f"{net_latency:.3f}s" if net_latency is not None else "N/A"
+
+                pcr_str = f" | PCR: {self.latest_option_chain_pcr:.3f}" if self.latest_option_chain_pcr is not None else ""
 
                 if not is_open:
                     print(
                         f"[HOLIDAY / OFFLINE STATUS] Session: {curr_state.value.upper()} | "
                         f"WS: {ws_status} | Subscribed: {sub_count} | Broker Acks: {self.ws_client.subscription_acks} | "
                         f"Quotes Seen: {quote_count}/{sub_count} | Snapshots: {self.snapshots_accepted} | "
-                        f"Duplicates: {self.duplicates_dropped} | Trading Signals: DISABLED"
+                        f"Duplicates: {self.duplicates_dropped} | Trading Signals: DISABLED{pcr_str}"
                     )
                 else:
-                    nifty_latency = self.freshness.get_latency_seconds(f"tick:{settings.PRIMARY_INDEX}")
-                    lat_str = f"{nifty_latency:.2f}s" if nifty_latency is not None else "Awaiting tick..."
                     print(
                         f"[LIVE STATUS] Session: {curr_state.value.upper()} | "
                         f"WS: {ws_status} | Live Ticks: {self.live_ticks_accepted} | Candles: {self.candle_count} | "
-                        f"NIFTY Latency: {lat_str} | Quotes Seen: {quote_count}/{sub_count}"
+                        f"NIFTY Feed Age: {feed_age_str} | Network Latency: {net_lat_str} | Quotes Seen: {quote_count}/{sub_count}{pcr_str}"
                     )
         except KeyboardInterrupt:
             print("\nShutting down cleanly...")

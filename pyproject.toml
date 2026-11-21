@@ -41,6 +41,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src", "scripts"]
 markers = [
     "unit: Unit tests",
     "integration: Integration tests",

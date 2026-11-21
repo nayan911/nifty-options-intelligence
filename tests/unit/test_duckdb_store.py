@@ -81,6 +81,28 @@ def test_bulk_tick_insert_and_resample(store):
     assert df_ohlc.iloc[0]["volume"] == 100 * 50
 
 
+def test_resample_ticks_strictly_excludes_snapshots(store):
+    """Verify that off-market SNAPSHOT ticks are strictly excluded from OHLC candle resampling."""
+    base_time = IST.localize(datetime(2026, 11, 26, 9, 15, 0))
+
+    # 1. Insert 2 LIVE ticks with 100 volume each
+    t1 = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_time, ltp=25100.0, incremental_volume=100, event_class="LIVE")
+    t2 = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_time + timedelta(seconds=10), ltp=25120.0, incremental_volume=100, event_class="LIVE")
+
+    # 2. Insert 1 SNAPSHOT tick with anomalous price 25200 and volume 500
+    t_snap = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_time + timedelta(seconds=20), ltp=25200.0, incremental_volume=500, event_class="SNAPSHOT")
+
+    store.insert_ticks_bulk([t1, t2, t_snap])
+
+    df = store.resample_ticks_to_ohlc(symbol="NSE:NIFTY26NOVFUT", interval_minutes=1, event_class="LIVE")
+
+    assert len(df) == 1
+    # High must be 25120 (from LIVE ticks), strictly ignoring SNAPSHOT tick 25200!
+    assert df.iloc[0]["high"] == 25120.0
+    # Volume must be 200, strictly ignoring SNAPSHOT volume 500!
+    assert df.iloc[0]["volume"] == 200
+
+
 def test_save_option_chain_snapshot(store):
     now = IST.localize(datetime(2026, 11, 26, 11, 0, 0))
     snapshot = OptionChainSnapshot(
@@ -261,3 +283,156 @@ def test_option_chain_transactional_rollback_on_failure(store, monkeypatch):
     count_strikes = store._conn.execute("SELECT COUNT(*) FROM option_chain_strikes").fetchone()[0]
     assert count_snaps == 0
     assert count_strikes == 0
+
+
+def test_duckdb_schema_migration_from_legacy_database(tmp_path):
+    """Verify that an older DuckDB file with legacy table schemas is safely migrated:
+    1. Creates automatic backup file.
+    2. Migrates missing columns without data loss or column ordering corruption.
+    3. Successfully writes and reads new option-chain columns with explicit column mapping.
+    """
+    import duckdb
+
+    legacy_db_file = tmp_path / "legacy_test.duckdb"
+
+    # Step 1: Create a genuine legacy database with original schema (prior to commit 0436ec2)
+    conn = duckdb.connect(str(legacy_db_file))
+    conn.execute(
+        """
+        CREATE TABLE ticks (
+            symbol VARCHAR NOT NULL,
+            exchange_timestamp TIMESTAMP WITH TIME ZONE,
+            local_timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+            ltp DOUBLE NOT NULL,
+            volume BIGINT NOT NULL,
+            bid DOUBLE,
+            ask DOUBLE,
+            bid_qty BIGINT,
+            ask_qty BIGINT,
+            oi BIGINT,
+            source VARCHAR DEFAULT 'FYERS'
+        );
+
+        CREATE TABLE candles (
+            symbol VARCHAR NOT NULL,
+            timeframe VARCHAR NOT NULL,
+            timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+            open DOUBLE NOT NULL,
+            high DOUBLE NOT NULL,
+            low DOUBLE NOT NULL,
+            close DOUBLE NOT NULL,
+            volume BIGINT NOT NULL,
+            oi BIGINT,
+            is_closed BOOLEAN DEFAULT FALSE,
+            PRIMARY KEY (symbol, timeframe, timestamp)
+        );
+
+        CREATE TABLE option_chain_snapshots (
+            snapshot_id VARCHAR PRIMARY KEY,
+            underlying VARCHAR NOT NULL,
+            spot_price DOUBLE NOT NULL,
+            timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+            expiry DATE NOT NULL,
+            total_call_oi BIGINT,
+            total_put_oi BIGINT,
+            pcr DOUBLE
+        );
+
+        CREATE TABLE option_chain_strikes (
+            snapshot_id VARCHAR NOT NULL,
+            strike DOUBLE NOT NULL,
+            call_ltp DOUBLE,
+            call_oi BIGINT,
+            call_iv DOUBLE,
+            call_delta DOUBLE,
+            call_theta DOUBLE,
+            put_ltp DOUBLE,
+            put_oi BIGINT,
+            put_iv DOUBLE,
+            put_delta DOUBLE,
+            put_theta DOUBLE,
+            FOREIGN KEY (snapshot_id) REFERENCES option_chain_snapshots(snapshot_id)
+        );
+        """
+    )
+    # Insert legacy row
+    conn.execute(
+        "INSERT INTO ticks VALUES ('NSE:NIFTY50-INDEX', NULL, '2026-11-20 15:30:00+05:30', 24100.0, 0, NULL, NULL, NULL, NULL, NULL, 'FYERS')"
+    )
+    conn.close()
+
+    # Step 2: Open with DuckDBStore - triggers backup and migration
+    store = DuckDBStore(db_path=legacy_db_file)
+
+    # Verify automated backup was created!
+    bak_file = legacy_db_file.with_suffix(".duckdb.bak")
+    assert bak_file.exists()
+    assert bak_file.stat().st_size > 0
+
+    # Step 3: Insert new option chain snapshot with all new columns
+    now = IST.localize(datetime(2026, 11, 26, 11, 0, 0))
+    snapshot = OptionChainSnapshot(
+        underlying="NIFTY",
+        spot_price=25000.0,
+        api_timestamp=now,
+        expiry=date(2026, 11, 26),
+        total_call_oi=100000,
+        total_put_oi=120000,
+        pcr=1.2,
+        strikes=[
+            OptionChainStrike(
+                strike=25000.0,
+                call={
+                    "ltp": 150.0,
+                    "oi": 40000,
+                    "oi_change": 3000,
+                    "volume": 60000,
+                    "bid": 149.5,
+                    "ask": 150.5,
+                    "iv": 14.0,
+                    "delta": 0.55,
+                    "gamma": 0.002,
+                    "theta": -11.0,
+                    "vega": 15.0,
+                },
+                put={
+                    "ltp": 80.0,
+                    "oi": 50000,
+                    "oi_change": -1500,
+                    "volume": 70000,
+                    "bid": 79.5,
+                    "ask": 80.5,
+                    "iv": 13.8,
+                    "delta": -0.45,
+                    "gamma": 0.002,
+                    "theta": -9.5,
+                    "vega": 14.5,
+                },
+            )
+        ],
+    )
+    store.save_option_chain_snapshot(snapshot)
+
+    # Step 4: Verify columns are populated into correct semantic positions
+    row = store._conn.execute(
+        """
+        SELECT strike, call_volume, call_oi_change, call_bid, call_ask, call_gamma, call_vega,
+               put_volume, put_oi_change, put_bid, put_ask, put_gamma, put_vega
+        FROM option_chain_strikes WHERE strike = 25000.0
+        """
+    ).fetchone()
+
+    assert row is not None
+    assert row[0] == 25000.0
+    assert row[1] == 60000  # call_volume
+    assert row[2] == 3000   # call_oi_change
+    assert row[3] == 149.5  # call_bid
+    assert row[4] == 150.5  # call_ask
+    assert row[5] == 0.002  # call_gamma
+    assert row[6] == 15.0   # call_vega
+    assert row[7] == 70000  # put_volume
+    assert row[8] == -1500  # put_oi_change
+    assert row[9] == 79.5   # put_bid
+    assert row[10] == 80.5  # put_ask
+
+    store.close()

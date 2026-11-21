@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS ticks (
     bid_qty BIGINT,
     ask_qty BIGINT,
     oi BIGINT,
-    source VARCHAR DEFAULT 'FYERS'
+    source VARCHAR DEFAULT 'FYERS',
+    event_class VARCHAR DEFAULT 'LIVE'
 );
 
 -- Aggregated OHLCV Candlesticks (1m, 5m, 15m, 1d)

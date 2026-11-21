@@ -131,3 +131,41 @@ def test_stale_latency_during_open_market():
     t = Tick(symbol="NSE:NIFTY26NOVFUT", exchange_timestamp=mon_old_quote, ltp=24100.0, cumulative_volume=50000)
     res = normalizer.normalize(t, current_time=mon_wall_time)
     assert res.status == TickStatus.VALID_SNAPSHOT
+
+
+def test_weekend_snapshot_does_not_corrupt_monday_volume_baseline():
+    """Regression test:
+    Observation 1: Saturday cached quote from Friday with cumulative volume = 1,000,000.
+    Observation 2: Monday 09:15:00 first live tick with cumulative volume = 20,000.
+    Crucial Invariant:
+    Incremental volume on Monday's first tick must be 0 (establishing new session baseline),
+    NOT 20,000 (which would be a massive false volume surge).
+    Observation 3: Monday 09:15:02 tick with cumulative volume = 20,050 -> incremental = 50.
+    """
+    normalizer = TickNormalizer()
+    sat_wall_time = datetime(2026, 11, 21, 14, 0, 0, tzinfo=IST)
+    fri_quote_time = datetime(2026, 11, 20, 15, 29, 0, tzinfo=IST)
+    sym = "NSE:NIFTY26NOVFUT"
+
+    # 1. Saturday off-market quote
+    t_sat = Tick(symbol=sym, exchange_timestamp=fri_quote_time, ltp=24100.0, cumulative_volume=1000000)
+    res_sat = normalizer.normalize(t_sat, current_time=sat_wall_time)
+    assert res_sat.status == TickStatus.VALID_SNAPSHOT
+    assert res_sat.tick.incremental_volume == 0
+    assert res_sat.tick.event_class == "SNAPSHOT"
+
+    # 2. Monday first live market tick (pre-open/opening trades total 20,000)
+    mon_open_time = datetime(2026, 11, 23, 9, 15, 0, tzinfo=IST)
+    t_mon_1 = Tick(symbol=sym, exchange_timestamp=mon_open_time, ltp=24105.0, cumulative_volume=20000)
+    res_mon_1 = normalizer.normalize(t_mon_1, current_time=mon_open_time)
+    assert res_mon_1.status == TickStatus.VALID_LIVE
+    # MUST BE 0 (baseline established for Monday session), NOT 20,000!
+    assert res_mon_1.tick.incremental_volume == 0
+    assert res_mon_1.tick.event_class == "LIVE"
+
+    # 3. Monday second tick with incremental trading
+    t_mon_2_time = mon_open_time + timedelta(seconds=2)
+    t_mon_2 = Tick(symbol=sym, exchange_timestamp=t_mon_2_time, ltp=24108.0, cumulative_volume=20050)
+    res_mon_2 = normalizer.normalize(t_mon_2, current_time=t_mon_2_time)
+    assert res_mon_2.status == TickStatus.VALID_LIVE
+    assert res_mon_2.tick.incremental_volume == 50
