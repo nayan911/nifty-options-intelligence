@@ -139,6 +139,7 @@ class RealtimeCandleBuilder:
                 elif bar_start > active.start_time:
                     # Interval boundary crossed -> close previous bar
                     closed_candle = active.to_candle(is_closed=True)
+                    closed_candle.observed_at = tick_time
                     closed_candles.append(closed_candle)
 
                     # Start fresh bar

@@ -69,6 +69,7 @@ class Candle(BaseModel):
     volume: int = Field(default=0, description="Traded volume strictly within this candle's duration")
     oi: Optional[int] = None
     is_closed: bool = False
+    observed_at: Optional[datetime] = Field(default=None, description="Actual observation timestamp when candle was closed/emitted")
 
 
 class OptionContract(BaseModel):

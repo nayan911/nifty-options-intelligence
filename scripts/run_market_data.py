@@ -211,15 +211,23 @@ class MarketDataEngine:
 
     def _on_technical_candidate(self, candidate: TechnicalCandidate) -> None:
         """Invoked when Phase C MultiTimeframeAnalyzer confirms a unified 15m+5m+1m technical setup."""
+        headroom_str = (
+            f"{candidate.headroom_points:.1f}pts"
+            if candidate.headroom_points is not None
+            else "N/A"
+        )
+        t1_rr_str = f"{candidate.target_1_rr:.2f}R" if hasattr(candidate, "target_1_rr") else "1.50R"
+        t2_rr_str = f"{candidate.target_2_rr:.2f}R" if hasattr(candidate, "target_2_rr") else "2.00R"
+
         print(
             f"\n{'*'*78}\n"
             f"  [PHASE C: QUALIFIED MULTI-TIMEFRAME TECHNICAL CANDIDATE]\n"
             f"  {candidate.summary()}\n"
             f"  Macro 15m Trend: {candidate.timeframe_breakdown.get('15m_trend')} | "
             f"5m RVOL: {candidate.timeframe_breakdown.get('5m_rvol')}x | "
-            f"15m Headroom: {candidate.headroom_points:.1f}pts\n"
+            f"15m Headroom: {headroom_str}\n"
             f"  Entry: {candidate.entry_price:.2f} | SL: {candidate.stop_loss:.2f} | "
-            f"T1: {candidate.target_1:.2f} | T2: {candidate.target_2:.2f} | R:R: 1:{candidate.risk_reward_ratio}\n"
+            f"T1: {candidate.target_1:.2f} ({t1_rr_str}) | T2: {candidate.target_2:.2f} ({t2_rr_str}) | R:R: 1:{candidate.risk_reward_ratio}\n"
             f"{'*'*78}\n"
         )
 

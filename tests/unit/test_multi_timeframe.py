@@ -1943,3 +1943,311 @@ def test_multi_timeframe_intrabar_stop_loss_breach():
     assert len(analyzer.active_setups) == 0
 
 
+def test_multi_timeframe_live_pipeline_actual_available_at_propagation():
+    """Verify Live Pipeline: When futures arrives late with observed_at, actual_available_at is propagated end-to-end."""
+    candidates = []
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+        on_technical_candidate=lambda c: candidates.append(c),
+    )
+    if engine.multi_timeframe_analyzer:
+        engine.multi_timeframe_analyzer.min_confluence_score = 40.0
+    start_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+    spot_sym = "NSE:NIFTY50-INDEX"
+    fut_sym = "NSE:NIFTY26NOVFUT"
+
+    # Set daily references
+    engine.set_daily_references(spot_sym, pdh=25100.0, pdl=24900.0, pdc=25000.0, cdo=25020.0)
+
+    # Warm up 21 5m candles below PDH (25050-25080) and keep 15m context fresh
+    for i in range(21):
+        ts_cur = start_time + timedelta(minutes=5 * i)
+        if i % 3 == 0:
+            engine.on_candle(
+                Candle(
+                    symbol=spot_sym,
+                    timeframe="15m",
+                    timestamp=ts_cur,
+                    open=25020.0,
+                    high=25080.0,
+                    low=25010.0,
+                    close=25075.0,
+                    volume=0,
+                    is_closed=True,
+                )
+            )
+        engine.on_candle(
+            Candle(
+                symbol=fut_sym,
+                timeframe="5m",
+                timestamp=ts_cur,
+                open=25070.0,
+                high=25085.0,
+                low=25065.0,
+                close=25080.0,
+                volume=2000,
+                is_closed=True,
+            )
+        )
+        engine.on_candle(
+            Candle(
+                symbol=spot_sym,
+                timeframe="5m",
+                timestamp=ts_cur,
+                open=25070.0,
+                high=25085.0,
+                low=25065.0,
+                close=25080.0,
+                volume=0,
+                is_closed=True,
+            )
+        )
+
+    # Breakout candle at 11:00 (closes at 11:05)
+    ts_bo = start_time + timedelta(minutes=5 * 21)
+    engine.on_candle(
+        Candle(
+            symbol=fut_sym,
+            timeframe="5m",
+            timestamp=ts_bo,
+            open=25085.0,
+            high=25125.0,
+            low=25080.0,
+            close=25120.0,
+            volume=8000,
+            is_closed=True,
+        )
+    )
+    engine.on_candle(
+        Candle(
+            symbol=spot_sym,
+            timeframe="5m",
+            timestamp=ts_bo,
+            open=25085.0,
+            high=25125.0,
+            low=25080.0,
+            close=25120.0,
+            volume=0,
+            is_closed=True,
+        )
+    )
+
+    # Retest candle at 11:05 (closes at 11:10)
+    ts_re = start_time + timedelta(minutes=5 * 22)
+    # Spot 5m candle closes at 11:10 (interval 11:05-11:10), but has no volume -> waits for futures
+    c_spot_5m = Candle(
+        symbol=spot_sym,
+        timeframe="5m",
+        timestamp=ts_re,
+        open=25105.0,
+        high=25115.0,
+        low=25098.0,
+        close=25110.0,
+        volume=0,
+        is_closed=True,
+    )
+    engine.on_candle(c_spot_5m)
+    # Spot 5m is waiting for futures volume
+    assert len(engine.multi_timeframe_analyzer.active_setups) == 0
+
+    # Futures 5m candle arrives at 11:11:20 (observed_at = 11:11:20)
+    actual_arrival = ts_re + timedelta(minutes=6, seconds=20)  # 11:11:20
+    c_fut_5m = Candle(
+        symbol=fut_sym,
+        timeframe="5m",
+        timestamp=ts_re,
+        open=25105.0,
+        high=25115.0,
+        low=25098.0,
+        close=25110.0,
+        volume=3000,
+        is_closed=True,
+        observed_at=actual_arrival,
+    )
+    engine.on_candle(c_fut_5m)
+
+    # Invariant: Active setup qualified with genuine available_at = 11:11:20!
+    assert len(engine.multi_timeframe_analyzer.active_setups) >= 1
+    active = list(engine.multi_timeframe_analyzer.active_setups.values())[0]
+    assert active.available_at == actual_arrival
+
+    # 1m candle for 11:10-11:11 (closes at 11:11:00 < 11:11:20 actual arrival)
+    c_1m_early = Candle(
+        symbol=spot_sym,
+        timeframe="1m",
+        timestamp=ts_re + timedelta(minutes=5),  # 11:10-11:11
+        open=25110.0,
+        high=25118.0,
+        low=25108.0,
+        close=25115.0,
+        volume=0,
+        is_closed=True,
+    )
+    engine.on_candle(c_1m_early)
+    # Invariant: 11:10-11:11 candle closed before futures arrived; no candidate emitted
+    assert len(candidates) == 0
+
+    # 1m candle for 11:11-11:12 (closes at 11:12:00 > 11:11:20)
+    c_1m_valid = Candle(
+        symbol=spot_sym,
+        timeframe="1m",
+        timestamp=ts_re + timedelta(minutes=6),  # 11:11-11:12
+        open=25112.0,
+        high=25122.0,
+        low=25110.0,
+        close=25118.0,
+        volume=0,
+        is_closed=True,
+    )
+    engine.on_candle(c_1m_valid)
+    # Invariant: Candidate emitted on the first 1m bar that closed after actual available_at!
+    assert len(candidates) >= 1
+
+
+def test_multi_timeframe_simultaneous_arrival_order_invariance():
+    """Verify Invariance: When 5m and 15m close on the same minute, order of arrival does not change output."""
+    base_time = IST.localize(datetime(2026, 11, 23, 10, 0))
+    sym = "NSE:NIFTY50-INDEX"
+
+    _c_5m = Candle(
+        symbol=sym,
+        timeframe="5m",
+        timestamp=base_time + timedelta(minutes=10),  # 10:10-10:15
+        open=25080.0,
+        high=25125.0,
+        low=25075.0,
+        close=25115.0,
+        volume=0,
+        is_closed=True,
+    )
+    snap_5m = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time + timedelta(minutes=10),
+        timeframe="5m",
+        open=25080.0,
+        high=25125.0,
+        low=25075.0,
+        close=25115.0,
+        volume=0,
+        atr=20.0,
+        rvol=2.0,
+    )
+    setup = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type="PDH",
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        current_state=BreakoutState.SETUP_ELIGIBLE,
+        start_time=base_time + timedelta(minutes=10),
+        symbol=sym,
+        timeframe="5m",
+        stop_loss=25080.0,
+    )
+
+    snap_15m = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time,  # 10:00-10:15 (closes at 10:15)
+        timeframe="15m",
+        open=25020.0,
+        high=25120.0,
+        low=25010.0,
+        close=25110.0,
+        volume=0,
+        trend_bias="BULLISH",
+    )
+
+    # Run A: 15m processed first, then 5m processed
+    engine_a = TechnicalAnalysisEngine(primary_index=sym, primary_futures="NSE:NIFTY26NOVFUT")
+    analyzer_a = MultiTimeframeAnalyzer(engine=engine_a)
+    engine_a.states[sym].latest_snapshots["15m"] = snap_15m
+    engine_a.states[sym].snapshot_history["15m"].append(snap_15m)
+    res_a = analyzer_a.on_5m_setup(setup, snap_5m)
+
+    # Run B: 5m processed first (buffered in _pending_5m_setups), then 15m processed
+    engine_b = TechnicalAnalysisEngine(primary_index=sym, primary_futures="NSE:NIFTY26NOVFUT")
+    analyzer_b = MultiTimeframeAnalyzer(engine=engine_b)
+    # At first, 15m has not arrived yet: on_5m_setup buffers
+    res_b_early = analyzer_b.on_5m_setup(setup, snap_5m)
+    assert res_b_early is None
+    assert len(analyzer_b._pending_5m_setups) == 1
+
+    # Now 15m arrives
+    engine_b.states[sym].latest_snapshots["15m"] = snap_15m
+    engine_b.states[sym].snapshot_history["15m"].append(snap_15m)
+    analyzer_b.on_15m_snapshot(snap_15m)
+
+    # Invariant: Both runs end up with the identical qualified active setup!
+    assert res_a is not None
+    assert setup.setup_id in analyzer_a.active_setups
+    assert setup.setup_id in analyzer_b.active_setups
+    assert analyzer_a.active_setups[setup.setup_id].available_at == analyzer_b.active_setups[setup.setup_id].available_at
+
+
+def test_multi_timeframe_independent_rr_telemetry():
+    """Verify Telemetry: TechnicalCandidate reports independent actual R:R for both Target 1 and Target 2."""
+    candidate = TechnicalCandidate(
+        candidate_id="NSE_NIFTY50-INDEX_20261123_101500_BULLISH_PDH_25100.0",
+        symbol="NSE:NIFTY50-INDEX",
+        timestamp=IST.localize(datetime(2026, 11, 23, 10, 15)),
+        direction=BreakoutDirection.BULLISH,
+        setup_level="PDH_25100.0",
+        nominal_price=25100.0,
+        entry_price=25000.0,
+        stop_loss=24980.0,  # Risk = 20 pts
+        target_1=25030.0,  # +30 pts = 1.5R
+        target_2=25035.0,  # +35 pts = 1.75R (capped at resistance)
+        risk_points=20.0,
+        reward_points=30.0,
+        risk_reward_ratio=1.5,
+        confluence_score=85.0,
+        target_1_rr=1.50,
+        target_2_rr=1.75,
+        headroom_points=35.0,
+    )
+
+    summary = candidate.summary()
+    # Invariant: Telemetry accurately distinguishes 1.50R from 1.75R
+    assert "T1: 25030.00 (1.50R)" in summary
+    assert "T2: 25035.00 (1.75R)" in summary
+
+
+def test_market_data_runner_callback_none_headroom(capsys):
+    """Verify Runner Callback: _on_technical_candidate formats safely when headroom_points is None."""
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from scripts.run_market_data import MarketDataEngine
+
+    candidate = TechnicalCandidate(
+        candidate_id="NSE_NIFTY50-INDEX_20261123_101500_BULLISH_PDH_25100.0",
+        symbol="NSE:NIFTY50-INDEX",
+        timestamp=IST.localize(datetime(2026, 11, 23, 10, 15)),
+        direction=BreakoutDirection.BULLISH,
+        setup_level="PDH_25100.0",
+        nominal_price=25100.0,
+        entry_price=25110.0,
+        stop_loss=25095.0,
+        target_1=25132.5,
+        target_2=25140.0,
+        risk_points=15.0,
+        reward_points=22.5,
+        risk_reward_ratio=1.5,
+        confluence_score=75.0,
+        target_1_rr=1.50,
+        target_2_rr=2.00,
+        headroom_points=None,  # None headroom must not crash formatting!
+        timeframe_breakdown={"15m_trend": "BULLISH", "5m_rvol": 2.1},
+    )
+
+    runner = object.__new__(MarketDataEngine)
+    # Invariant: Executes cleanly without raising TypeError
+    runner._on_technical_candidate(candidate)
+    captured = capsys.readouterr()
+    assert "15m Headroom: N/A" in captured.out
+    assert "T1: 25132.50 (1.50R)" in captured.out
+
+
+

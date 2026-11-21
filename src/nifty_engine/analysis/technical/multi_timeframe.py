@@ -5,6 +5,7 @@ Coordinates the 3-tier hierarchical technical analysis funnel:
    - Trend direction validation (BULLISH, BEARISH, SIDEWAYS).
    - Headroom verification: requires >= 1.5x ATR distance to opposing 15m S/R barriers.
    - Causal snapshot retrieval with zero lookahead bias and strict freshness thresholds.
+   - Coordinates overlapping candle-close events (e.g. at :15, :30, :45, :00) regardless of arrival order.
 2. Tier 2 (5m Setup Qualification):
    - Listens for 5m Breakout & Retest transitions to SETUP_ELIGIBLE.
    - Validates futures volume surge (RVOL >= 1.3x).
@@ -18,6 +19,7 @@ Coordinates the 3-tier hierarchical technical analysis funnel:
    - Permanent invalidation for failed breakout levels or stop-loss breaches.
    - Optimizes stop-loss anchoring to recent 1m micro-swings with correct directional boundary.
    - Enforces Target 1 obstacle clearance and strictly caps Target 2 at opposing 15m barriers.
+   - Reports independent, accurate R:R telemetry for both Target 1 and Target 2.
    - Strict zero-tolerance confluence scoring: missing/unknown data awards 0 points.
    - Emits a unified, deterministic TechnicalCandidate.
 """
@@ -26,7 +28,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from nifty_engine.analysis.technical.breakouts import (
     BreakoutContext,
@@ -72,6 +74,8 @@ class TechnicalCandidate:
     reward_points: float
     risk_reward_ratio: float
     confluence_score: float
+    target_1_rr: float = 1.5
+    target_2_rr: float = 2.0
     headroom_points: Optional[float] = None
     timeframe_breakdown: Dict[str, Any] = field(default_factory=dict)
     is_paper_trading: bool = True
@@ -81,7 +85,8 @@ class TechnicalCandidate:
         hd_str = f"{self.headroom_points:.1f}pts" if self.headroom_points is not None else "N/A"
         return (
             f"[{self.candidate_id}] {self.symbol} {self.direction.value} @ {self.entry_price:.2f} | "
-            f"SL: {self.stop_loss:.2f} | T1: {self.target_1:.2f} (1.5R) | T2: {self.target_2:.2f} (2.0R) | "
+            f"SL: {self.stop_loss:.2f} | T1: {self.target_1:.2f} ({self.target_1_rr:.2f}R) | "
+            f"T2: {self.target_2:.2f} ({self.target_2_rr:.2f}R) | "
             f"Risk: {self.risk_points:.1f}pts | Headroom: {hd_str} | Score: {self.confluence_score:.0f}/100"
         )
 
@@ -130,6 +135,8 @@ class MultiTimeframeAnalyzer:
 
         # In-flight setups waiting for 1m entry timing: {setup_id: Active5mSetup}
         self.active_setups: Dict[str, Active5mSetup] = {}
+        # Arrival-order coordination buffer: {setup_id: (setup, snap_5m, available_at)}
+        self._pending_5m_setups: Dict[str, Tuple[BreakoutContext, TechnicalSnapshot, Optional[datetime]]] = {}
         # Avoid duplicate candidate dispatches: {candidate_id}
         self.notified_candidates: Set[str] = set()
         self.current_session_date: Optional[date] = None
@@ -143,7 +150,16 @@ class MultiTimeframeAnalyzer:
         if candle_date > self.current_session_date:
             self.current_session_date = candle_date
             self.active_setups.clear()
+            self._pending_5m_setups.clear()
             self.notified_candidates.clear()
+
+    def on_15m_snapshot(self, snap_15m: TechnicalSnapshot) -> None:
+        """Invoked when a 15m candle completes, unblocking simultaneous 5m setups waiting for it."""
+        with self._lock:
+            for sid, (setup, snap_5m, avail_at) in list(self._pending_5m_setups.items()):
+                if setup.symbol == snap_15m.symbol and snap_5m.bar_close_time == snap_15m.bar_close_time:
+                    del self._pending_5m_setups[sid]
+                    self._qualify_5m_setup(setup, snap_5m, available_at=avail_at)
 
     def on_5m_setup(
         self,
@@ -156,76 +172,93 @@ class MultiTimeframeAnalyzer:
             self._check_session_rollover(snap_5m.timestamp)
 
             bar_close = snap_5m.bar_close_time
-            # Genuine availability timestamp when all volume confirmations completed
             actual_available_at = available_at or getattr(snap_5m, "available_at", None) or bar_close
             actual_available_at = max(actual_available_at, bar_close)
 
-            # 1. Retrieve 15m snapshot available as of actual_available_at (strictly zero lookahead)
-            snap_15m = self.engine.get_snapshot(setup.symbol, timeframe="15m", as_of=actual_available_at)
-            if not snap_15m:
-                # 15m structure not yet completed/observed by available_at; cannot qualify without macro context
-                return None
-
-            # Verify no future leakage: 15m bar close must be on or before actual_available_at
-            if snap_15m.bar_close_time > actual_available_at:
-                return None
-
-            # Verify freshness of 15m market context
-            age_15m = (actual_available_at - snap_15m.bar_close_time).total_seconds()
-            if age_15m > self.max_15m_macro_age_seconds or snap_15m.timestamp.date() != actual_available_at.date():
-                return None
-
-            # 2. Tier 1 Macro Trend Bias Filter
-            macro_trend = snap_15m.trend_bias
-            if macro_trend == "INSUFFICIENT_DATA":
-                return None
-
-            if setup.direction == BreakoutDirection.BULLISH:
-                if macro_trend == "BEARISH":
-                    # Strictly reject counter-trend bullish breakout against 15m downtrend
-                    return None
-            elif setup.direction == BreakoutDirection.BEARISH:
-                if macro_trend == "BULLISH":
-                    # Strictly reject counter-trend bearish breakout against 15m uptrend
+            # Check if this 5m candle closed on a 15m boundary (:00, :15, :30, :45)
+            # If so, coordinate arrival order: wait if simultaneous 15m candle has not completed yet
+            if bar_close.minute % 15 == 0:
+                snap_15m = self.engine.get_snapshot(setup.symbol, timeframe="15m", as_of=actual_available_at)
+                if snap_15m is None or snap_15m.bar_close_time < bar_close:
+                    self._pending_5m_setups[setup.setup_id] = (setup, snap_5m, actual_available_at)
                     return None
 
-            # 3. Tier 1 Headroom to Opposing 15m S/R Obstacles
-            atr_5m = snap_5m.atr
-            min_headroom = max(self.min_headroom_atr_multiple * atr_5m, 25.0) if atr_5m is not None else 25.0
+            return self._qualify_5m_setup(setup, snap_5m, actual_available_at)
 
-            opposing_zone: Optional[PriceZone] = None
-            headroom_points: Optional[float] = None
+    def _qualify_5m_setup(
+        self,
+        setup: BreakoutContext,
+        snap_5m: TechnicalSnapshot,
+        available_at: datetime,
+    ) -> Optional[Active5mSetup]:
+        """Core Tier 1 qualification evaluating 15m macro trend and headroom."""
+        bar_close = snap_5m.bar_close_time
 
-            if setup.direction == BreakoutDirection.BULLISH:
-                if snap_15m.nearest_resistance and snap_15m.nearest_resistance.nominal_price > setup.nominal_price:
-                    opposing_zone = snap_15m.nearest_resistance
-                    headroom_points = max(0.0, opposing_zone.lower_bound - snap_5m.close)
-                    if headroom_points < min_headroom:
-                        # Major 15m resistance is too close; unfavorable risk-reward
-                        return None
-            elif setup.direction == BreakoutDirection.BEARISH:
-                if snap_15m.nearest_support and snap_15m.nearest_support.nominal_price < setup.nominal_price:
-                    opposing_zone = snap_15m.nearest_support
-                    headroom_points = max(0.0, snap_5m.close - opposing_zone.upper_bound)
-                    if headroom_points < min_headroom:
-                        # Major 15m support is too close; unfavorable risk-reward
-                        return None
+        # 1. Retrieve 15m snapshot available as of available_at (strictly zero lookahead)
+        snap_15m = self.engine.get_snapshot(setup.symbol, timeframe="15m", as_of=available_at)
+        if not snap_15m:
+            return None
 
-            # 4. Qualify 5m setup and wait for 1m entry trigger
-            expiry_dt = actual_available_at + timedelta(minutes=self.entry_window_minutes)
-            active = Active5mSetup(
-                setup=setup,
-                snapshot_5m=snap_5m,
-                qualified_time=snap_5m.timestamp,
-                bar_close_time=bar_close,
-                available_at=actual_available_at,
-                expiry_time=expiry_dt,
-                headroom_points=headroom_points,
-                opposing_zone=opposing_zone,
-                state=SetupLifecycleState.WAITING_ENTRY,
-            )
-            self.active_setups[setup.setup_id] = active
-            return active
+        # Verify no future leakage: 15m bar close must be on or before available_at
+        if snap_15m.bar_close_time > available_at:
+            return None
+
+        # Verify freshness of 15m market context
+        age_15m = (available_at - snap_15m.bar_close_time).total_seconds()
+        if age_15m > self.max_15m_macro_age_seconds or snap_15m.timestamp.date() != available_at.date():
+            return None
+
+        # 2. Tier 1 Macro Trend Bias Filter
+        macro_trend = snap_15m.trend_bias
+        if macro_trend == "INSUFFICIENT_DATA":
+            return None
+
+        if setup.direction == BreakoutDirection.BULLISH:
+            if macro_trend == "BEARISH":
+                # Strictly reject counter-trend bullish breakout against 15m downtrend
+                return None
+        elif setup.direction == BreakoutDirection.BEARISH:
+            if macro_trend == "BULLISH":
+                # Strictly reject counter-trend bearish breakout against 15m uptrend
+                return None
+
+        # 3. Tier 1 Headroom to Opposing 15m S/R Obstacles
+        atr_5m = snap_5m.atr
+        min_headroom = max(self.min_headroom_atr_multiple * atr_5m, 25.0) if atr_5m is not None else 25.0
+
+        opposing_zone: Optional[PriceZone] = None
+        headroom_points: Optional[float] = None
+
+        if setup.direction == BreakoutDirection.BULLISH:
+            if snap_15m.nearest_resistance and snap_15m.nearest_resistance.nominal_price > setup.nominal_price:
+                opposing_zone = snap_15m.nearest_resistance
+                headroom_points = max(0.0, opposing_zone.lower_bound - snap_5m.close)
+                if headroom_points < min_headroom:
+                    # Major 15m resistance is too close; unfavorable risk-reward
+                    return None
+        elif setup.direction == BreakoutDirection.BEARISH:
+            if snap_15m.nearest_support and snap_15m.nearest_support.nominal_price < setup.nominal_price:
+                opposing_zone = snap_15m.nearest_support
+                headroom_points = max(0.0, snap_5m.close - opposing_zone.upper_bound)
+                if headroom_points < min_headroom:
+                    # Major 15m support is too close; unfavorable risk-reward
+                    return None
+
+        # 4. Qualify 5m setup and wait for 1m entry trigger
+        expiry_dt = available_at + timedelta(minutes=self.entry_window_minutes)
+        active = Active5mSetup(
+            setup=setup,
+            snapshot_5m=snap_5m,
+            qualified_time=snap_5m.timestamp,
+            bar_close_time=bar_close,
+            available_at=available_at,
+            expiry_time=expiry_dt,
+            headroom_points=headroom_points,
+            opposing_zone=opposing_zone,
+            state=SetupLifecycleState.WAITING_ENTRY,
+        )
+        self.active_setups[setup.setup_id] = active
+        return active
 
     def on_1m_candle(
         self,
@@ -237,6 +270,12 @@ class MultiTimeframeAnalyzer:
             self._check_session_rollover(candle.timestamp)
 
             candle_close_time = get_bar_close_time(candle.timestamp, "1m")
+
+            # Flush any pending simultaneous 5m setups whose 15m candle did not arrive before 1m tick
+            for sid, (setup, snap_5m, avail_at) in list(self._pending_5m_setups.items()):
+                if candle_close_time > snap_5m.bar_close_time:
+                    del self._pending_5m_setups[sid]
+                    self._qualify_5m_setup(setup, snap_5m, available_at=avail_at or snap_5m.bar_close_time)
 
             # 1. Purge expired active setups
             for sid, active in list(self.active_setups.items()):
@@ -497,7 +536,12 @@ class MultiTimeframeAnalyzer:
                     target_2 = round(barrier_price, 1)
             reward_points = entry_price - target_1
 
-        rr_ratio = round(reward_points / risk_points, 2) if risk_points > 0 else 0.0
+        # Calculate exact independent reward-to-risk ratios for telemetry
+        reward_1 = abs(target_1 - entry_price)
+        reward_2 = abs(target_2 - entry_price)
+        t1_rr = round(reward_1 / risk_points, 2) if risk_points > 0 else 0.0
+        t2_rr = round(reward_2 / risk_points, 2) if risk_points > 0 else 0.0
+        rr_ratio = t1_rr
 
         # 7. Confluence Scoring (0-100) — STRICT: 0 pts for missing/unknown data
         score = self._compute_confluence_score(
@@ -536,6 +580,8 @@ class MultiTimeframeAnalyzer:
             reward_points=round(reward_points, 1),
             risk_reward_ratio=rr_ratio,
             confluence_score=round(score, 1),
+            target_1_rr=t1_rr,
+            target_2_rr=t2_rr,
             headroom_points=round(live_headroom, 1) if live_headroom is not None else None,
             timeframe_breakdown={
                 "15m_trend": snap_15m.trend_bias,

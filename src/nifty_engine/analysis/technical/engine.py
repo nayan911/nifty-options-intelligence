@@ -198,11 +198,11 @@ class SymbolTechnicalState:
         history = self.snapshot_history.get(timeframe)
         if history:
             for snap in reversed(history):
-                if snap.bar_close_time <= as_of:
+                if snap.effective_available_at <= as_of:
                     return snap
 
         latest = self.latest_snapshots.get(timeframe)
-        if latest is not None and latest.bar_close_time <= as_of:
+        if latest is not None and latest.effective_available_at <= as_of:
             return latest
 
         return None
@@ -442,6 +442,7 @@ class SymbolTechnicalState:
         timeframe: str,
         futures_rvol: Optional[float],
         futures_timestamp: Optional[datetime] = None,
+        futures_observed_at: Optional[datetime] = None,
         on_setup_candidate: Optional[Callable[[BreakoutContext, TechnicalSnapshot], None]] = None,
     ) -> None:
         """Executes deferred breakout evaluation for a spot candle once synchronized futures volume arrives."""
@@ -455,8 +456,8 @@ class SymbolTechnicalState:
         if futures_timestamp is not None and abs((candle.timestamp - futures_timestamp).total_seconds()) > 5.0:
             effective_rvol = None
 
-        actual_available_at = None
-        if futures_timestamp is not None:
+        actual_available_at = futures_observed_at
+        if actual_available_at is None and futures_timestamp is not None:
             fut_close = get_bar_close_time(futures_timestamp, timeframe)
             spot_close = get_bar_close_time(candle.timestamp, timeframe)
             actual_available_at = max(spot_close, fut_close)
@@ -1330,6 +1331,7 @@ class TechnicalAnalysisEngine:
                                 timeframe=candle.timeframe,
                                 futures_rvol=fut_rvol,
                                 futures_timestamp=candle.timestamp,
+                                futures_observed_at=candle.observed_at,
                                 on_setup_candidate=self._dispatch_setup_candidate,
                             )
                     elif candle.timestamp > pending_spot_candle.timestamp:
@@ -1339,6 +1341,7 @@ class TechnicalAnalysisEngine:
                         spot_state.complete_breakout_evaluation(
                             timeframe=candle.timeframe,
                             futures_rvol=None,
+                            futures_observed_at=candle.observed_at,
                             on_setup_candidate=self._dispatch_setup_candidate,
                         )
 
@@ -1351,6 +1354,15 @@ class TechnicalAnalysisEngine:
                 and snapshot.timestamp == candle.timestamp
             ):
                 self.multi_timeframe_analyzer.on_1m_candle(candle, snapshot)
+
+            # Phase C: 15m snapshot coordination unblocking simultaneous 5m setups
+            if (
+                snapshot
+                and candle.timeframe == "15m"
+                and self.multi_timeframe_analyzer
+                and state.last_candle_accepted.get("15m", False)
+            ):
+                self.multi_timeframe_analyzer.on_15m_snapshot(snapshot)
 
             return snapshot
 
