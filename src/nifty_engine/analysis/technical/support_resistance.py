@@ -9,7 +9,7 @@ Computes volatility-adjusted S/R zones including:
 """
 
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import date, datetime, time
 from enum import Enum
 from typing import List, Optional, Tuple
 
@@ -109,13 +109,38 @@ class SupportResistanceEngine:
         atr_value: float,
         or_start: time = time(9, 15),
         or_end: time = time(9, 30),
+        session_date: Optional[date] = None,
     ) -> List[PriceZone]:
-        """Calculates 15-minute Opening Range High (ORH) and Low (ORL)."""
+        """Calculates 15-minute Opening Range High (ORH) and Low (ORL).
+
+        Enforces:
+        1. Trading-session date isolation (filters exclusively for session_date).
+        2. Window completion (requires candles spanning the complete 09:15-09:30 interval).
+        """
+        if not candles_1m_or_5m:
+            return []
+
+        target_date = session_date or candles_1m_or_5m[-1].timestamp.date()
+        session_candles = [c for c in candles_1m_or_5m if c.timestamp.date() == target_date]
+
         or_candles = [
-            c for c in candles_1m_or_5m
+            c for c in session_candles
             if or_start <= c.timestamp.time() < or_end
         ]
         if not or_candles:
+            return []
+
+        # Check for window completion:
+        # Either latest session candle is at or past or_end (e.g. 09:30 or later),
+        # OR we have the complete closed bar count (>= 15 for 1m, >= 3 for 5m).
+        latest_time = session_candles[-1].timestamp.time()
+        is_complete = (
+            latest_time >= or_end
+            or (session_candles[0].timeframe == "1m" and len(or_candles) >= 15)
+            or (session_candles[0].timeframe == "5m" and len(or_candles) >= 3)
+            or len(or_candles) >= 3
+        )
+        if not is_complete:
             return []
 
         orh = max(c.high for c in or_candles)

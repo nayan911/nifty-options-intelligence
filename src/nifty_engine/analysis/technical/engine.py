@@ -15,8 +15,8 @@ Orchestrates streaming technical and structural quantitative analysis across sub
 
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, time
-from typing import Callable, Deque, Dict, List, Optional, Tuple
+from datetime import date, datetime, time
+from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -138,6 +138,11 @@ class SymbolTechnicalState:
         self.latest_5m_rvol: Optional[float] = None
         self.latest_5m_rvol_timestamp: Optional[datetime] = None
 
+        # Trading session state & isolation
+        self.current_session_date: Optional[date] = None
+        self.session_open_price: Optional[float] = None
+        self.notified_setup_ids: Set[str] = set()
+
     @property
     def latest_snapshot(self) -> Optional[TechnicalSnapshot]:
         """Backward-compatible property returning the latest 1m snapshot."""
@@ -162,6 +167,68 @@ class SymbolTechnicalState:
             "CDO": cdo,
         }
 
+    def _check_session_rollover(self, candle_timestamp: datetime) -> None:
+        """Enforces clean trading-session boundaries across multiple trading days."""
+        candle_date = candle_timestamp.date()
+        if self.current_session_date != candle_date:
+            self.current_session_date = candle_date
+            self.session_open_price = None
+            self.active_breakouts_1m.clear()
+            self.active_breakouts_5m.clear()
+            self.latest_1m_rvol = None
+            self.latest_1m_rvol_timestamp = None
+            self.latest_5m_rvol = None
+            self.latest_5m_rvol_timestamp = None
+
+    def _recheck_breakout_volume(
+        self,
+        timeframe: str,
+        candle: Candle,
+        rvol_val: float,
+        on_setup_candidate: Optional[Callable[[BreakoutContext, TechnicalSnapshot], None]] = None,
+    ) -> None:
+        """Re-evaluates in-flight breakout setups when paired futures RVOL arrives after spot candle."""
+        active_map = self.active_breakouts_1m if timeframe == "1m" else self.active_breakouts_5m
+        machine = self.breakout_machine_1m if timeframe == "1m" else self.breakout_machine_5m
+        n = len(self.candles_1m if timeframe == "1m" else self.candles_5m)
+
+        terminal_states = {
+            BreakoutState.SETUP_ELIGIBLE,
+            BreakoutState.FALSE_BREAKOUT,
+            BreakoutState.RETEST_FAILED,
+            BreakoutState.SETUP_EXPIRED,
+            BreakoutState.INVALIDATED,
+        }
+
+        snap = self.latest_snapshots.get(timeframe)
+        if snap is None:
+            return
+
+        for lvl_id, ctx in list(active_map.items()):
+            prev_state = ctx.current_state
+            updated_ctx = machine.update_candle(
+                candle=candle,
+                candle_index=n - 1,
+                zone=ctx.zone,
+                atr_value=snap.atr or 0.0,
+                futures_rvol=rvol_val,
+                context=ctx,
+            )
+            active_map[lvl_id] = updated_ctx
+
+            if (
+                prev_state != BreakoutState.SETUP_ELIGIBLE
+                and updated_ctx.current_state == BreakoutState.SETUP_ELIGIBLE
+                and updated_ctx.setup_id not in self.notified_setup_ids
+            ):
+                self.notified_setup_ids.add(updated_ctx.setup_id)
+                updated_ctx.is_notified = True
+                if on_setup_candidate:
+                    on_setup_candidate(updated_ctx, snap)
+                del active_map[lvl_id]
+            elif updated_ctx.current_state in terminal_states:
+                del active_map[lvl_id]
+
     def process_candle(
         self,
         candle: Candle,
@@ -169,6 +236,10 @@ class SymbolTechnicalState:
         on_setup_candidate: Optional[Callable[[BreakoutContext, TechnicalSnapshot], None]] = None,
     ) -> TechnicalSnapshot:
         """Routes candle strictly to its corresponding timeframe handler."""
+        self._check_session_rollover(candle.timestamp)
+        if self.session_open_price is None:
+            self.session_open_price = candle.open
+
         if candle.timeframe == "1m":
             return self._process_1m_candle(
                 candle, futures_rvol=futures_rvol, on_setup_candidate=on_setup_candidate
@@ -189,11 +260,14 @@ class SymbolTechnicalState:
         ema_21: Optional[float],
         ema_50: Optional[float],
         confirmed_swings: List[SwingPoint],
+        orh: Optional[float] = None,
+        orl: Optional[float] = None,
+        cdo: Optional[float] = None,
     ) -> Tuple[str, bool]:
         """Classifies trend bias as (trend_bias, is_provisional).
 
         If EMAs are warmed up, returns confirmed trend (is_provisional=False).
-        Otherwise falls back to structural swings / daily reference levels (is_provisional=True).
+        Otherwise falls back to Opening Range / structural swings / daily reference levels (is_provisional=True).
         """
         # 1. Confirmed Indicator-Based Trend
         if ema_9 is not None and ema_21 is not None and ema_50 is not None:
@@ -212,28 +286,47 @@ class SymbolTechnicalState:
                 return "SIDEWAYS", False
 
         # 2. Provisional Structural Trend (Indicator Warmup Fallback)
+        # A. Breakout Beyond Opening Range (Highest structural priority)
+        if orh is not None and orl is not None:
+            if close > orh:
+                return "BULLISH", True
+            elif close < orl:
+                return "BEARISH", True
+
+        # B. Daily Reference Levels (PDH, PDL, PDC, CDO)
+        effective_cdo = cdo
         if self.daily_reference_levels:
             pdh = self.daily_reference_levels.get("PDH")
             pdl = self.daily_reference_levels.get("PDL")
-            cdo = self.daily_reference_levels.get("CDO")
+            cdo_lvl = self.daily_reference_levels.get("CDO") or effective_cdo
             pdc = self.daily_reference_levels.get("PDC")
             if pdh and close > pdh:
                 return "BULLISH", True
             if pdl and close < pdl:
                 return "BEARISH", True
-            if cdo and pdc:
-                if close > cdo and close > pdc:
+            if cdo_lvl and pdc:
+                if close > cdo_lvl and close > pdc:
                     return "BULLISH", True
-                elif close < cdo and close < pdc:
+                elif close < cdo_lvl and close < pdc:
                     return "BEARISH", True
                 else:
                     return "SIDEWAYS", True
-            elif cdo:
-                if close > cdo:
+            elif cdo_lvl:
+                if close > cdo_lvl:
                     return "BULLISH", True
-                elif close < cdo:
+                elif close < cdo_lvl:
                     return "BEARISH", True
+        elif effective_cdo is not None:
+            if close > effective_cdo:
+                return "BULLISH", True
+            elif close < effective_cdo:
+                return "BEARISH", True
 
+        # C. Inside Opening Range Balance
+        if orh is not None and orl is not None:
+            return "SIDEWAYS", True
+
+        # C. Confirmed Swings
         high_swings = [s for s in confirmed_swings if s.is_high]
         low_swings = [s for s in confirmed_swings if s.is_low]
         if len(high_swings) >= 2 and len(low_swings) >= 2:
@@ -317,17 +410,9 @@ class SymbolTechnicalState:
             except Exception:
                 pass
 
-        # 2. Structural Swings & Trend Bias
+        # 2. Structural Swings
         self.swing_detector_1m.on_candle(candle)
         confirmed_swings = self.swing_detector_1m.get_visible_swings(as_of_time=candle.timestamp)
-
-        trend_bias, is_provisional = self._determine_trend_bias(
-            close=candle.close,
-            ema_9=ema_9,
-            ema_21=ema_21,
-            ema_50=ema_50,
-            confirmed_swings=confirmed_swings,
-        )
 
         # 3. Dynamic Support & Resistance Zones
         effective_atr = atr_val if atr_val is not None else 0.0
@@ -344,8 +429,29 @@ class SymbolTechnicalState:
                 )
             )
 
-        or_zones = self.sr_engine.compute_opening_range(c_list, atr_value=effective_atr)
+        or_zones = self.sr_engine.compute_opening_range(
+            c_list, atr_value=effective_atr, session_date=candle.timestamp.date()
+        )
         zones.extend(or_zones)
+        orh_1m = next((z.nominal_price for z in or_zones if z.level_type == LevelType.ORH), None)
+        orl_1m = next((z.nominal_price for z in or_zones if z.level_type == LevelType.ORL), None)
+
+        effective_cdo = None
+        if self.daily_reference_levels:
+            effective_cdo = self.daily_reference_levels.get("CDO")
+        if effective_cdo is None:
+            effective_cdo = self.session_open_price
+
+        trend_bias, is_provisional = self._determine_trend_bias(
+            close=candle.close,
+            ema_9=ema_9,
+            ema_21=ema_21,
+            ema_50=ema_50,
+            confirmed_swings=confirmed_swings,
+            orh=orh_1m,
+            orl=orl_1m,
+            cdo=effective_cdo,
+        )
 
         zones.extend(
             self.sr_engine.compute_psychological_levels(
@@ -379,6 +485,74 @@ class SymbolTechnicalState:
 
         # 4. Breakout State Machine (1m)
         active_setups: List[BreakoutContext] = []
+        terminal_states = {
+            BreakoutState.SETUP_ELIGIBLE,
+            BreakoutState.FALSE_BREAKOUT,
+            BreakoutState.RETEST_FAILED,
+            BreakoutState.SETUP_EXPIRED,
+            BreakoutState.INVALIDATED,
+        }
+
+        # 4A. Update existing active setups (ensures expiration and invalidation even when dynamic zones shift)
+        effective_atr_breakout = atr_val if atr_val is not None else 0.0
+        effective_rvol_breakout = rvol_val if rvol_val is not None else 1.0
+
+        for lvl_id, ctx in list(self.active_breakouts_1m.items()):
+            matching_zone = next((z for z in zones if f"{z.level_type.value}_{z.nominal_price:.1f}" == lvl_id), None)
+            if not matching_zone:
+                matching_zone = ctx.zone
+
+            if not matching_zone:
+                ctx.transition_to(BreakoutState.INVALIDATED, candle.timestamp, "Original reference zone no longer exists")
+                del self.active_breakouts_1m[lvl_id]
+                continue
+
+            prev_state = ctx.current_state
+            updated_ctx = self.breakout_machine_1m.update_candle(
+                candle=candle,
+                candle_index=n - 1,
+                zone=matching_zone,
+                atr_value=effective_atr_breakout,
+                futures_rvol=effective_rvol_breakout,
+                context=ctx,
+            )
+            self.active_breakouts_1m[lvl_id] = updated_ctx
+
+            if (
+                prev_state != BreakoutState.SETUP_ELIGIBLE
+                and updated_ctx.current_state == BreakoutState.SETUP_ELIGIBLE
+                and updated_ctx.setup_id not in self.notified_setup_ids
+            ):
+                self.notified_setup_ids.add(updated_ctx.setup_id)
+                updated_ctx.is_notified = True
+                active_setups.append(updated_ctx)
+                if on_setup_candidate:
+                    snapshot_preview = TechnicalSnapshot(
+                        symbol=self.symbol,
+                        timestamp=candle.timestamp,
+                        timeframe="1m",
+                        open=candle.open,
+                        high=candle.high,
+                        low=candle.low,
+                        close=candle.close,
+                        volume=candle.volume,
+                        is_warmed_up=is_warmed_up,
+                        is_provisional=is_provisional,
+                        ema_9=round(ema_9, 2) if ema_9 else None,
+                        ema_21=round(ema_21, 2) if ema_21 else None,
+                        rsi=round(rsi_val, 1) if rsi_val else None,
+                        atr=round(atr_val, 2) if atr_val else None,
+                        rvol=round(rvol_val, 2) if rvol_val else None,
+                        trend_bias=trend_bias,
+                    )
+                    on_setup_candidate(updated_ctx, snapshot_preview)
+                del self.active_breakouts_1m[lvl_id]
+            elif updated_ctx.current_state in terminal_states:
+                del self.active_breakouts_1m[lvl_id]
+            else:
+                active_setups.append(updated_ctx)
+
+        # 4B. Evaluate new breakout approaches
         if is_warmed_up and atr_val is not None and rvol_val is not None:
             eval_zones: List[PriceZone] = []
             if nearest_sup:
@@ -389,57 +563,6 @@ class SymbolTechnicalState:
             for z in zones:
                 if z not in eval_zones and (z.lower_bound <= candle.high and z.upper_bound >= candle.low):
                     eval_zones.append(z)
-
-            terminal_states = {
-                BreakoutState.SETUP_ELIGIBLE,
-                BreakoutState.FALSE_BREAKOUT,
-                BreakoutState.RETEST_FAILED,
-                BreakoutState.SETUP_EXPIRED,
-                BreakoutState.INVALIDATED,
-            }
-
-            for lvl_id, ctx in list(self.active_breakouts_1m.items()):
-                matching_zone = next((z for z in zones if f"{z.level_type.value}_{z.nominal_price:.1f}" == lvl_id), None)
-                if not matching_zone:
-                    continue
-
-                updated_ctx = self.breakout_machine_1m.update_candle(
-                    candle=candle,
-                    candle_index=n - 1,
-                    zone=matching_zone,
-                    atr_value=atr_val,
-                    futures_rvol=rvol_val,
-                    context=ctx,
-                )
-                self.active_breakouts_1m[lvl_id] = updated_ctx
-
-                if updated_ctx.current_state == BreakoutState.SETUP_ELIGIBLE:
-                    active_setups.append(updated_ctx)
-                    if on_setup_candidate:
-                        snapshot_preview = TechnicalSnapshot(
-                            symbol=self.symbol,
-                            timestamp=candle.timestamp,
-                            timeframe="1m",
-                            open=candle.open,
-                            high=candle.high,
-                            low=candle.low,
-                            close=candle.close,
-                            volume=candle.volume,
-                            is_warmed_up=is_warmed_up,
-                            is_provisional=is_provisional,
-                            ema_9=round(ema_9, 2) if ema_9 else None,
-                            ema_21=round(ema_21, 2) if ema_21 else None,
-                            rsi=round(rsi_val, 1) if rsi_val else None,
-                            atr=round(atr_val, 2),
-                            rvol=round(rvol_val, 2),
-                            trend_bias=trend_bias,
-                        )
-                        on_setup_candidate(updated_ctx, snapshot_preview)
-
-                elif updated_ctx.current_state not in terminal_states:
-                    active_setups.append(updated_ctx)
-                else:
-                    del self.active_breakouts_1m[lvl_id]
 
             for z in eval_zones:
                 lvl_id = f"{z.level_type.value}_{z.nominal_price:.1f}"
@@ -557,17 +680,9 @@ class SymbolTechnicalState:
             except Exception:
                 pass
 
-        # 2. 5m Structural Swings & Trend Bias
+        # 2. 5m Structural Swings
         self.swing_detector_5m.on_candle(candle)
         confirmed_swings_5m = self.swing_detector_5m.get_visible_swings(as_of_time=candle.timestamp)
-
-        trend_bias, is_provisional = self._determine_trend_bias(
-            close=candle.close,
-            ema_9=ema_9,
-            ema_21=ema_21,
-            ema_50=ema_50,
-            confirmed_swings=confirmed_swings_5m,
-        )
 
         # 3. Dynamic Support & Resistance Zones (5m)
         effective_atr = atr_val if atr_val is not None else 0.0
@@ -584,9 +699,30 @@ class SymbolTechnicalState:
                 )
             )
 
-        # 15m Opening range (from first three 5m bars: 09:15, 09:20, 09:25)
-        or_zones_5m = self.sr_engine.compute_opening_range(c_list, atr_value=effective_atr)
+        # 15m Opening range (from first three 5m bars: 09:15, 09:20, 09:25 of current session)
+        or_zones_5m = self.sr_engine.compute_opening_range(
+            c_list, atr_value=effective_atr, session_date=candle.timestamp.date()
+        )
         zones_5m.extend(or_zones_5m)
+        orh_5m = next((z.nominal_price for z in or_zones_5m if z.level_type == LevelType.ORH), None)
+        orl_5m = next((z.nominal_price for z in or_zones_5m if z.level_type == LevelType.ORL), None)
+
+        effective_cdo = None
+        if self.daily_reference_levels:
+            effective_cdo = self.daily_reference_levels.get("CDO")
+        if effective_cdo is None:
+            effective_cdo = self.session_open_price
+
+        trend_bias, is_provisional = self._determine_trend_bias(
+            close=candle.close,
+            ema_9=ema_9,
+            ema_21=ema_21,
+            ema_50=ema_50,
+            confirmed_swings=confirmed_swings_5m,
+            orh=orh_5m,
+            orl=orl_5m,
+            cdo=effective_cdo,
+        )
 
         zones_5m.extend(
             self.sr_engine.compute_psychological_levels(
@@ -620,6 +756,74 @@ class SymbolTechnicalState:
 
         # 4. 5m Breakout State Machine (Primary Setup Detector)
         active_setups_5m: List[BreakoutContext] = []
+        terminal_states = {
+            BreakoutState.SETUP_ELIGIBLE,
+            BreakoutState.FALSE_BREAKOUT,
+            BreakoutState.RETEST_FAILED,
+            BreakoutState.SETUP_EXPIRED,
+            BreakoutState.INVALIDATED,
+        }
+
+        # 4A. Update existing active setups (ensures expiration and invalidation even when dynamic zones shift)
+        effective_atr_breakout = atr_val if atr_val is not None else 0.0
+        effective_rvol_breakout = rvol_val if rvol_val is not None else 1.0
+
+        for lvl_id, ctx in list(self.active_breakouts_5m.items()):
+            matching_zone = next((z for z in zones_5m if f"{z.level_type.value}_{z.nominal_price:.1f}" == lvl_id), None)
+            if not matching_zone:
+                matching_zone = ctx.zone
+
+            if not matching_zone:
+                ctx.transition_to(BreakoutState.INVALIDATED, candle.timestamp, "Original reference zone no longer exists")
+                del self.active_breakouts_5m[lvl_id]
+                continue
+
+            prev_state = ctx.current_state
+            updated_ctx = self.breakout_machine_5m.update_candle(
+                candle=candle,
+                candle_index=n - 1,
+                zone=matching_zone,
+                atr_value=effective_atr_breakout,
+                futures_rvol=effective_rvol_breakout,
+                context=ctx,
+            )
+            self.active_breakouts_5m[lvl_id] = updated_ctx
+
+            if (
+                prev_state != BreakoutState.SETUP_ELIGIBLE
+                and updated_ctx.current_state == BreakoutState.SETUP_ELIGIBLE
+                and updated_ctx.setup_id not in self.notified_setup_ids
+            ):
+                self.notified_setup_ids.add(updated_ctx.setup_id)
+                updated_ctx.is_notified = True
+                active_setups_5m.append(updated_ctx)
+                if on_setup_candidate:
+                    snapshot_preview = TechnicalSnapshot(
+                        symbol=self.symbol,
+                        timestamp=candle.timestamp,
+                        timeframe="5m",
+                        open=candle.open,
+                        high=candle.high,
+                        low=candle.low,
+                        close=candle.close,
+                        volume=candle.volume,
+                        is_warmed_up=is_warmed_up,
+                        is_provisional=is_provisional,
+                        ema_9=round(ema_9, 2) if ema_9 else None,
+                        ema_21=round(ema_21, 2) if ema_21 else None,
+                        rsi=round(rsi_val, 1) if rsi_val else None,
+                        atr=round(atr_val, 2) if atr_val else None,
+                        rvol=round(rvol_val, 2) if rvol_val else None,
+                        trend_bias=trend_bias,
+                    )
+                    on_setup_candidate(updated_ctx, snapshot_preview)
+                del self.active_breakouts_5m[lvl_id]
+            elif updated_ctx.current_state in terminal_states:
+                del self.active_breakouts_5m[lvl_id]
+            else:
+                active_setups_5m.append(updated_ctx)
+
+        # 4B. Evaluate new breakout approaches
         if is_warmed_up and atr_val is not None and rvol_val is not None:
             eval_zones: List[PriceZone] = []
             if nearest_sup_5m:
@@ -630,57 +834,6 @@ class SymbolTechnicalState:
             for z in zones_5m:
                 if z not in eval_zones and (z.lower_bound <= candle.high and z.upper_bound >= candle.low):
                     eval_zones.append(z)
-
-            terminal_states = {
-                BreakoutState.SETUP_ELIGIBLE,
-                BreakoutState.FALSE_BREAKOUT,
-                BreakoutState.RETEST_FAILED,
-                BreakoutState.SETUP_EXPIRED,
-                BreakoutState.INVALIDATED,
-            }
-
-            for lvl_id, ctx in list(self.active_breakouts_5m.items()):
-                matching_zone = next((z for z in zones_5m if f"{z.level_type.value}_{z.nominal_price:.1f}" == lvl_id), None)
-                if not matching_zone:
-                    continue
-
-                updated_ctx = self.breakout_machine_5m.update_candle(
-                    candle=candle,
-                    candle_index=n - 1,
-                    zone=matching_zone,
-                    atr_value=atr_val,
-                    futures_rvol=rvol_val,
-                    context=ctx,
-                )
-                self.active_breakouts_5m[lvl_id] = updated_ctx
-
-                if updated_ctx.current_state == BreakoutState.SETUP_ELIGIBLE:
-                    active_setups_5m.append(updated_ctx)
-                    if on_setup_candidate:
-                        snapshot_preview = TechnicalSnapshot(
-                            symbol=self.symbol,
-                            timestamp=candle.timestamp,
-                            timeframe="5m",
-                            open=candle.open,
-                            high=candle.high,
-                            low=candle.low,
-                            close=candle.close,
-                            volume=candle.volume,
-                            is_warmed_up=is_warmed_up,
-                            is_provisional=is_provisional,
-                            ema_9=round(ema_9, 2) if ema_9 else None,
-                            ema_21=round(ema_21, 2) if ema_21 else None,
-                            rsi=round(rsi_val, 1) if rsi_val else None,
-                            atr=round(atr_val, 2),
-                            rvol=round(rvol_val, 2),
-                            trend_bias=trend_bias,
-                        )
-                        on_setup_candidate(updated_ctx, snapshot_preview)
-
-                elif updated_ctx.current_state not in terminal_states:
-                    active_setups_5m.append(updated_ctx)
-                else:
-                    del self.active_breakouts_5m[lvl_id]
 
             for z in eval_zones:
                 lvl_id = f"{z.level_type.value}_{z.nominal_price:.1f}"
@@ -755,19 +908,10 @@ class SymbolTechnicalState:
 
         is_warmed_up = (n >= 21 and atr_val is not None)
 
-        # 2. 15m Structural Swings & Higher-Timeframe Trend
+        # 2. 15m Structural Swings & Support/Resistance Zones (15m Market Structure)
         self.swing_detector_15m.on_candle(candle)
         confirmed_swings_15m = self.swing_detector_15m.get_visible_swings(as_of_time=candle.timestamp)
 
-        trend_bias, is_provisional = self._determine_trend_bias(
-            close=candle.close,
-            ema_9=ema_9,
-            ema_21=ema_21,
-            ema_50=ema_50,
-            confirmed_swings=confirmed_swings_15m,
-        )
-
-        # 3. Dynamic Support & Resistance Zones (15m Market Structure)
         effective_atr = atr_val if atr_val is not None else 0.0
         zones_15m: List[PriceZone] = []
 
@@ -782,16 +926,41 @@ class SymbolTechnicalState:
                 )
             )
 
-        # 15m Opening Range (the 09:15-09:30 candle is the first 15m bar)
-        or_candles_15m = [c for c in c_list if c.timestamp.time() == time(9, 15)]
+        # 15m Opening Range (the 09:15-09:30 candle is the first 15m bar of current session)
+        current_date = candle.timestamp.date()
+        or_candles_15m = [
+            c for c in c_list
+            if c.timestamp.date() == current_date and c.timestamp.time() == time(9, 15) and c.is_closed
+        ]
+        orh_15m: Optional[float] = None
+        orl_15m: Optional[float] = None
         if or_candles_15m:
             c0 = or_candles_15m[0]
+            orh_15m = c0.high
+            orl_15m = c0.low
             zones_15m.append(
-                self.sr_engine.create_zone(LevelType.ORH, c0.high, effective_atr, "15-Min Opening Range High", weight=2.0)
+                self.sr_engine.create_zone(LevelType.ORH, orh_15m, effective_atr, "15-Min Opening Range High", weight=2.0)
             )
             zones_15m.append(
-                self.sr_engine.create_zone(LevelType.ORL, c0.low, effective_atr, "15-Min Opening Range Low", weight=2.0)
+                self.sr_engine.create_zone(LevelType.ORL, orl_15m, effective_atr, "15-Min Opening Range Low", weight=2.0)
             )
+
+        effective_cdo = None
+        if self.daily_reference_levels:
+            effective_cdo = self.daily_reference_levels.get("CDO")
+        if effective_cdo is None:
+            effective_cdo = self.session_open_price
+
+        trend_bias, is_provisional = self._determine_trend_bias(
+            close=candle.close,
+            ema_9=ema_9,
+            ema_21=ema_21,
+            ema_50=ema_50,
+            confirmed_swings=confirmed_swings_15m,
+            orh=orh_15m,
+            orl=orl_15m,
+            cdo=effective_cdo,
+        )
 
         zones_15m.extend(
             self.sr_engine.compute_psychological_levels(
@@ -866,6 +1035,9 @@ class TechnicalAnalysisEngine:
         self.index_futures_map: Dict[str, str] = {
             primary_index: primary_futures,
         }
+        self.futures_index_map: Dict[str, str] = {
+            primary_futures: primary_index,
+        }
 
         self.states: Dict[str, SymbolTechnicalState] = {}
         # Pre-initialize primary index and futures states
@@ -881,11 +1053,13 @@ class TechnicalAnalysisEngine:
         """Dynamically updates active primary futures ticker (e.g. at contract rollover)."""
         self.primary_futures = futures_ticker
         self.index_futures_map[self.primary_index] = futures_ticker
+        self.futures_index_map[futures_ticker] = self.primary_index
         self._get_or_create_state(futures_ticker, is_index=False)
 
     def set_index_futures_mapping(self, index_symbol: str, futures_symbol: str) -> None:
         """Explicitly pairs a spot index with its corresponding futures instrument."""
         self.index_futures_map[index_symbol] = futures_symbol
+        self.futures_index_map[futures_symbol] = index_symbol
         self._get_or_create_state(futures_symbol, is_index=False)
 
     def set_daily_references(
@@ -902,7 +1076,7 @@ class TechnicalAnalysisEngine:
 
     def on_candle(self, candle: Candle) -> Optional[TechnicalSnapshot]:
         """Dispatches closed candle with strict timeframe routing and synchronized volume freshness checks."""
-        is_idx = ("INDEX" in candle.symbol) or (candle.symbol == self.primary_index)
+        is_idx = ("INDEX" in candle.symbol) or (candle.symbol in self.index_futures_map)
         state = self._get_or_create_state(candle.symbol, is_index=is_idx)
 
         # Cross-asset volume pairing: Spot index references its EXPLICIT paired Futures RVOL
@@ -914,15 +1088,15 @@ class TechnicalAnalysisEngine:
             if candle.timeframe == "1m":
                 if fut_state.latest_1m_rvol is not None and fut_state.latest_1m_rvol_timestamp is not None:
                     delta_seconds = (candle.timestamp - fut_state.latest_1m_rvol_timestamp).total_seconds()
-                    # 1m tolerance: 0 <= delta <= 120s
-                    if 0.0 <= delta_seconds <= 120.0:
+                    # Interval matching: spot and futures share interval boundary (delta == 0 or within 5s)
+                    if 0.0 <= delta_seconds <= 5.0:
                         futures_rvol = fut_state.latest_1m_rvol
 
             elif candle.timeframe == "5m":
                 if fut_state.latest_5m_rvol is not None and fut_state.latest_5m_rvol_timestamp is not None:
                     delta_seconds = (candle.timestamp - fut_state.latest_5m_rvol_timestamp).total_seconds()
-                    # 5m tolerance: 0 <= delta <= 300s
-                    if 0.0 <= delta_seconds <= 300.0:
+                    # Interval matching: spot and futures share interval boundary (delta == 0 or within 5s)
+                    if 0.0 <= delta_seconds <= 5.0:
                         futures_rvol = fut_state.latest_5m_rvol
 
         snapshot = state.process_candle(
@@ -930,6 +1104,31 @@ class TechnicalAnalysisEngine:
             futures_rvol=futures_rvol,
             on_setup_candidate=self.on_setup_candidate,
         )
+
+        # Arrival order independence: If this is a futures candle, check if paired spot index
+        # arrived earlier for the exact same interval and was awaiting volume confirmation
+        paired_index = self.futures_index_map.get(candle.symbol)
+        if paired_index and paired_index in self.states:
+            spot_state = self.states[paired_index]
+            spot_snap = spot_state.latest_snapshots.get(candle.timeframe)
+            if (
+                spot_snap is not None
+                and spot_snap.rvol is None
+                and abs((spot_snap.timestamp - candle.timestamp).total_seconds()) <= 5.0
+            ):
+                fut_rvol = state.latest_1m_rvol if candle.timeframe == "1m" else state.latest_5m_rvol
+                if fut_rvol is not None:
+                    spot_snap.rvol = round(fut_rvol, 2)
+                    spot_state.latest_snapshots[candle.timeframe] = spot_snap
+                    last_candles = spot_state.candles_1m if candle.timeframe == "1m" else spot_state.candles_5m
+                    if last_candles:
+                        spot_state._recheck_breakout_volume(
+                            timeframe=candle.timeframe,
+                            candle=last_candles[-1],
+                            rvol_val=fut_rvol,
+                            on_setup_candidate=self.on_setup_candidate,
+                        )
+
         return snapshot
 
     def get_snapshot(self, symbol: str, timeframe: str = "1m") -> Optional[TechnicalSnapshot]:

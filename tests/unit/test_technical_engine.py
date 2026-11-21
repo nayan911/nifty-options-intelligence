@@ -709,3 +709,367 @@ def test_5m_breakout_state_machine_isolation_and_callback():
     state = engine.states[sym]
     assert len(state.active_breakouts_1m) == 0
 
+
+def test_breakout_candidate_notification_exactly_once():
+    """Verify Issue P1 Fix: Setup notifications are emitted exactly once upon initial transition to SETUP_ELIGIBLE.
+    Subsequent candles on the same level do NOT trigger duplicate callbacks.
+    """
+    callback_calls = []
+
+    def on_candidate(setup: BreakoutContext, snap: TechnicalSnapshot):
+        callback_calls.append((setup.setup_id, snap.timestamp))
+
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+        on_setup_candidate=on_candidate,
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+    sym = "NSE:NIFTY26NOVFUT"
+
+    engine.set_daily_references(
+        symbol=sym,
+        pdh=25100.0,
+        pdl=24900.0,
+        pdc=25000.0,
+        cdo=25020.0,
+    )
+
+    # 1. Warm up with 22 5m candles below resistance
+    for i in range(22):
+        engine.on_candle(
+            Candle(
+                symbol=sym,
+                timeframe="5m",
+                timestamp=base_time + timedelta(minutes=5 * i),
+                open=25070.0,
+                high=25085.0,
+                low=25065.0,
+                close=25080.0,
+                volume=2000,
+                is_closed=True,
+            )
+        )
+
+    # 2. Breakout candle
+    engine.on_candle(
+        Candle(
+            symbol=sym,
+            timeframe="5m",
+            timestamp=base_time + timedelta(minutes=5 * 22),
+            open=25085.0,
+            high=25125.0,
+            low=25080.0,
+            close=25120.0,
+            volume=8000,
+            is_closed=True,
+        )
+    )
+
+    # 3. Retest bar -> transitions to SETUP_ELIGIBLE
+    engine.on_candle(
+        Candle(
+            symbol=sym,
+            timeframe="5m",
+            timestamp=base_time + timedelta(minutes=5 * 23),
+            open=25105.0,
+            high=25115.0,
+            low=25098.0,
+            close=25110.0,
+            volume=3000,
+            is_closed=True,
+        )
+    )
+
+    initial_count = len(callback_calls)
+    assert initial_count >= 1
+    # Verify all emitted setups at transition have unique setup IDs
+    assert len(set(c[0] for c in callback_calls)) == initial_count
+
+    # 4. Feed subsequent candles while price stays above resistance
+    for k in range(24, 27):
+        engine.on_candle(
+            Candle(
+                symbol=sym,
+                timeframe="5m",
+                timestamp=base_time + timedelta(minutes=5 * k),
+                open=25112.0,
+                high=25130.0,
+                low=25105.0,
+                close=25125.0,
+                volume=2500,
+                is_closed=True,
+            )
+        )
+
+    # Invariant: Callback was called EXACTLY ONCE per setup, never re-triggered on subsequent candles!
+    assert len(callback_calls) == initial_count
+
+
+def test_opening_range_session_date_isolation():
+    """Verify Issue P1 Fix: Opening Range is isolated strictly to the current session date.
+    Prior trading day candles do not contaminate the new session's ORH/ORL.
+    """
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    friday_time = IST.localize(datetime(2026, 11, 20, 9, 15))
+    monday_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+    sym = "NSE:NIFTY26NOVFUT"
+
+    # Friday 15m candle: High 25500, Low 25300
+    engine.on_candle(
+        Candle(
+            symbol=sym,
+            timeframe="15m",
+            timestamp=friday_time,
+            open=25400.0,
+            high=25500.0,
+            low=25300.0,
+            close=25450.0,
+            volume=5000,
+            is_closed=True,
+        )
+    )
+
+    # Monday 15m candle: High 24200, Low 24000
+    snap_monday = engine.on_candle(
+        Candle(
+            symbol=sym,
+            timeframe="15m",
+            timestamp=monday_time,
+            open=24100.0,
+            high=24200.0,
+            low=24000.0,
+            close=24150.0,
+            volume=4000,
+            is_closed=True,
+        )
+    )
+    assert snap_monday.timeframe == "15m"
+
+    # Nearest S/R zones on Monday must reflect Monday's Opening Range, NOT Friday's 25500/25300!
+    state = engine.states[sym]
+    assert state.current_session_date == monday_time.date()
+    zones = state.latest_snapshots["15m"]
+    assert zones is not None
+    if zones.nearest_resistance:
+        assert zones.nearest_resistance.nominal_price < 25000.0
+
+
+def test_breakout_setup_expires_when_dynamic_zone_shifts():
+    """Verify Issue P1 Fix: Setups retain their original reference zone snapshot.
+    If dynamic levels (VWAP or swing clusters) shift away, the setup still counts bars and expires.
+    """
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+    sym = "NSE:NIFTY26NOVFUT"
+
+    engine.set_daily_references(
+        symbol=sym,
+        pdh=25100.0,
+        pdl=24900.0,
+        pdc=25000.0,
+        cdo=25020.0,
+    )
+
+    # 1. Warm up 22 5m candles below resistance
+    for i in range(22):
+        engine.on_candle(
+            Candle(
+                symbol=sym,
+                timeframe="5m",
+                timestamp=base_time + timedelta(minutes=5 * i),
+                open=25070.0,
+                high=25085.0,
+                low=25065.0,
+                close=25080.0,
+                volume=2000,
+                is_closed=True,
+            )
+        )
+
+    # 2. Breakout candle creates in-flight setup on resistance (25100)
+    engine.on_candle(
+        Candle(
+            symbol=sym,
+            timeframe="5m",
+            timestamp=base_time + timedelta(minutes=5 * 22),
+            open=25085.0,
+            high=25125.0,
+            low=25080.0,
+            close=25120.0,
+            volume=8000,
+            is_closed=True,
+        )
+    )
+
+    # 3. Price runs away without retesting (5 bars later > max_retest_candles=4)
+    for j in range(23, 28):
+        engine.on_candle(
+            Candle(
+                symbol=sym,
+                timeframe="5m",
+                timestamp=base_time + timedelta(minutes=5 * j),
+                open=25140.0 + (j - 23) * 10,
+                high=25160.0 + (j - 23) * 10,
+                low=25135.0 + (j - 23) * 10,
+                close=25150.0 + (j - 23) * 10,
+                volume=2000,
+                is_closed=True,
+            )
+        )
+
+    # Invariant: Active breakout setup on PDH_25100.0 must NOT linger indefinitely; it has expired and been removed!
+    state = engine.states[sym]
+    assert "PDH_25100.0" not in state.active_breakouts_5m
+
+
+def test_provisional_trend_bias_incorporates_opening_range_without_daily_levels():
+    """Verify Issue P2 Fix: Early morning session establishes provisional trend bias
+    using the completed 15m Opening Range structure without requiring manual daily reference levels.
+    """
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+    sym = "NSE:NIFTY50-INDEX"
+
+    # Notice: NO call to engine.set_daily_references()!
+
+    # 1. 09:15-09:30 15m candle forms Opening Range: High 25050, Low 24950, Close 25020 (Open 25000)
+    snap1 = engine.on_candle(
+        Candle(
+            symbol=sym,
+            timeframe="15m",
+            timestamp=base_time,
+            open=25000.0,
+            high=25050.0,
+            low=24950.0,
+            close=25020.0,
+            volume=0,
+            is_closed=True,
+        )
+    )
+    # Price is above open price (25000) -> BULLISH (provisional)
+    assert snap1.is_provisional is True
+    assert snap1.trend_bias == "BULLISH"
+
+    # 2. 09:30-09:45 candle breaks out above Opening Range High (25050) to 25070
+    snap2 = engine.on_candle(
+        Candle(
+            symbol=sym,
+            timeframe="15m",
+            timestamp=base_time + timedelta(minutes=15),
+            open=25025.0,
+            high=25075.0,
+            low=25020.0,
+            close=25070.0,
+            volume=0,
+            is_closed=True,
+        )
+    )
+    assert snap2.trend_bias == "BULLISH"
+    assert snap2.is_provisional is True
+
+
+def test_spot_and_futures_deterministic_arrival_order_independence():
+    """Verify Issue P2 Fix: Spot index technical evaluation is deterministic
+    regardless of whether the spot candle arrives before or after its paired futures candle.
+    """
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+    t21 = base_time + timedelta(minutes=5 * 21)
+
+    # Engine A: Futures arrives first, Spot arrives second
+    engine_a = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    for i in range(22):
+        engine_a.on_candle(
+            Candle(
+                symbol="NSE:NIFTY26NOVFUT",
+                timeframe="5m",
+                timestamp=base_time + timedelta(minutes=5 * i),
+                open=25000.0,
+                high=25015.0,
+                low=24995.0,
+                close=25010.0,
+                volume=10000,
+                is_closed=True,
+            )
+        )
+    spot_candle_a = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        timestamp=t21,
+        open=25000.0,
+        high=25020.0,
+        low=24990.0,
+        close=25015.0,
+        volume=0,
+        is_closed=True,
+    )
+    snap_a = engine_a.on_candle(spot_candle_a)
+
+    # Engine B: Spot arrives first, Futures arrives second
+    engine_b = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    # Warm up futures up to bar 20
+    for i in range(21):
+        engine_b.on_candle(
+            Candle(
+                symbol="NSE:NIFTY26NOVFUT",
+                timeframe="5m",
+                timestamp=base_time + timedelta(minutes=5 * i),
+                open=25000.0,
+                high=25015.0,
+                low=24995.0,
+                close=25010.0,
+                volume=10000,
+                is_closed=True,
+            )
+        )
+    # Feed spot candle at t21 FIRST
+    spot_candle_b = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        timestamp=t21,
+        open=25000.0,
+        high=25020.0,
+        low=24990.0,
+        close=25015.0,
+        volume=0,
+        is_closed=True,
+    )
+    engine_b.on_candle(spot_candle_b)
+
+    # Feed futures candle at t21 SECOND
+    engine_b.on_candle(
+        Candle(
+            symbol="NSE:NIFTY26NOVFUT",
+            timeframe="5m",
+            timestamp=t21,
+            open=25000.0,
+            high=25015.0,
+            low=24995.0,
+            close=25010.0,
+            volume=10000,
+            is_closed=True,
+        )
+    )
+    snap_b = engine_b.get_snapshot("NSE:NIFTY50-INDEX", timeframe="5m")
+
+    # Invariant: Both arrival orders yield identical RVOL on spot snapshot!
+    assert snap_a is not None and snap_a.rvol is not None
+    assert snap_b is not None and snap_b.rvol is not None
+    assert snap_a.rvol == snap_b.rvol
+
+

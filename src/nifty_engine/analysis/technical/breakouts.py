@@ -42,6 +42,14 @@ class BreakoutContext:
     candles_since_breakout: int = 0
     invalidation_reason: Optional[str] = None
     history: List[Tuple[BreakoutState, datetime, str]] = field(default_factory=list)
+    setup_id: str = ""
+    is_notified: bool = False
+    zone: Optional[PriceZone] = None
+
+    def __post_init__(self):
+        if not self.setup_id:
+            ts_str = str(int(self.start_time.timestamp())) if self.start_time else "0"
+            self.setup_id = f"{self.level_id}_{self.direction.value}_{ts_str}"
 
     def transition_to(self, new_state: BreakoutState, timestamp: datetime, reason: str):
         self.current_state = new_state
@@ -69,16 +77,16 @@ class BreakoutStateMachine:
         self,
         candle: Candle,
         candle_index: int,
-        zone: PriceZone,
+        zone: Optional[PriceZone],
         atr_value: float,
         futures_rvol: float,
         context: Optional[BreakoutContext] = None,
     ) -> BreakoutContext:
         """Processes a newly closed candle against a PriceZone and transitions state."""
-        approach_dist = max(self.approach_buffer_atr * atr_value, 4.0)
-
         # 1. Initialize context if starting from scratch
         if context is None:
+            if zone is None:
+                raise ValueError("Initial BreakoutContext creation requires a valid PriceZone")
             # If zone is above candle open, it was resistance -> candidate BULLISH breakout
             # If zone is below candle open, it was support -> candidate BEARISH breakdown
             direction = (
@@ -93,7 +101,25 @@ class BreakoutStateMachine:
                 direction=direction,
                 current_state=BreakoutState.APPROACHING_LEVEL,
                 start_time=candle.timestamp,
+                zone=zone,
             )
+        else:
+            if zone is not None:
+                context.zone = zone
+            else:
+                zone = context.zone
+
+        if zone is None:
+            context.transition_to(
+                BreakoutState.INVALIDATED,
+                candle.timestamp,
+                "Reference zone unavailable and no stored zone in context",
+            )
+            return context
+
+        effective_atr = atr_value if atr_value is not None and atr_value > 0.0 else max(zone.upper_bound - zone.nominal_price, 5.0)
+        approach_dist = max(self.approach_buffer_atr * effective_atr, 4.0)
+        effective_rvol = futures_rvol if futures_rvol is not None else 1.0
 
         state = context.current_state
 
@@ -115,7 +141,7 @@ class BreakoutStateMachine:
                     # Check if it already closed above zone
                     if candle.close > zone.upper_bound:
                         self._evaluate_breakout_confirmation(
-                            context, candle, candle_index, zone, atr_value, futures_rvol
+                            context, candle, candle_index, zone, effective_atr, effective_rvol
                         )
                     else:
                         context.transition_to(
@@ -128,7 +154,7 @@ class BreakoutStateMachine:
                 if candle.low <= zone.upper_bound:
                     if candle.close < zone.lower_bound:
                         self._evaluate_breakout_confirmation(
-                            context, candle, candle_index, zone, atr_value, futures_rvol
+                            context, candle, candle_index, zone, effective_atr, effective_rvol
                         )
                     else:
                         context.transition_to(
@@ -140,7 +166,7 @@ class BreakoutStateMachine:
         # 3. State: BREAKOUT_DETECTED
         elif state == BreakoutState.BREAKOUT_DETECTED:
             self._evaluate_breakout_confirmation(
-                context, candle, candle_index, zone, atr_value, futures_rvol
+                context, candle, candle_index, zone, effective_atr, effective_rvol
             )
 
         # 4. State: BREAKOUT_CONFIRMED / RETEST_PENDING
@@ -179,7 +205,7 @@ class BreakoutStateMachine:
                     if candle.close >= zone.nominal_price and candle.close > candle.open:
                         context.retest_time = candle.timestamp
                         context.retest_candle_index = candle_index
-                        context.stop_loss = round(candle.low - (0.1 * atr_value), 2)
+                        context.stop_loss = round(candle.low - (0.1 * effective_atr), 2)
                         risk = max(candle.close - context.stop_loss, 10.0)
                         context.target_price = round(candle.close + (1.5 * risk), 2)
 
@@ -223,7 +249,7 @@ class BreakoutStateMachine:
                     if candle.close <= zone.nominal_price and candle.close < candle.open:
                         context.retest_time = candle.timestamp
                         context.retest_candle_index = candle_index
-                        context.stop_loss = round(candle.high + (0.1 * atr_value), 2)
+                        context.stop_loss = round(candle.high + (0.1 * effective_atr), 2)
                         risk = max(context.stop_loss - candle.close, 10.0)
                         context.target_price = round(candle.close - (1.5 * risk), 2)
 
