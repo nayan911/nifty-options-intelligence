@@ -18,6 +18,7 @@ import pytz
 
 from nifty_engine.core.calendar import ExchangeCalendar
 from nifty_engine.core.interfaces import SessionState, Tick
+from nifty_engine.utils.timezone import now_ist
 
 IST = pytz.timezone("Asia/Kolkata")
 INDEX_SYMBOLS = {
@@ -46,14 +47,23 @@ class NormalizationResult:
 class TickNormalizer:
     """Stateful validator and volume normalizer for live streaming feeds."""
 
-    def __init__(self, calendar: Optional[ExchangeCalendar] = None):
+    def __init__(
+        self,
+        calendar: Optional[ExchangeCalendar] = None,
+        max_freshness_seconds: float = 30.0,
+    ):
         self.calendar = calendar or ExchangeCalendar()
+        self.max_freshness_seconds = max_freshness_seconds
         # Per-symbol state tracking
         self._last_fingerprint: Dict[str, Tuple] = {}
         self._last_exchange_time: Dict[str, datetime] = {}
         self._last_cum_volume: Dict[str, int] = {}
 
-    def normalize(self, raw_tick: Tick) -> NormalizationResult:
+    def normalize(
+        self,
+        raw_tick: Tick,
+        current_time: Optional[datetime] = None,
+    ) -> NormalizationResult:
         """Validate, sanitize, and compute true incremental volume for a tick."""
         # 1. Structure validation
         if raw_tick.ltp <= 0:
@@ -100,13 +110,30 @@ class TickNormalizer:
                     incremental_vol = cum_vol
                 self._last_cum_volume[sym] = cum_vol
 
-        # 5. Session Classification
-        session_state = self.calendar.get_session_state(ts, is_derivative=True)
-        is_live_trading = session_state in (
+        # 5. Session & Live vs Snapshot Classification
+        # Dual-gate validation:
+        # A. Current real-world wall-clock time must be an open trading session
+        current_wall_time = current_time or now_ist()
+        current_session = self.calendar.get_session_state(current_wall_time, is_derivative=True)
+        is_market_currently_open = current_session in (
             SessionState.REGULAR_CASH,
             SessionState.DERIVATIVES_EXT,
             SessionState.SPECIAL_SESSION,
         )
+
+        is_live_trading = False
+        if is_market_currently_open:
+            if raw_tick.exchange_timestamp is not None:
+                # Exchange timestamp must match current trading date and be fresh
+                exch_dt = raw_tick.exchange_timestamp.astimezone(IST)
+                same_trading_date = exch_dt.date() == current_wall_time.date()
+                latency_sec = (current_wall_time - exch_dt).total_seconds()
+                is_fresh = 0 <= latency_sec <= self.max_freshness_seconds
+                is_live_trading = same_trading_date and is_fresh
+            else:
+                # Fallback to local arrival time if broker omitted exchange timestamp
+                is_live_trading = True
+
         status = TickStatus.VALID_LIVE if is_live_trading else TickStatus.VALID_SNAPSHOT
 
         # Construct sanitized, normalized tick model

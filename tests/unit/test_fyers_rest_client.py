@@ -96,9 +96,10 @@ def test_parse_option_chain_flat_contract_records():
 
 
 def test_parse_option_chain_nested_records():
-    """Verify parsing of nested 'ce' / 'pe' format for backward compatibility."""
+    """Verify parsing of nested 'ce' / 'pe' format with expiryData."""
     payload = {
         "underlyingValue": 24000.0,
+        "expiryData": [{"date": "23-Nov-2026", "timestamp": 1795392000}],
         "optionsChain": [
             {
                 "strike_price": 24000.0,
@@ -116,3 +117,83 @@ def test_parse_option_chain_nested_records():
     assert snapshot.total_call_oi == 50000
     assert snapshot.total_put_oi == 60000
     assert snapshot.pcr == 1.2
+    assert snapshot.expiry.year == 2026
+
+
+def test_parse_option_chain_official_fyers_oich_and_greeks():
+    """Verify extraction of official FYERS 'oich' key and Greeks."""
+    payload = {
+        "underlyingValue": 25780.0,
+        "expiryData": [{"date": "23-Nov-2026", "timestamp": 1795392000}],
+        "optionsChain": [
+            {
+                "symbol": "NSE:NIFTY26NOV25800CE",
+                "strike_price": 25800.0,
+                "option_type": "CE",
+                "ltp": 110.5,
+                "oi": 80000,
+                "oich": 4500,  # Official FYERS field name
+                "volume": 200000,
+                "bid": 110.2,
+                "ask": 110.8,
+                "greeks": {
+                    "iv": 14.2,
+                    "delta": 0.52,
+                    "gamma": 0.003,
+                    "theta": -12.1,
+                    "vega": 15.4,
+                },
+            }
+        ],
+    }
+    snapshot = FyersRestClient.parse_option_chain_payload(payload, "NSE:NIFTY50-INDEX")
+    assert len(snapshot.strikes) == 1
+    c = snapshot.strikes[0].call
+    assert c is not None
+    assert c["oi_change"] == 4500
+    assert c["gamma"] == 0.003
+    assert c["vega"] == 15.4
+    assert c["bid"] == 110.2
+    assert c["ask"] == 110.8
+
+
+def test_underlying_identification_banknifty_vs_nifty():
+    """Verify BANKNIFTY is not accidentally misclassified as NIFTY."""
+    payload = {
+        "underlyingValue": 52000.0,
+        "expiryData": [{"date": "25-Nov-2026", "timestamp": 1795564800}],
+        "optionsChain": [
+            {
+                "symbol": "NSE:BANKNIFTY26NOV52000CE",
+                "strike_price": 52000.0,
+                "option_type": "CE",
+                "ltp": 350.0,
+                "oi": 25000,
+            }
+        ],
+    }
+
+    snap_bank = FyersRestClient.parse_option_chain_payload(payload, "NSE:NIFTYBANK-INDEX")
+    assert snap_bank.underlying == "BANKNIFTY"
+
+    snap_nifty = FyersRestClient.parse_option_chain_payload(payload, "NSE:NIFTY50-INDEX")
+    assert snap_nifty.underlying == "NIFTY"
+
+
+def test_missing_expiry_raises_error():
+    """Verify that an option chain payload with no detectable expiry raises ValueError."""
+    import pytest
+    payload = {
+        "underlyingValue": 25000.0,
+        "optionsChain": [
+            {
+                "symbol": "NSE:NIFTY26NOV25000CE",
+                "strike_price": 25000.0,
+                "option_type": "CE",
+                "ltp": 50.0,
+                "oi": 1000,
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="Could not resolve contract expiry date"):
+        FyersRestClient.parse_option_chain_payload(payload, "NSE:NIFTY50-INDEX")

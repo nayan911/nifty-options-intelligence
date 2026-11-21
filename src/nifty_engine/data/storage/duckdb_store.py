@@ -1,8 +1,9 @@
 """DuckDB high-performance embedded storage engine."""
 
+import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
-import threading
 from typing import Any, List, Optional, Union
 
 import duckdb
@@ -39,10 +40,34 @@ class DuckDBStore(IStorageEngine):
         self._conn = duckdb.connect(self.db_path)
         self._init_schemas()
 
+    def _get_cursor(self) -> duckdb.DuckDBPyConnection:
+        """Internal helper to obtain a cursor (allows mocking/fault injection in tests)."""
+        return self._conn.cursor()
+
     def _init_schemas(self) -> None:
-        """Create tables and indexes if they do not exist."""
+        """Create tables and indexes if they do not exist, and migrate missing columns."""
         with self._lock:
-            self._conn.cursor().execute(CREATE_TABLES_SQL)
+            cur = self._conn.cursor()
+            cur.execute(CREATE_TABLES_SQL)
+            # Idempotently migrate columns for option_chain_strikes if already existing from prior runs
+            for col, dtype in [
+                ("call_oi_change", "BIGINT"),
+                ("call_volume", "BIGINT"),
+                ("call_bid", "DOUBLE"),
+                ("call_ask", "DOUBLE"),
+                ("call_gamma", "DOUBLE"),
+                ("call_vega", "DOUBLE"),
+                ("put_oi_change", "BIGINT"),
+                ("put_volume", "BIGINT"),
+                ("put_bid", "DOUBLE"),
+                ("put_ask", "DOUBLE"),
+                ("put_gamma", "DOUBLE"),
+                ("put_vega", "DOUBLE"),
+            ]:
+                try:
+                    cur.execute(f"ALTER TABLE option_chain_strikes ADD COLUMN IF NOT EXISTS {col} {dtype}")
+                except Exception:
+                    pass
 
     def insert_tick(self, tick: Tick) -> None:
         """Buffer a single tick for high-throughput single-writer batch insert."""
@@ -57,13 +82,20 @@ class DuckDBStore(IStorageEngine):
             return self._flush_ticks_unlocked()
 
     def _flush_ticks_unlocked(self) -> int:
-        """Internal flush assuming self._lock is already held."""
+        """Internal flush assuming self._lock is already held.
+
+        Clears buffer only upon successful persistence, preventing data loss on transient write errors.
+        """
         if not self._tick_buffer:
             return 0
         batch = list(self._tick_buffer)
-        self._tick_buffer.clear()
-        self._insert_ticks_bulk_unlocked(batch)
-        return len(batch)
+        try:
+            self._insert_ticks_bulk_unlocked(batch)
+            del self._tick_buffer[: len(batch)]
+            return len(batch)
+        except Exception:
+            # Buffer is preserved on failure
+            raise
 
     def insert_ticks_bulk(self, ticks: List[Tick]) -> None:
         """High-performance bulk insert of ticks."""
@@ -91,9 +123,12 @@ class DuckDBStore(IStorageEngine):
             for t in ticks
         ]
         df = pd.DataFrame(data)
-        # DuckDB directly queries local DataFrame 'df' via cursor without register/unregister contention
         cur = self._conn.cursor()
-        cur.execute("INSERT INTO ticks SELECT * FROM df")
+        cur.register("staging_ticks_df", df)
+        try:
+            cur.execute("INSERT INTO ticks SELECT * FROM staging_ticks_df")
+        finally:
+            cur.unregister("staging_ticks_df")
 
     def insert_candle(self, candle: Candle) -> None:
         """Upsert a candle (replaces if existing bar with same key is updated)."""
@@ -232,8 +267,7 @@ class DuckDBStore(IStorageEngine):
             return cur.execute(query, params).df()
 
     def save_option_chain_snapshot(self, snapshot: OptionChainSnapshot) -> None:
-        """Store header and strike-level details of an option chain snapshot."""
-        import uuid
+        """Store header and strike-level details of an option chain snapshot transactionally."""
         snap_id = str(uuid.uuid4())
 
         rows = []
@@ -245,40 +279,63 @@ class DuckDBStore(IStorageEngine):
                 "strike": s.strike,
                 "call_ltp": c.get("ltp"),
                 "call_oi": c.get("oi"),
+                "call_oi_change": c.get("oi_change"),
+                "call_volume": c.get("volume"),
+                "call_bid": c.get("bid"),
+                "call_ask": c.get("ask"),
                 "call_iv": c.get("iv"),
                 "call_delta": c.get("delta"),
+                "call_gamma": c.get("gamma"),
                 "call_theta": c.get("theta"),
+                "call_vega": c.get("vega"),
                 "put_ltp": p.get("ltp"),
                 "put_oi": p.get("oi"),
+                "put_oi_change": p.get("oi_change"),
+                "put_volume": p.get("volume"),
+                "put_bid": p.get("bid"),
+                "put_ask": p.get("ask"),
                 "put_iv": p.get("iv"),
                 "put_delta": p.get("delta"),
+                "put_gamma": p.get("gamma"),
                 "put_theta": p.get("theta"),
+                "put_vega": p.get("vega"),
             })
 
         with self._lock:
-            cur = self._conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO option_chain_snapshots (
-                    snapshot_id, underlying, spot_price, timestamp, expiry,
-                    total_call_oi, total_put_oi, pcr
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    snap_id,
-                    snapshot.underlying,
-                    snapshot.spot_price,
-                    snapshot.api_timestamp,
-                    snapshot.expiry,
-                    snapshot.total_call_oi,
-                    snapshot.total_put_oi,
-                    snapshot.pcr,
-                ]
-            )
+            cur = self._get_cursor()
+            cur.execute("BEGIN TRANSACTION")
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO option_chain_snapshots (
+                        snapshot_id, underlying, spot_price, timestamp, expiry,
+                        total_call_oi, total_put_oi, pcr
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        snap_id,
+                        snapshot.underlying,
+                        snapshot.spot_price,
+                        snapshot.api_timestamp,
+                        snapshot.expiry,
+                        snapshot.total_call_oi,
+                        snapshot.total_put_oi,
+                        snapshot.pcr,
+                    ],
+                )
 
-            if rows:
-                df = pd.DataFrame(rows)
-                cur.execute("INSERT INTO option_chain_strikes SELECT * FROM df")
+                if rows:
+                    df = pd.DataFrame(rows)
+                    cur.register("staging_strikes_df", df)
+                    try:
+                        cur.execute("INSERT INTO option_chain_strikes SELECT * FROM staging_strikes_df")
+                    finally:
+                        cur.unregister("staging_strikes_df")
+
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
 
     def close(self) -> None:
         """Flush any pending buffered ticks and close connection."""

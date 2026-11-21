@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from nifty_engine.utils.timezone import now_ist
+
 
 class OptionType(str, Enum):
     CE = "CE"
@@ -41,7 +43,7 @@ class Tick(BaseModel):
     """Normalized tick data model with explicit incremental volume separation."""
     symbol: str
     exchange_timestamp: Optional[datetime] = None
-    local_timestamp: datetime = Field(default_factory=datetime.utcnow)
+    local_timestamp: datetime = Field(default_factory=now_ist)
     ltp: float = Field(..., gt=0, description="Last traded price")
     cumulative_volume: int = Field(default=0, ge=0, description="Cumulative daily traded volume from exchange")
     incremental_volume: int = Field(default=0, ge=0, description="Incremental traded volume since previous tick")
@@ -100,7 +102,7 @@ class OptionChainSnapshot(BaseModel):
     """Full snapshot of the option chain with separated API vs Exchange metadata."""
     underlying: str
     spot_price: float
-    api_timestamp: datetime = Field(default_factory=datetime.utcnow, description="Time response received from broker")
+    api_timestamp: datetime = Field(default_factory=now_ist, description="Time response received from broker")
     exchange_timestamp: Optional[datetime] = Field(default=None, description="Time reported by exchange if available")
     last_oi_change_timestamp: Optional[datetime] = Field(default=None, description="Last time strike OI values changed")
     expiry: date

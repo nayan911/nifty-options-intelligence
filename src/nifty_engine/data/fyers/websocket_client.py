@@ -47,14 +47,21 @@ class FyersWebSocketClient:
         self.max_symbols = max_symbols
 
         self.subscribed_symbols: Set[str] = set()
-        self.acknowledged_symbols: Set[str] = set()
+        self.quote_observed_symbols: Set[str] = set()
         self.subscription_acks: int = 0
+        self.total_messages_received: int = 0
+        self.last_error: Optional[str] = None
         self._socket: Optional[FyersDataSocket] = None
         self._is_connected: bool = False
 
         # Ensure local logs directory exists for FyersDataSocket logger
         self.log_dir = Path("data/logs")
         self.log_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def acknowledged_symbols(self) -> Set[str]:
+        """Backward-compatible alias for quote_observed_symbols."""
+        return self.quote_observed_symbols
 
     @property
     def is_connected(self) -> bool:
@@ -106,6 +113,7 @@ class FyersWebSocketClient:
 
     def _on_open(self) -> None:
         self._is_connected = True
+        self.last_error = None
         # Subscribe pending symbols upon connection
         if self.subscribed_symbols and self._socket:
             self._socket.subscribe(symbols=list(self.subscribed_symbols), data_type="SymbolUpdate")
@@ -114,12 +122,14 @@ class FyersWebSocketClient:
         self._is_connected = False
 
     def _on_error(self, message: str) -> None:
-        pass
+        self.last_error = str(message)
 
     def _on_message(self, message: dict) -> None:
         """Parse raw incoming FYERS WebSocket tick or system message and dispatch."""
         if not message or not isinstance(message, dict):
             return
+
+        self.total_messages_received += 1
 
         # 1. Handle Subscription / System Acknowledgements
         msg_type = message.get("type")
@@ -135,7 +145,7 @@ class FyersWebSocketClient:
         ltp = message.get("ltp")
 
         if symbol and ltp is not None:
-            self.acknowledged_symbols.add(symbol)
+            self.quote_observed_symbols.add(symbol)
             epoch = message.get("exch_feed_time")
             exch_dt = datetime.fromtimestamp(epoch, tz=IST) if epoch else None
             is_index_asset = symbol in INDEX_SYMBOLS or "-INDEX" in symbol

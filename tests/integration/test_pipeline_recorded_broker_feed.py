@@ -65,7 +65,7 @@ def test_21_symbol_feed_processing_and_volume_integrity():
             cumulative_volume=cum_vol,
             is_index=is_idx,
         )
-        res = normalizer.normalize(raw_tick)
+        res = normalizer.normalize(raw_tick, current_time=base_time)
         assert res.status == TickStatus.VALID_LIVE
         # In round 1 baseline, incremental volume is 0
         assert res.tick.incremental_volume == 0
@@ -73,18 +73,19 @@ def test_21_symbol_feed_processing_and_volume_integrity():
         builder.process_tick(res.tick)
 
     # Round 2: Active trading ticks at 09:15:05 (volume increments)
+    round2_time = base_time + timedelta(seconds=5)
     for sym, ltp, cum_vol, is_idx in symbols_spec:
         # Increase cumulative volume by 500 for tradeable assets
         new_cum_vol = cum_vol + (0 if is_idx else 500)
         raw_tick = Tick(
             symbol=sym,
-            exchange_timestamp=base_time + timedelta(seconds=5),
-            local_timestamp=base_time + timedelta(seconds=5),
+            exchange_timestamp=round2_time,
+            local_timestamp=round2_time,
             ltp=ltp + 1.0,
             cumulative_volume=new_cum_vol,
             is_index=is_idx,
         )
-        res = normalizer.normalize(raw_tick)
+        res = normalizer.normalize(raw_tick, current_time=round2_time)
         assert res.status == TickStatus.VALID_LIVE
 
         if is_idx:

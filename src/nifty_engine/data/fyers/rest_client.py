@@ -128,6 +128,21 @@ class FyersRestClient:
         total_put_oi = 0
         detected_expiry: Optional[date] = None
 
+        # Check top-level expiryData (official FYERS v3 specification)
+        expiry_data = chain_data.get("expiryData", [])
+        if expiry_data and isinstance(expiry_data, list):
+            first_exp = expiry_data[0]
+            if isinstance(first_exp, dict):
+                if first_exp.get("timestamp"):
+                    detected_expiry = datetime.fromtimestamp(first_exp["timestamp"], tz=IST).date()
+                elif first_exp.get("date"):
+                    try:
+                        detected_expiry = datetime.strptime(first_exp["date"], "%d-%b-%Y").date()
+                    except ValueError:
+                        pass
+            elif isinstance(first_exp, (int, float)):
+                detected_expiry = datetime.fromtimestamp(first_exp, tz=IST).date()
+
         for item in options_chain:
             # Case 1: Nested structure (item contains 'ce' and/or 'pe')
             if "ce" in item or "pe" in item:
@@ -145,6 +160,11 @@ class FyersRestClient:
                     oi = int(p.get("oi", 0))
                     total_put_oi += oi
                     strike_map[strike_p]["put"] = FyersRestClient._extract_contract_fields(p)
+
+                if detected_expiry is None:
+                    exp_val = item.get("expiry") or (item.get("ce") or {}).get("expiry")
+                    if isinstance(exp_val, (int, float)) and exp_val > 0:
+                        detected_expiry = datetime.fromtimestamp(exp_val, tz=IST).date()
 
             # Case 2: Flat structure (item is a single contract record with option_type / opt)
             else:
@@ -175,8 +195,13 @@ class FyersRestClient:
                 # Extract expiry date if present
                 if detected_expiry is None and item.get("expiry"):
                     exp_val = item["expiry"]
-                    if isinstance(exp_val, (int, float)):
+                    if isinstance(exp_val, (int, float)) and exp_val > 0:
                         detected_expiry = datetime.fromtimestamp(exp_val, tz=IST).date()
+
+        if detected_expiry is None:
+            raise ValueError(
+                f"Could not resolve contract expiry date from FYERS option chain payload for {underlying_symbol}."
+            )
 
         parsed_strikes: List[OptionChainStrike] = [
             OptionChainStrike(
@@ -189,11 +214,21 @@ class FyersRestClient:
 
         pcr = round(total_put_oi / total_call_oi, 3) if total_call_oi > 0 else 0.0
 
+        sym_upper = underlying_symbol.upper()
+        if "BANKNIFTY" in sym_upper or "NIFTYBANK" in sym_upper:
+            underlying = "BANKNIFTY"
+        elif "NIFTY" in sym_upper:
+            underlying = "NIFTY"
+        elif "SENSEX" in sym_upper:
+            underlying = "SENSEX"
+        else:
+            underlying = underlying_symbol
+
         return OptionChainSnapshot(
-            underlying="NIFTY" if "NIFTY" in underlying_symbol else underlying_symbol,
+            underlying=underlying,
             spot_price=spot_price,
             api_timestamp=datetime.now(IST),
-            expiry=detected_expiry or date.today(),
+            expiry=detected_expiry,
             strikes=parsed_strikes,
             total_call_oi=total_call_oi,
             total_put_oi=total_put_oi,
@@ -202,13 +237,21 @@ class FyersRestClient:
 
     @staticmethod
     def _extract_contract_fields(raw: Dict[str, Any]) -> Dict[str, Any]:
-        """Extracts standard contract fields including Greeks, OI change, volume, and quotes."""
+        """Extracts standard contract fields including Greeks, OI change (oich), volume, and quotes."""
         greeks = raw.get("greeks", {}) or {}
+
+        # Parse documented FYERS oich / oichange / oi_change
+        raw_oich = raw.get("oich")
+        if raw_oich is None:
+            raw_oich = raw.get("oichange")
+        if raw_oich is None:
+            raw_oich = raw.get("oi_change", 0)
+
         return {
             "symbol": raw.get("symbol", ""),
             "ltp": float(raw.get("ltp", 0.0)),
             "oi": int(raw.get("oi", 0)),
-            "oi_change": int(raw.get("oichange", raw.get("oi_change", 0))),
+            "oi_change": int(raw_oich),
             "volume": int(raw.get("volume", raw.get("vol_traded_today", 0))),
             "bid": float(raw.get("bid", 0.0)) if raw.get("bid") is not None else None,
             "ask": float(raw.get("ask", 0.0)) if raw.get("ask") is not None else None,

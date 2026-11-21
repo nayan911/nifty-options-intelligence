@@ -31,10 +31,10 @@ def test_futures_incremental_volume_calculation():
     builder = RealtimeCandleBuilder()
     base_dt = IST.localize(datetime(2026, 11, 26, 9, 15, 10))
 
-    # Futures contract ticks with cumulative vol_traded_today: 1,000,000 -> 1,000,050 -> 1,000,120
-    t1 = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_dt, ltp=25100.0, cumulative_volume=1000000, is_index=False)
-    t2 = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_dt.replace(second=20), ltp=25105.0, cumulative_volume=1000050, is_index=False)
-    t3 = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_dt.replace(second=40), ltp=25095.0, cumulative_volume=1000120, is_index=False)
+    # Normalized ticks with incremental volume calculated by TickNormalizer:
+    t1 = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_dt, ltp=25100.0, cumulative_volume=1000000, incremental_volume=0, is_index=False)
+    t2 = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_dt.replace(second=20), ltp=25105.0, cumulative_volume=1000050, incremental_volume=50, is_index=False)
+    t3 = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_dt.replace(second=40), ltp=25095.0, cumulative_volume=1000120, incremental_volume=70, is_index=False)
 
     builder.process_tick(t1)
     builder.process_tick(t2)
@@ -42,8 +42,31 @@ def test_futures_incremental_volume_calculation():
 
     bar = builder.get_current_candle("NSE:NIFTY26NOVFUT", "1m")
     assert bar is not None
-    # Incremental volume must be 50 + 70 = 120 (NOT 3 million!)
+    # Incremental volume must be 0 + 50 + 70 = 120
     assert bar.volume == 120
+
+
+def test_regression_no_double_volume_counting_when_cumulative_unchanged():
+    """Regression test:
+    Tick 1: cum = 1000, inc = 0 (baseline)
+    Tick 2: cum = 1100, inc = 100
+    Tick 3: cum = 1100, inc = 0 (price moves from 25050 to 25060, but no new contracts traded)
+    Expected volume must remain strictly 100, NOT 200.
+    """
+    builder = RealtimeCandleBuilder()
+    base_dt = IST.localize(datetime(2026, 11, 26, 9, 15, 10))
+
+    t1 = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_dt, ltp=25000.0, cumulative_volume=1000, incremental_volume=0, is_index=False)
+    t2 = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_dt.replace(second=20), ltp=25050.0, cumulative_volume=1100, incremental_volume=100, is_index=False)
+    t3 = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_dt.replace(second=40), ltp=25060.0, cumulative_volume=1100, incremental_volume=0, is_index=False)
+
+    builder.process_tick(t1)
+    builder.process_tick(t2)
+    builder.process_tick(t3)
+
+    bar = builder.get_current_candle("NSE:NIFTY26NOVFUT", "1m")
+    assert bar is not None
+    assert bar.volume == 100  # Strictly 100, preventing the 200 double-count bug
 
 
 def test_bar_high_low_strictly_isolated():

@@ -7,7 +7,7 @@ and out-of-order quarantine, builds 1m/5m/15m OHLCV bars, and persists data into
 
 import sys
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 
 import pytz
 
@@ -21,6 +21,7 @@ from nifty_engine.data.fyers.instrument_master import FyersInstrumentMaster
 from nifty_engine.data.fyers.websocket_client import FyersWebSocketClient
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.data.tick_normalizer import TickNormalizer, TickStatus
+from nifty_engine.utils.timezone import now_ist
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -44,13 +45,21 @@ class MarketDataEngine:
             on_ack=self._on_ws_ack,
         )
 
-        self.tick_count = 0
-        self.live_tick_count = 0
-        self.snapshot_count = 0
+        # Observability & diagnostic counters
+        self.total_ticks_received = 0
+        self.live_ticks_accepted = 0
+        self.snapshots_accepted = 0
+        self.duplicates_dropped = 0
+        self.out_of_order_quarantined = 0
+        self.malformed_dropped = 0
+        self.ticks_persisted = 0
         self.candle_count = 0
+        self.symbol_stats: Dict[str, Dict[str, int]] = {}
+
         self.current_spot_price: Optional[float] = None
         self.active_atm_strike: Optional[float] = None
-        self.subscribed_option_symbols: List[str] = []
+        self.subscribed_option_symbols: Set[str] = set()
+        self.active_paper_trade_symbols: Set[str] = set()
 
     def _on_ws_ack(self, ack_msg: dict):
         """Callback on WebSocket subscription and status acknowledgements."""
@@ -58,19 +67,44 @@ class MarketDataEngine:
 
     def _on_tick_received(self, raw_tick: Tick):
         """Processes raw tick through normalizer, sanitizes volume, persists, and builds bars."""
+        sym = raw_tick.symbol
+        self.total_ticks_received += 1
+
+        if sym not in self.symbol_stats:
+            self.symbol_stats[sym] = {
+                "received": 0,
+                "live": 0,
+                "snapshot": 0,
+                "duplicate": 0,
+                "out_of_order": 0,
+                "malformed": 0,
+            }
+        self.symbol_stats[sym]["received"] += 1
+
         res = self.normalizer.normalize(raw_tick)
 
-        if res.status in (TickStatus.DUPLICATE, TickStatus.OUT_OF_ORDER, TickStatus.MALFORMED):
+        if res.status == TickStatus.DUPLICATE:
+            self.duplicates_dropped += 1
+            self.symbol_stats[sym]["duplicate"] += 1
             return
+        elif res.status == TickStatus.OUT_OF_ORDER:
+            self.out_of_order_quarantined += 1
+            self.symbol_stats[sym]["out_of_order"] += 1
+            return
+        elif res.status == TickStatus.MALFORMED:
+            self.malformed_dropped += 1
+            self.symbol_stats[sym]["malformed"] += 1
+            return
+
         if not res.tick:
             return
 
         tick = res.tick
-        self.tick_count += 1
         self.freshness.record_tick(tick)
 
-        # 1. Save normalized tick (with exact incremental volume) to DuckDB
+        # 1. Save normalized tick (with single source of truth incremental volume) to DuckDB
         self.store.insert_tick(tick)
+        self.ticks_persisted += 1
 
         # 2. Track NIFTY spot price
         if tick.symbol == settings.PRIMARY_INDEX:
@@ -78,10 +112,12 @@ class MarketDataEngine:
 
         # 3. Only pass live trading ticks to CandleBuilder (holiday snapshots are saved but do not form bars)
         if res.status == TickStatus.VALID_LIVE:
-            self.live_tick_count += 1
+            self.live_ticks_accepted += 1
+            self.symbol_stats[sym]["live"] += 1
             self.builder.process_tick(tick)
         else:
-            self.snapshot_count += 1
+            self.snapshots_accepted += 1
+            self.symbol_stats[sym]["snapshot"] += 1
 
     def _on_candle_closed(self, candle: Candle):
         """Invoked when a 1m/5m/15m bar closes."""
@@ -95,7 +131,7 @@ class MarketDataEngine:
         )
 
     def _get_initial_spot(self) -> float:
-        """Determines best reference NIFTY spot price from database or fallback."""
+        """Determines reference NIFTY spot price from database, live REST quotes, or master."""
         try:
             with self.store._lock:
                 cur = self.store._conn.cursor()
@@ -114,7 +150,30 @@ class MarketDataEngine:
                     return float(res_tick[0][0])
         except Exception:
             pass
-        return 24100.0
+
+        # Try live broker quote
+        try:
+            client = self.auth.get_client()
+            q_res = client.quotes(data={"symbols": settings.PRIMARY_INDEX})
+            if q_res and q_res.get("s") == "ok" and q_res.get("d"):
+                lp = q_res["d"][0].get("v", {}).get("lp")
+                if lp and float(lp) > 0:
+                    return float(lp)
+        except Exception:
+            pass
+
+        # Calculate reference strike from instrument master's active strikes
+        try:
+            expiries = self.master.get_active_expiries("NIFTY")
+            if expiries:
+                contracts = self.master.get_option_chain_contracts("NIFTY", expiries[0])
+                strikes = sorted(c.strike for c in contracts if c.strike > 0)
+                if strikes:
+                    return strikes[len(strikes) // 2]
+        except Exception:
+            pass
+
+        raise RuntimeError("Could not resolve valid reference NIFTY spot price. Check network/instrument master.")
 
     def _build_watchlist(self) -> List[str]:
         """Constructs 21-25 symbol watchlist within 100-symbol quota."""
@@ -170,12 +229,56 @@ class MarketDataEngine:
                         except LookupError:
                             pass
 
-            self.subscribed_option_symbols = opt_symbols
+            self.subscribed_option_symbols = set(opt_symbols)
             watchlist.extend(opt_symbols)
         except Exception as e:
             print(f"[WARN] Options resolution: {e}")
 
         return watchlist
+
+    def check_and_rotate_options(self) -> None:
+        """Dynamically rotates option subscriptions when NIFTY ATM strike shifts."""
+        if self.current_spot_price is None or self.active_atm_strike is None:
+            return
+
+        new_atm = round(self.current_spot_price / 50.0) * 50.0
+        if new_atm == self.active_atm_strike:
+            return
+
+        print(f"\n[ATM ROTATION] Spot moved to {self.current_spot_price:.2f}. Shifting ATM {self.active_atm_strike} -> {new_atm}")
+        self.active_atm_strike = new_atm
+
+        try:
+            expiries = self.master.get_active_expiries("NIFTY")
+            if not expiries:
+                return
+
+            new_opt_symbols: Set[str] = set()
+            for exp in expiries[:2]:
+                for s in [new_atm - 50.0, new_atm, new_atm + 50.0]:
+                    try:
+                        ce = self.master.resolve_option("NIFTY", exp, s, OptionType.CE)
+                        pe = self.master.resolve_option("NIFTY", exp, s, OptionType.PE)
+                        new_opt_symbols.add(ce.symbol)
+                        new_opt_symbols.add(pe.symbol)
+                    except LookupError:
+                        pass
+
+            to_unsubscribe = (self.subscribed_option_symbols - new_opt_symbols) - self.active_paper_trade_symbols
+            to_subscribe = new_opt_symbols - self.subscribed_option_symbols
+
+            if to_unsubscribe:
+                print(f"[ROTATION] Unsubscribing {len(to_unsubscribe)} stale strikes: {to_unsubscribe}")
+                self.ws_client.unsubscribe(list(to_unsubscribe))
+                self.subscribed_option_symbols -= to_unsubscribe
+
+            if to_subscribe:
+                print(f"[ROTATION] Subscribing {len(to_subscribe)} new ATM strikes: {to_subscribe}")
+                self.ws_client.subscribe(list(to_subscribe))
+                self.subscribed_option_symbols |= to_subscribe
+
+        except Exception as e:
+            print(f"[WARN] Option rotation error: {e}")
 
     def start(self):
         """Starts streaming and monitoring pipeline."""
@@ -220,29 +323,39 @@ class MarketDataEngine:
         try:
             while self.running:
                 time.sleep(10)
-                # Flush DuckDB buffer periodically
+                # 1. Flush DuckDB buffer periodically
                 self.store.flush_ticks()
 
-                # Session re-evaluation
+                # 2. Clock-driven candle finalization (emits bars on boundary even without immediate ticks)
+                closed_bars = self.builder.flush_closed_bars(now_ist())
+                for bar in closed_bars:
+                    self._on_candle_closed(bar)
+
+                # 3. Dynamic option rotation if ATM shifted
+                self.check_and_rotate_options()
+
+                # 4. Session evaluation & status reporting
                 curr_state = self.calendar.get_session_state(is_derivative=True)
                 is_open = curr_state in (SessionState.REGULAR_CASH, SessionState.DERIVATIVES_EXT, SessionState.SPECIAL_SESSION)
 
-                ack_count = len(self.ws_client.acknowledged_symbols)
+                ws_status = "CONNECTED" if self.ws_client.is_connected else "DISCONNECTED"
+                quote_count = len(self.ws_client.quote_observed_symbols)
                 sub_count = len(watchlist)
 
                 if not is_open:
                     print(
                         f"[HOLIDAY / OFFLINE STATUS] Session: {curr_state.value.upper()} | "
-                        f"WS: CONNECTED | Subscribed: {sub_count} | Acknowledged: {ack_count}/{sub_count} | "
-                        f"Snapshots Stored: {self.snapshot_count} | Trading Signals: DISABLED"
+                        f"WS: {ws_status} | Subscribed: {sub_count} | Broker Acks: {self.ws_client.subscription_acks} | "
+                        f"Quotes Seen: {quote_count}/{sub_count} | Snapshots: {self.snapshots_accepted} | "
+                        f"Duplicates: {self.duplicates_dropped} | Trading Signals: DISABLED"
                     )
                 else:
                     nifty_latency = self.freshness.get_latency_seconds(f"tick:{settings.PRIMARY_INDEX}")
                     lat_str = f"{nifty_latency:.2f}s" if nifty_latency is not None else "Awaiting tick..."
                     print(
                         f"[LIVE STATUS] Session: {curr_state.value.upper()} | "
-                        f"Ticks: {self.live_tick_count} | Candles: {self.candle_count} | "
-                        f"NIFTY Latency: {lat_str} | Acked: {ack_count}/{sub_count}"
+                        f"WS: {ws_status} | Live Ticks: {self.live_ticks_accepted} | Candles: {self.candle_count} | "
+                        f"NIFTY Latency: {lat_str} | Quotes Seen: {quote_count}/{sub_count}"
                     )
         except KeyboardInterrupt:
             print("\nShutting down cleanly...")
