@@ -1187,12 +1187,14 @@ class TechnicalAnalysisEngine:
         primary_futures: str = "NSE:NIFTY26NOVFUT",
         on_setup_candidate: Optional[Callable[[BreakoutContext, TechnicalSnapshot], None]] = None,
         on_technical_candidate: Optional[Callable[[Any], None]] = None,
+        derivatives_engine: Optional[Any] = None,
     ):
         self._lock = threading.RLock()
         self.primary_index = primary_index
         self.primary_futures = primary_futures
         self.on_setup_candidate = on_setup_candidate
         self.on_technical_candidate = on_technical_candidate
+        self.derivatives_engine = derivatives_engine
         self.multi_timeframe_analyzer: Optional[Any] = None
 
         if on_technical_candidate:
@@ -1200,6 +1202,7 @@ class TechnicalAnalysisEngine:
             self.multi_timeframe_analyzer = MultiTimeframeAnalyzer(
                 engine=self,
                 on_candidate=on_technical_candidate,
+                derivatives_engine=derivatives_engine,
             )
 
         # Explicit Index-to-Futures Mapping (prevents NIFTY futures confirming BANKNIFTY)
@@ -1233,7 +1236,15 @@ class TechnicalAnalysisEngine:
             self.multi_timeframe_analyzer = MultiTimeframeAnalyzer(
                 engine=self,
                 on_candidate=callback,
+                derivatives_engine=self.derivatives_engine,
             )
+
+    def on_option_chain(self, snapshot: Any, as_of: Optional[datetime] = None) -> None:
+        """Ingests option chain snapshots into the derivatives intelligence engine."""
+        with self._lock:
+            if self.derivatives_engine is not None:
+                self.derivatives_engine.oi_analyzer.on_option_chain(snapshot, as_of=as_of)
+                self.derivatives_engine.pcr_engine.on_option_chain(snapshot, as_of=as_of)
 
     def _get_or_create_state(self, symbol: str, is_index: bool = False) -> SymbolTechnicalState:
         if symbol not in self.states:
@@ -1277,6 +1288,12 @@ class TechnicalAnalysisEngine:
         with self._lock:
             is_idx = ("INDEX" in candle.symbol) or (candle.symbol in self.index_futures_map)
             state = self._get_or_create_state(candle.symbol, is_index=is_idx)
+
+            # Phase 3A: Update derivatives futures positioning if candle has OI
+            if self.derivatives_engine is not None and (
+                candle.symbol in self.futures_index_map or candle.symbol == self.primary_futures
+            ):
+                self.derivatives_engine.oi_analyzer.on_futures_candle(candle)
 
             # Reject older trading dates before modifying state
             if state.current_session_date is not None and candle.timestamp.date() < state.current_session_date:

@@ -80,17 +80,19 @@ class TechnicalCandidate:
     timeframe_breakdown: Dict[str, Any] = field(default_factory=dict)
     decision_at: Optional[datetime] = None
     confirmation_status: str = "CONFIRMED"
+    derivatives_assessment: Optional[Any] = None
     is_paper_trading: bool = True
 
     def summary(self) -> str:
         """Formatted human-readable summary of the technical candidate."""
         hd_str = f"{self.headroom_points:.1f}pts" if self.headroom_points is not None else "N/A"
         dec_str = f" | Decision: {self.decision_at.strftime('%H:%M:%S')} [{self.confirmation_status}]" if self.decision_at else ""
+        deriv_str = f" | Deriv: {self.derivatives_assessment.assessment_type.value}" if self.derivatives_assessment else ""
         return (
             f"[{self.candidate_id}] {self.symbol} {self.direction.value} @ {self.entry_price:.2f} | "
             f"SL: {self.stop_loss:.2f} | T1: {self.target_1:.2f} ({self.target_1_rr:.2f}R) | "
             f"T2: {self.target_2:.2f} ({self.target_2_rr:.2f}R) | "
-            f"Risk: {self.risk_points:.1f}pts | Headroom: {hd_str} | Score: {self.confluence_score:.0f}/100{dec_str}"
+            f"Risk: {self.risk_points:.1f}pts | Headroom: {hd_str} | Score: {self.confluence_score:.0f}/100{dec_str}{deriv_str}"
         )
 
 
@@ -125,10 +127,12 @@ class MultiTimeframeAnalyzer:
         max_1m_futures_age_seconds: float = 60.0,
         max_5m_futures_age_seconds: float = 300.0,
         max_15m_macro_age_seconds: float = 1200.0,
+        derivatives_engine: Optional[Any] = None,
     ):
         self._lock = threading.RLock()
         self.engine = engine
         self.on_candidate = on_candidate
+        self.derivatives_engine = derivatives_engine
         self.min_confluence_score = min_confluence_score
         self.min_headroom_atr_multiple = min_headroom_atr_multiple
         self.min_risk_points = min_risk_points
@@ -619,6 +623,29 @@ class MultiTimeframeAnalyzer:
             return None
         self.notified_candidates.add(candidate_id)
 
+        # Phase 3A: Optional Derivatives Assessment (strictly descriptive, zero hard vetoes)
+        deriv_engine = self.derivatives_engine or getattr(self.engine, "derivatives_engine", None)
+        deriv_assessment = None
+        if deriv_engine is not None:
+            deriv_assessment = deriv_engine.evaluate_setup(
+                direction=setup.direction,
+                level_price=nominal_lvl,
+                as_of=decision_time,
+                confirmation_status=confirmation_status,
+            )
+
+        breakdown = {
+            "15m_trend": snap_15m.trend_bias,
+            "5m_rvol": active.snapshot_5m.rvol,
+            "5m_vwap": active.snapshot_5m.vwap,
+            "1m_rsi": snap_1m.rsi,
+            "1m_vwap": snap_1m.vwap,
+            "decision_at": decision_time.isoformat(),
+            "confirmation_status": confirmation_status,
+        }
+        if deriv_assessment is not None:
+            breakdown["derivatives_assessment"] = deriv_assessment.to_dict()
+
         candidate = TechnicalCandidate(
             candidate_id=candidate_id,
             symbol=setup.symbol,
@@ -639,15 +666,8 @@ class MultiTimeframeAnalyzer:
             headroom_points=round(live_headroom, 1) if live_headroom is not None else None,
             decision_at=decision_time,
             confirmation_status=confirmation_status,
-            timeframe_breakdown={
-                "15m_trend": snap_15m.trend_bias,
-                "5m_rvol": active.snapshot_5m.rvol,
-                "5m_vwap": active.snapshot_5m.vwap,
-                "1m_rsi": snap_1m.rsi,
-                "1m_vwap": snap_1m.vwap,
-                "decision_at": decision_time.isoformat(),
-                "confirmation_status": confirmation_status,
-            },
+            derivatives_assessment=deriv_assessment,
+            timeframe_breakdown=breakdown,
             is_paper_trading=True,
         )
 
