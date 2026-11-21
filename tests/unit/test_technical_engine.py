@@ -1073,3 +1073,305 @@ def test_spot_and_futures_deterministic_arrival_order_independence():
     assert snap_a.rvol == snap_b.rvol
 
 
+def test_spot_breakout_arrival_order_parity_and_candidate_dispatch():
+    """Verify Issue P0 Fix: Breakout state machine evaluation and candidate callbacks
+    produce identical setup_id, state transitions, and parameters whether spot arrives first or futures arrives first.
+    """
+    candidates_a = []
+    candidates_b = []
+
+    def cb_a(setup: BreakoutContext, snap: TechnicalSnapshot):
+        candidates_a.append((setup, snap))
+
+    def cb_b(setup: BreakoutContext, snap: TechnicalSnapshot):
+        candidates_b.append((setup, snap))
+
+    engine_a = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+        on_setup_candidate=cb_a,
+    )
+    engine_b = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+        on_setup_candidate=cb_b,
+    )
+
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+
+    for eng in (engine_a, engine_b):
+        eng.set_daily_references(
+            symbol="NSE:NIFTY50-INDEX",
+            pdh=25100.0,
+            pdl=24900.0,
+            pdc=25000.0,
+            cdo=25020.0,
+        )
+
+    # Warm up bars 0..21 (22 bars) on both spot and futures
+    for i in range(22):
+        ts = base_time + timedelta(minutes=5 * i)
+        fut_c = Candle(
+            symbol="NSE:NIFTY26NOVFUT",
+            timeframe="5m",
+            timestamp=ts,
+            open=25070.0,
+            high=25085.0,
+            low=25065.0,
+            close=25080.0,
+            volume=2000,
+            is_closed=True,
+        )
+        spot_c = Candle(
+            symbol="NSE:NIFTY50-INDEX",
+            timeframe="5m",
+            timestamp=ts,
+            open=25070.0,
+            high=25085.0,
+            low=25065.0,
+            close=25080.0,
+            volume=0,
+            is_closed=True,
+        )
+        engine_a.on_candle(fut_c)
+        engine_a.on_candle(spot_c)
+        engine_b.on_candle(spot_c)
+        engine_b.on_candle(fut_c)
+
+    # Bar 22: Breakout bar (close 25120 above PDH 25100) with volume surge (8000 vs 2000 baseline)
+    ts_breakout = base_time + timedelta(minutes=5 * 22)
+    fut_bo = Candle(
+        symbol="NSE:NIFTY26NOVFUT",
+        timeframe="5m",
+        timestamp=ts_breakout,
+        open=25085.0,
+        high=25125.0,
+        low=25080.0,
+        close=25120.0,
+        volume=8000,
+        is_closed=True,
+    )
+    spot_bo = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        timestamp=ts_breakout,
+        open=25085.0,
+        high=25125.0,
+        low=25080.0,
+        close=25120.0,
+        volume=0,
+        is_closed=True,
+    )
+
+    # In Engine A: Futures arrives first, then spot
+    engine_a.on_candle(fut_bo)
+    engine_a.on_candle(spot_bo)
+
+    # In Engine B: Spot arrives first, then futures
+    engine_b.on_candle(spot_bo)
+    engine_b.on_candle(fut_bo)
+
+    # Bar 23: Retest bar (dips to 25098, closes 25110)
+    ts_retest = base_time + timedelta(minutes=5 * 23)
+    fut_re = Candle(
+        symbol="NSE:NIFTY26NOVFUT",
+        timeframe="5m",
+        timestamp=ts_retest,
+        open=25105.0,
+        high=25115.0,
+        low=25098.0,
+        close=25110.0,
+        volume=3000,
+        is_closed=True,
+    )
+    spot_re = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        timestamp=ts_retest,
+        open=25105.0,
+        high=25115.0,
+        low=25098.0,
+        close=25110.0,
+        volume=0,
+        is_closed=True,
+    )
+
+    # In Engine A: Futures first
+    engine_a.on_candle(fut_re)
+    engine_a.on_candle(spot_re)
+
+    # In Engine B: Spot first
+    engine_b.on_candle(spot_re)
+    engine_b.on_candle(fut_re)
+
+    # Invariant 1: Candidate callback dispatched in both engines
+    spot_cand_a = [c for c in candidates_a if c[0].symbol == "NSE:NIFTY50-INDEX"]
+    spot_cand_b = [c for c in candidates_b if c[0].symbol == "NSE:NIFTY50-INDEX"]
+
+    assert len(spot_cand_a) >= 1
+    assert len(spot_cand_b) >= 1
+    assert len(spot_cand_a) == len(spot_cand_b)
+
+    setup_a, snap_a = spot_cand_a[0]
+    setup_b, snap_b = spot_cand_b[0]
+
+    # Invariant 2: Candidate setup parameters are perfectly identical
+    assert setup_a.setup_id == setup_b.setup_id
+    assert setup_a.current_state == BreakoutState.SETUP_ELIGIBLE
+    assert setup_b.current_state == BreakoutState.SETUP_ELIGIBLE
+    assert setup_a.stop_loss == setup_b.stop_loss
+    assert setup_a.target_price == setup_b.target_price
+    assert setup_a.timeframe == setup_b.timeframe == "5m"
+    assert setup_a.symbol == setup_b.symbol == "NSE:NIFTY50-INDEX"
+
+
+def test_unclosed_and_duplicate_candle_validation():
+    """Verify Issue P1 Fix:
+    1. Unclosed candles (is_closed=False) are rejected and return None.
+    2. Duplicate candles with same timestamp are rejected and do not double-advance state.
+    """
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+
+    # 1. Unclosed candle rejected
+    unclosed_candle = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="1m",
+        timestamp=base_time,
+        open=25000.0,
+        high=25010.0,
+        low=24990.0,
+        close=25005.0,
+        volume=0,
+        is_closed=False,
+    )
+    assert engine.on_candle(unclosed_candle) is None
+    assert len(engine.states["NSE:NIFTY50-INDEX"].candles_1m) == 0
+
+    # 2. Closed candle accepted
+    closed_c1 = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="1m",
+        timestamp=base_time,
+        open=25000.0,
+        high=25010.0,
+        low=24990.0,
+        close=25005.0,
+        volume=0,
+        is_closed=True,
+    )
+    snap1 = engine.on_candle(closed_c1)
+    assert snap1 is not None
+    assert len(engine.states["NSE:NIFTY50-INDEX"].candles_1m) == 1
+
+    # 3. Duplicate candle with same timestamp does NOT append new candle
+    duplicate_c1 = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="1m",
+        timestamp=base_time,
+        open=25000.0,
+        high=25015.0,
+        low=24985.0,
+        close=25010.0,
+        volume=0,
+        is_closed=True,
+    )
+    snap_dup = engine.on_candle(duplicate_c1)
+    assert snap_dup is not None
+    assert len(engine.states["NSE:NIFTY50-INDEX"].candles_1m) == 1
+
+
+def test_setup_id_timeframe_isolation():
+    """Verify Issue P2 Fix: Setup IDs include symbol and timeframe, preventing collision
+    between 1m and 5m setups on the same reference level.
+    """
+    ctx_1m = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type="PDH",
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        breakout_candle_index=5,
+        breakout_time=IST.localize(datetime(2026, 11, 23, 9, 20)),
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="1m",
+    )
+    ctx_5m = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type="PDH",
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        breakout_candle_index=1,
+        breakout_time=IST.localize(datetime(2026, 11, 23, 9, 20)),
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+    )
+
+    assert "1m" in ctx_1m.setup_id
+    assert "5m" in ctx_5m.setup_id
+    assert ctx_1m.setup_id != ctx_5m.setup_id
+
+
+def test_session_rollover_clears_levels_and_snapshots():
+    """Verify Issue P2 Fix: Session rollover resets daily reference levels, snapshots,
+    notified setups, and pending evaluations so prior day state never leaks into new session.
+    """
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    day1_time = IST.localize(datetime(2026, 11, 20, 15, 25))
+    day2_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+
+    engine.set_daily_references(
+        symbol="NSE:NIFTY50-INDEX",
+        pdh=25100.0,
+        pdl=24900.0,
+        pdc=25000.0,
+        cdo=25020.0,
+    )
+
+    # Day 1 candle
+    engine.on_candle(
+        Candle(
+            symbol="NSE:NIFTY50-INDEX",
+            timeframe="5m",
+            timestamp=day1_time,
+            open=25050.0,
+            high=25070.0,
+            low=25040.0,
+            close=25060.0,
+            volume=0,
+            is_closed=True,
+        )
+    )
+
+    state = engine.states["NSE:NIFTY50-INDEX"]
+    assert state.daily_reference_levels is not None
+    assert state.latest_snapshots["5m"] is not None
+
+    # Day 2 candle triggers rollover
+    engine.on_candle(
+        Candle(
+            symbol="NSE:NIFTY50-INDEX",
+            timeframe="5m",
+            timestamp=day2_time,
+            open=25200.0,
+            high=25220.0,
+            low=25190.0,
+            close=25210.0,
+            volume=0,
+            is_closed=True,
+        )
+    )
+
+    # Rollover verified
+    assert state.current_session_date == day2_time.date()
+    assert state.daily_reference_levels is None
+    assert len(state.notified_setup_ids) == 0
+    assert len(state._pending_breakout_eval) == 0
+
+
+

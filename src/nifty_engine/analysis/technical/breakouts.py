@@ -45,11 +45,14 @@ class BreakoutContext:
     setup_id: str = ""
     is_notified: bool = False
     zone: Optional[PriceZone] = None
+    symbol: str = ""
+    timeframe: str = ""
 
     def __post_init__(self):
         if not self.setup_id:
             ts_str = str(int(self.start_time.timestamp())) if self.start_time else "0"
-            self.setup_id = f"{self.level_id}_{self.direction.value}_{ts_str}"
+            parts = [p for p in (self.symbol, self.timeframe, self.level_id, self.direction.value, ts_str) if p]
+            self.setup_id = "_".join(parts)
 
     def transition_to(self, new_state: BreakoutState, timestamp: datetime, reason: str):
         self.current_state = new_state
@@ -102,6 +105,8 @@ class BreakoutStateMachine:
                 current_state=BreakoutState.APPROACHING_LEVEL,
                 start_time=candle.timestamp,
                 zone=zone,
+                symbol=candle.symbol,
+                timeframe=candle.timeframe,
             )
         else:
             if zone is not None:

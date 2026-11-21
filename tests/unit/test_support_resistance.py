@@ -24,7 +24,7 @@ def create_mock_candle(idx: int, open_: float, high: float, low: float, close: f
         low=low,
         close=close,
         volume=2500,
-        is_complete=True,
+        is_closed=True,
     )
 
 
@@ -97,3 +97,84 @@ def test_nearest_support_and_resistance():
     assert supp.nominal_price == 24080.0
     assert res is not None
     assert res.nominal_price == 24150.0
+
+
+def test_opening_range_premature_rejection_and_completeness():
+    """Verify Issue P1 Fix: Opening range is declared ready ONLY when all required intervals are present.
+    - 1m chart requires all 15 candles (09:15-09:29). Having only 3 or 14 returns empty list.
+    - 5m chart requires all 3 candles (09:15, 09:20, 09:25).
+    - 15m chart requires 09:15 candle.
+    """
+    engine = SupportResistanceEngine(zone_atr_multiple=0.1, min_zone_width_points=2.0)
+    base_time = datetime(2026, 11, 23, 9, 15, tzinfo=IST)
+    session_date = base_time.date()
+
+    # 1. 1-minute chart: feed only 3 candles (09:15, 09:16, 09:17) -> MUST NOT be declared ready!
+    c_1m_premature = [
+        Candle(
+            symbol="NSE:NIFTY50-INDEX",
+            timeframe="1m",
+            timestamp=base_time + timedelta(minutes=i),
+            open=25000.0,
+            high=25010.0,
+            low=24990.0,
+            close=25005.0,
+            volume=0,
+            is_closed=True,
+        )
+        for i in range(3)
+    ]
+    zones_premature = engine.compute_opening_range(c_1m_premature, atr_value=20.0, session_date=session_date)
+    assert zones_premature == []
+
+    # Feed 14 candles (missing 09:29) -> Still empty!
+    c_1m_14 = [
+        Candle(
+            symbol="NSE:NIFTY50-INDEX",
+            timeframe="1m",
+            timestamp=base_time + timedelta(minutes=i),
+            open=25000.0,
+            high=25010.0,
+            low=24990.0,
+            close=25005.0,
+            volume=0,
+            is_closed=True,
+        )
+        for i in range(14)
+    ]
+    assert engine.compute_opening_range(c_1m_14, atr_value=20.0, session_date=session_date) == []
+
+    # Complete 15 candles (09:15 through 09:29) -> Declared ready!
+    c_1m_complete = [
+        Candle(
+            symbol="NSE:NIFTY50-INDEX",
+            timeframe="1m",
+            timestamp=base_time + timedelta(minutes=i),
+            open=25000.0,
+            high=25010.0 + i,
+            low=24990.0 - i,
+            close=25005.0,
+            volume=0,
+            is_closed=True,
+        )
+        for i in range(15)
+    ]
+    zones_1m = engine.compute_opening_range(c_1m_complete, atr_value=20.0, session_date=session_date)
+    assert len(zones_1m) == 2
+    orh = next(z for z in zones_1m if z.level_type == LevelType.ORH)
+    orl = next(z for z in zones_1m if z.level_type == LevelType.ORL)
+    assert orh.nominal_price == 25024.0  # 25010 + 14
+    assert orl.nominal_price == 24976.0  # 24990 - 14
+
+    # 2. 5-minute chart: 2 candles (09:15, 09:20) -> Premature, return empty
+    c_5m_premature = [
+        create_mock_candle(0, 25000, 25020, 24980, 25010, base_time),
+        create_mock_candle(1, 25010, 25030, 24990, 25020, base_time),
+    ]
+    assert engine.compute_opening_range(c_5m_premature, atr_value=20.0, session_date=session_date) == []
+
+    # 3 x 5m candles (09:15, 09:20, 09:25) -> Complete!
+    c_5m_complete = c_5m_premature + [create_mock_candle(2, 25020, 25040, 25000, 25030, base_time)]
+    zones_5m = engine.compute_opening_range(c_5m_complete, atr_value=20.0, session_date=session_date)
+    assert len(zones_5m) == 2
+

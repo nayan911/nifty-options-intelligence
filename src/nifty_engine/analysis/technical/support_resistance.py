@@ -60,6 +60,10 @@ class PriceZone:
 class SupportResistanceEngine:
     """Manages and evaluates dynamic support and resistance zones."""
 
+    EXPECTED_OR_TIMES_1M = {time(9, 15 + i) for i in range(15)}
+    EXPECTED_OR_TIMES_5M = {time(9, 15), time(9, 20), time(9, 25)}
+    EXPECTED_OR_TIMES_15M = {time(9, 15)}
+
     def __init__(
         self,
         zone_atr_multiple: float = 0.15,
@@ -130,18 +134,22 @@ class SupportResistanceEngine:
         if not or_candles:
             return []
 
-        # Check for window completion:
-        # Either latest session candle is at or past or_end (e.g. 09:30 or later),
-        # OR we have the complete closed bar count (>= 15 for 1m, >= 3 for 5m).
-        latest_time = session_candles[-1].timestamp.time()
-        is_complete = (
-            latest_time >= or_end
-            or (session_candles[0].timeframe == "1m" and len(or_candles) >= 15)
-            or (session_candles[0].timeframe == "5m" and len(or_candles) >= 3)
-            or len(or_candles) >= 3
-        )
-        if not is_complete:
-            return []
+        timeframe = session_candles[0].timeframe
+        present_times = {c.timestamp.time() for c in or_candles}
+
+        # Strict completeness enforcement: All distinct expected closed candle intervals must be present
+        if timeframe == "1m":
+            if not self.EXPECTED_OR_TIMES_1M.issubset(present_times):
+                return []
+        elif timeframe == "5m":
+            if not self.EXPECTED_OR_TIMES_5M.issubset(present_times):
+                return []
+        elif timeframe == "15m":
+            if not self.EXPECTED_OR_TIMES_15M.issubset(present_times):
+                return []
+        else:
+            if len(or_candles) < 3:
+                return []
 
         orh = max(c.high for c in or_candles)
         orl = min(c.low for c in or_candles)
