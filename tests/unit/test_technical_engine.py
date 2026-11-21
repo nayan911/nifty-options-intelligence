@@ -1374,4 +1374,352 @@ def test_session_rollover_clears_levels_and_snapshots():
     assert len(state._pending_breakout_eval) == 0
 
 
+def test_missing_futures_candle_followed_by_future_interval_candle():
+    """Verify Issue P0 Fix: Future-interval volume CANNOT confirm a previous breakout.
+    Scenario:
+    1. 10:00 spot candle breaks out above resistance and waits for 10:00 futures confirmation.
+    2. 10:00 futures candle is missing.
+    3. 10:05 futures candle arrives with huge surge volume (RVOL = 2.5x).
+    4. Invariant: 10:00 spot setup MUST NOT borrow the 10:05 futures RVOL.
+       It completes with missing volume (futures_rvol=None), preventing look-ahead bias!
+    """
+    candidates = []
+
+    def on_cand(setup: BreakoutContext, snap: TechnicalSnapshot):
+        candidates.append((setup, snap))
+
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+        on_setup_candidate=on_cand,
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+
+    engine.set_daily_references(
+        symbol="NSE:NIFTY50-INDEX",
+        pdh=25100.0,
+        pdl=24900.0,
+        pdc=25000.0,
+        cdo=25020.0,
+    )
+
+    # 1. Warm up 22 bars (09:15 to 11:00) below resistance (25080)
+    for i in range(22):
+        ts = base_time + timedelta(minutes=5 * i)
+        engine.on_candle(
+            Candle(
+                symbol="NSE:NIFTY26NOVFUT",
+                timeframe="5m",
+                timestamp=ts,
+                open=25070.0,
+                high=25085.0,
+                low=25065.0,
+                close=25080.0,
+                volume=2000,
+                is_closed=True,
+            )
+        )
+        engine.on_candle(
+            Candle(
+                symbol="NSE:NIFTY50-INDEX",
+                timeframe="5m",
+                timestamp=ts,
+                open=25070.0,
+                high=25085.0,
+                low=25065.0,
+                close=25080.0,
+                volume=0,
+                is_closed=True,
+            )
+        )
+
+    # 2. 11:05 spot candle breaks out above PDH (close 25120 > 25100)
+    ts_1105 = base_time + timedelta(minutes=5 * 22)
+    spot_1105 = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        timestamp=ts_1105,
+        open=25085.0,
+        high=25125.0,
+        low=25080.0,
+        close=25120.0,
+        volume=0,
+        is_closed=True,
+    )
+    engine.on_candle(spot_1105)
+
+    spot_state = engine.states["NSE:NIFTY50-INDEX"]
+    # Spot is pending futures confirmation for interval 11:05
+    assert "5m" in spot_state._pending_breakout_eval
+    pending_candle = spot_state._pending_breakout_eval["5m"][0]
+    assert pending_candle.timestamp == ts_1105
+
+    # 3. 11:05 futures candle is MISSING!
+    # Next futures candle arrives for interval 11:10 (future interval) with massive volume (8000)
+    ts_1110 = base_time + timedelta(minutes=5 * 23)
+    fut_1110 = Candle(
+        symbol="NSE:NIFTY26NOVFUT",
+        timeframe="5m",
+        timestamp=ts_1110,
+        open=25085.0,
+        high=25130.0,
+        low=25080.0,
+        close=25125.0,
+        volume=8000,  # 4x volume surge!
+        is_closed=True,
+    )
+    engine.on_candle(fut_1110)
+
+    # Invariant: 11:05 spot pending breakout was flushed WITHOUT borrowing 11:10 futures volume
+    assert "5m" not in spot_state._pending_breakout_eval
+    # 11:05 spot snapshot must NOT have 11:10 futures RVOL
+    snap_1105 = spot_state.latest_snapshots["5m"]
+    assert snap_1105 is not None
+    assert snap_1105.rvol is None  # Missing volume status maintained!
+
+
+def test_duplicate_and_delayed_futures_observations():
+    """Verify Issue P0 Fix: Delayed older futures observations do not confirm newer spot candles,
+    and duplicate futures observations do not corrupt snapshot RVOL.
+    """
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+
+    # Warm up futures up to bar 21
+    for i in range(22):
+        ts = base_time + timedelta(minutes=5 * i)
+        engine.on_candle(
+            Candle(
+                symbol="NSE:NIFTY26NOVFUT",
+                timeframe="5m",
+                timestamp=ts,
+                open=25000.0,
+                high=25015.0,
+                low=24995.0,
+                close=25010.0,
+                volume=10000,
+                is_closed=True,
+            )
+        )
+
+    # Spot candle at interval 22 (11:05)
+    t22 = base_time + timedelta(minutes=5 * 22)
+    spot_c = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        timestamp=t22,
+        open=25000.0,
+        high=25020.0,
+        low=24990.0,
+        close=25015.0,
+        volume=0,
+        is_closed=True,
+    )
+    engine.on_candle(spot_c)
+
+    spot_state = engine.states["NSE:NIFTY50-INDEX"]
+    assert "5m" in spot_state._pending_breakout_eval
+
+    # Feed an older delayed futures candle (e.g. at interval 20)
+    t20 = base_time + timedelta(minutes=5 * 20)
+    old_fut = Candle(
+        symbol="NSE:NIFTY26NOVFUT",
+        timeframe="5m",
+        timestamp=t20,
+        open=25000.0,
+        high=25015.0,
+        low=24995.0,
+        close=25010.0,
+        volume=5000,
+        is_closed=True,
+    )
+    engine.on_candle(old_fut)
+
+    # Invariant: Older futures candle did NOT confirm the newer t22 spot candle!
+    assert "5m" in spot_state._pending_breakout_eval
+    assert spot_state._pending_breakout_eval["5m"][0].timestamp == t22
+
+
+def test_pending_evaluation_clock_driven_expiry_when_feed_stops():
+    """Verify Issue P1 Fix: When feeds stop completely, clock-driven expiry clears pending
+    evaluations and marks them with explicit missing volume rather than waiting indefinitely.
+    """
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+
+    # Feed 1 futures candle to initialize futures stream
+    engine.on_candle(
+        Candle(
+            symbol="NSE:NIFTY26NOVFUT",
+            timeframe="5m",
+            timestamp=base_time,
+            open=25000.0,
+            high=25015.0,
+            low=24995.0,
+            close=25010.0,
+            volume=5000,
+            is_closed=True,
+        )
+    )
+
+    # Spot candle at 09:20 arrives and waits for futures volume
+    ts_0920 = base_time + timedelta(minutes=5)
+    spot_0920 = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        timestamp=ts_0920,
+        open=25000.0,
+        high=25020.0,
+        low=24990.0,
+        close=25015.0,
+        volume=0,
+        is_closed=True,
+    )
+    engine.on_candle(spot_0920)
+
+    spot_state = engine.states["NSE:NIFTY50-INDEX"]
+    assert "5m" in spot_state._pending_breakout_eval
+
+    # Feed stops completely! Clock advances by 15 minutes to 09:35 (past 5m bar close + timeout)
+    clock_now = ts_0920 + timedelta(minutes=15)
+    engine.expire_pending_evaluations(as_of_time=clock_now, timeout_seconds=120.0)
+
+    # Invariant: Pending evaluation expired and cleaned up
+    assert "5m" not in spot_state._pending_breakout_eval
+    snap = spot_state.latest_snapshots["5m"]
+    assert snap is not None
+    assert snap.rvol is None
+
+
+def test_concurrent_spot_and_futures_candle_processing():
+    """Verify Issue P1 Fix: TechnicalAnalysisEngine is thread-safe under concurrent
+    spot and futures candle processing without race conditions or deadlocks.
+    """
+    import concurrent.futures
+
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+
+    def feed_futures():
+        for i in range(30):
+            ts = base_time + timedelta(minutes=i)
+            engine.on_candle(
+                Candle(
+                    symbol="NSE:NIFTY26NOVFUT",
+                    timeframe="1m",
+                    timestamp=ts,
+                    open=25000.0 + i,
+                    high=25010.0 + i,
+                    low=24990.0 + i,
+                    close=25005.0 + i,
+                    volume=1000 + i * 50,
+                    is_closed=True,
+                )
+            )
+
+    def feed_spot():
+        for i in range(30):
+            ts = base_time + timedelta(minutes=i)
+            engine.on_candle(
+                Candle(
+                    symbol="NSE:NIFTY50-INDEX",
+                    timeframe="1m",
+                    timestamp=ts,
+                    open=25000.0 + i,
+                    high=25010.0 + i,
+                    low=24990.0 + i,
+                    close=25005.0 + i,
+                    volume=0,
+                    is_closed=True,
+                )
+            )
+
+    def query_snapshots():
+        for _ in range(30):
+            engine.get_snapshot("NSE:NIFTY50-INDEX", timeframe="1m")
+            engine.get_snapshot("NSE:NIFTY26NOVFUT", timeframe="1m")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        f1 = executor.submit(feed_futures)
+        f2 = executor.submit(feed_spot)
+        f3 = executor.submit(query_snapshots)
+        f1.result()
+        f2.result()
+        f3.result()
+
+    # Invariant: Thread safety verified; state intact
+    snap_spot = engine.get_snapshot("NSE:NIFTY50-INDEX", timeframe="1m")
+    snap_fut = engine.get_snapshot("NSE:NIFTY26NOVFUT", timeframe="1m")
+    assert snap_spot is not None
+    assert snap_fut is not None
+
+
+def test_previous_session_candles_arriving_late_rejected():
+    """Verify Issue P2 Fix: Late candles from an older trading session are strictly rejected
+    and do NOT reset current session date, daily reference levels, or active setups.
+    """
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    monday_time = IST.localize(datetime(2026, 11, 23, 10, 0))
+    friday_time = IST.localize(datetime(2026, 11, 20, 15, 25))
+
+    engine.set_daily_references(
+        symbol="NSE:NIFTY50-INDEX",
+        pdh=25100.0,
+        pdl=24900.0,
+        pdc=25000.0,
+        cdo=25020.0,
+    )
+
+    # Monday candle initializes Monday session
+    engine.on_candle(
+        Candle(
+            symbol="NSE:NIFTY50-INDEX",
+            timeframe="5m",
+            timestamp=monday_time,
+            open=25050.0,
+            high=25070.0,
+            low=25040.0,
+            close=25060.0,
+            volume=0,
+            is_closed=True,
+        )
+    )
+
+    state = engine.states["NSE:NIFTY50-INDEX"]
+    assert state.current_session_date == monday_time.date()
+    assert state.daily_reference_levels is not None
+
+    # Late Friday candle arrives
+    friday_candle = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        timestamp=friday_time,
+        open=24800.0,
+        high=24820.0,
+        low=24790.0,
+        close=24810.0,
+        volume=0,
+        is_closed=True,
+    )
+    engine.on_candle(friday_candle)
+
+    # Invariant: Monday session was NOT reset by late Friday candle!
+    assert state.current_session_date == monday_time.date()
+    assert state.daily_reference_levels is not None
+    assert state.daily_reference_levels["PDH"] == 25100.0
+
+
+
 

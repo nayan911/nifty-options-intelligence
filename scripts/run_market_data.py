@@ -448,6 +448,7 @@ class MarketDataEngine:
 
                 # 2. Clock-driven candle finalization (emits bars on boundary; callback handles persistence once)
                 self.builder.flush_closed_bars(now_ist())
+                self.technical_engine.expire_pending_evaluations(now_ist())
 
                 # 3. Dynamic option rotation if ATM shifted
                 self.check_and_rotate_options()

@@ -13,6 +13,7 @@ Orchestrates streaming technical and structural quantitative analysis across sub
 7. Candidate notification callbacks with explicit risk & disclaimer tags.
 """
 
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
@@ -169,13 +170,22 @@ class SymbolTechnicalState:
             "CDO": cdo,
         }
 
-    def _check_session_rollover(self, candle_timestamp: datetime) -> None:
-        """Enforces clean trading-session boundaries across multiple trading days."""
+    def _check_session_rollover(self, candle_timestamp: datetime) -> bool:
+        """Enforces clean trading-session boundaries across multiple trading days.
+
+        Returns True if candle belongs to current or newer session; False if candle is from an older session.
+        """
         candle_date = candle_timestamp.date()
         if self.current_session_date is None:
             self.current_session_date = candle_date
-            return
-        if self.current_session_date != candle_date:
+            return True
+
+        if candle_date < self.current_session_date:
+            # Reject older trading dates before performing session rollover!
+            # Out-of-order or late candles from prior sessions MUST NOT clear or contaminate current session.
+            return False
+
+        if candle_date > self.current_session_date:
             self.current_session_date = candle_date
             self.session_open_price = None
             self.daily_reference_levels = None
@@ -194,6 +204,8 @@ class SymbolTechnicalState:
             self.latest_candle_timestamps.clear()
             self._pending_breakout_eval.clear()
 
+        return True
+
     def process_candle(
         self,
         candle: Candle,
@@ -202,7 +214,9 @@ class SymbolTechnicalState:
         on_setup_candidate: Optional[Callable[[BreakoutContext, TechnicalSnapshot], None]] = None,
     ) -> TechnicalSnapshot:
         """Routes candle strictly to its corresponding timeframe handler."""
-        self._check_session_rollover(candle.timestamp)
+        if not self._check_session_rollover(candle.timestamp):
+            # Candle belongs to a past trading date: strictly reject!
+            return self.latest_snapshots.get(candle.timeframe) or self._create_generic_snapshot(candle)
 
         # Monotonic timestamp validation: reject duplicate or out-of-order candles
         last_ts = self.latest_candle_timestamps.get(candle.timeframe)
@@ -364,6 +378,7 @@ class SymbolTechnicalState:
         self,
         timeframe: str,
         futures_rvol: Optional[float],
+        futures_timestamp: Optional[datetime] = None,
         on_setup_candidate: Optional[Callable[[BreakoutContext, TechnicalSnapshot], None]] = None,
     ) -> None:
         """Executes deferred breakout evaluation for a spot candle once synchronized futures volume arrives."""
@@ -371,6 +386,11 @@ class SymbolTechnicalState:
             return
         params = self._pending_breakout_eval.pop(timeframe)
         (candle, zones, nearest_sup, nearest_res, n, atr_val, is_warmed_up, is_provisional, ema_9, ema_21, rsi_val, trend_bias) = params
+
+        # Interval alignment validation: verify futures observation matches spot candle interval
+        effective_rvol = futures_rvol
+        if futures_timestamp is not None and abs((candle.timestamp - futures_timestamp).total_seconds()) > 5.0:
+            effective_rvol = None
 
         active_setups = self._evaluate_breakouts(
             timeframe=timeframe,
@@ -380,7 +400,7 @@ class SymbolTechnicalState:
             nearest_res=nearest_res,
             n=n,
             atr_val=atr_val,
-            rvol_val=futures_rvol,
+            rvol_val=effective_rvol,
             is_warmed_up=is_warmed_up,
             is_provisional=is_provisional,
             ema_9=ema_9,
@@ -392,9 +412,31 @@ class SymbolTechnicalState:
 
         snap = self.latest_snapshots.get(timeframe)
         if snap:
-            snap.rvol = round(futures_rvol, 2) if futures_rvol is not None else None
+            if effective_rvol is not None:
+                snap.rvol = round(effective_rvol, 2)
             snap.active_setups = active_setups
             self.latest_snapshots[timeframe] = snap
+
+    def expire_pending_evaluations(
+        self,
+        as_of_time: datetime,
+        timeout_seconds: Optional[float] = None,
+        on_setup_candidate: Optional[Callable[[BreakoutContext, TechnicalSnapshot], None]] = None,
+    ) -> None:
+        """Flushes any pending breakout evaluations that have exceeded timeout without futures volume confirmation."""
+        for tf, params in list(self._pending_breakout_eval.items()):
+            pending_candle: Candle = params[0]
+            interval_secs = 60.0 if tf == "1m" else (300.0 if tf == "5m" else 900.0)
+            threshold = timeout_seconds if timeout_seconds is not None else (interval_secs * 2.0)
+
+            # Elapsed time past interval close
+            elapsed_past_close = (as_of_time - pending_candle.timestamp).total_seconds() - interval_secs
+            if elapsed_past_close >= threshold or as_of_time.date() > pending_candle.timestamp.date():
+                self.complete_breakout_evaluation(
+                    timeframe=tf,
+                    futures_rvol=None,
+                    on_setup_candidate=on_setup_candidate,
+                )
 
     def _determine_trend_bias(
         self,
@@ -1052,6 +1094,7 @@ class TechnicalAnalysisEngine:
         primary_futures: str = "NSE:NIFTY26NOVFUT",
         on_setup_candidate: Optional[Callable[[BreakoutContext, TechnicalSnapshot], None]] = None,
     ):
+        self._lock = threading.RLock()
         self.primary_index = primary_index
         self.primary_futures = primary_futures
         self.on_setup_candidate = on_setup_candidate
@@ -1076,16 +1119,18 @@ class TechnicalAnalysisEngine:
 
     def set_futures_ticker(self, futures_ticker: str) -> None:
         """Dynamically updates active primary futures ticker (e.g. at contract rollover)."""
-        self.primary_futures = futures_ticker
-        self.index_futures_map[self.primary_index] = futures_ticker
-        self.futures_index_map[futures_ticker] = self.primary_index
-        self._get_or_create_state(futures_ticker, is_index=False)
+        with self._lock:
+            self.primary_futures = futures_ticker
+            self.index_futures_map[self.primary_index] = futures_ticker
+            self.futures_index_map[futures_ticker] = self.primary_index
+            self._get_or_create_state(futures_ticker, is_index=False)
 
     def set_index_futures_mapping(self, index_symbol: str, futures_symbol: str) -> None:
         """Explicitly pairs a spot index with its corresponding futures instrument."""
-        self.index_futures_map[index_symbol] = futures_symbol
-        self.futures_index_map[futures_symbol] = index_symbol
-        self._get_or_create_state(futures_symbol, is_index=False)
+        with self._lock:
+            self.index_futures_map[index_symbol] = futures_symbol
+            self.futures_index_map[futures_symbol] = index_symbol
+            self._get_or_create_state(futures_symbol, is_index=False)
 
     def set_daily_references(
         self,
@@ -1093,11 +1138,12 @@ class TechnicalAnalysisEngine:
         pdh: float,
         pdl: float,
         pdc: float,
-        cdo: float
+        cdo: float,
     ) -> None:
         """Sets daily reference levels (PDH/PDL/PDC/CDO) for a symbol."""
-        state = self._get_or_create_state(symbol, is_index="INDEX" in symbol)
-        state.set_daily_references(pdh=pdh, pdl=pdl, pdc=pdc, cdo=cdo)
+        with self._lock:
+            state = self._get_or_create_state(symbol, is_index="INDEX" in symbol)
+            state.set_daily_references(pdh=pdh, pdl=pdl, pdc=pdc, cdo=cdo)
 
     def on_candle(self, candle: Candle) -> Optional[TechnicalSnapshot]:
         """Dispatches closed candle with strict timeframe routing and synchronized volume freshness checks."""
@@ -1105,68 +1151,114 @@ class TechnicalAnalysisEngine:
         if not candle.is_closed:
             return None
 
-        is_idx = ("INDEX" in candle.symbol) or (candle.symbol in self.index_futures_map)
-        state = self._get_or_create_state(candle.symbol, is_index=is_idx)
+        with self._lock:
+            is_idx = ("INDEX" in candle.symbol) or (candle.symbol in self.index_futures_map)
+            state = self._get_or_create_state(candle.symbol, is_index=is_idx)
 
-        # 1. Spot Index Candle: Check if mapped futures volume is available or pending
-        paired_futures = self.index_futures_map.get(candle.symbol)
-        awaiting_futures_volume = False
-        futures_rvol = None
+            # Reject older trading dates before modifying state
+            if state.current_session_date is not None and candle.timestamp.date() < state.current_session_date:
+                return state.latest_snapshots.get(candle.timeframe) or state._create_generic_snapshot(candle)
 
-        if paired_futures and paired_futures in self.states and candle.timeframe in ("1m", "5m"):
-            fut_state = self.states[paired_futures]
-            fut_candle_count = len(fut_state.candles_1m if candle.timeframe == "1m" else fut_state.candles_5m)
+            # 1. Spot Index Candle: Check if mapped futures volume is available or pending
+            paired_futures = self.index_futures_map.get(candle.symbol)
+            awaiting_futures_volume = False
+            futures_rvol = None
 
-            fut_rvol_ts = fut_state.latest_1m_rvol_timestamp if candle.timeframe == "1m" else fut_state.latest_5m_rvol_timestamp
-            fut_rvol = fut_state.latest_1m_rvol if candle.timeframe == "1m" else fut_state.latest_5m_rvol
+            if paired_futures and paired_futures in self.states and candle.timeframe in ("1m", "5m"):
+                fut_state = self.states[paired_futures]
+                fut_candle_count = len(fut_state.candles_1m if candle.timeframe == "1m" else fut_state.candles_5m)
 
-            has_matching_futures = (
-                fut_rvol_ts is not None
-                and fut_rvol is not None
-                and abs((candle.timestamp - fut_rvol_ts).total_seconds()) <= 5.0
+                fut_rvol_ts = fut_state.latest_1m_rvol_timestamp if candle.timeframe == "1m" else fut_state.latest_5m_rvol_timestamp
+                fut_rvol = fut_state.latest_1m_rvol if candle.timeframe == "1m" else fut_state.latest_5m_rvol
+
+                has_matching_futures = (
+                    fut_rvol_ts is not None
+                    and fut_rvol is not None
+                    and abs((candle.timestamp - fut_rvol_ts).total_seconds()) <= 5.0
+                )
+
+                if has_matching_futures:
+                    futures_rvol = fut_rvol
+                elif fut_candle_count > 0:
+                    # If futures stream is active in this session, check if candle is waiting for current interval's volume
+                    interval_secs = 60.0 if candle.timeframe == "1m" else 300.0
+                    if fut_rvol_ts is None or (0 <= (candle.timestamp - fut_rvol_ts).total_seconds() <= interval_secs):
+                        awaiting_futures_volume = True
+
+            snapshot = state.process_candle(
+                candle=candle,
+                futures_rvol=futures_rvol,
+                awaiting_futures_volume=awaiting_futures_volume,
+                on_setup_candidate=self.on_setup_candidate,
             )
 
-            if has_matching_futures:
-                futures_rvol = fut_rvol
-            elif fut_candle_count > 0:
-                # If futures stream is active in this session, check if candle is waiting for current interval's volume
-                interval_secs = 60.0 if candle.timeframe == "1m" else 300.0
-                if fut_rvol_ts is None or (0 <= (candle.timestamp - fut_rvol_ts).total_seconds() <= interval_secs):
-                    awaiting_futures_volume = True
+            # 2. Futures Candle: Check if paired spot index arrived earlier and was awaiting volume
+            paired_index = self.futures_index_map.get(candle.symbol)
+            if paired_index and paired_index in self.states and candle.timeframe in ("1m", "5m"):
+                spot_state = self.states[paired_index]
+                fut_rvol = state.latest_1m_rvol if candle.timeframe == "1m" else state.latest_5m_rvol
+                fut_rvol_ts = state.latest_1m_rvol_timestamp if candle.timeframe == "1m" else state.latest_5m_rvol_timestamp
 
-        snapshot = state.process_candle(
-            candle=candle,
-            futures_rvol=futures_rvol,
-            awaiting_futures_volume=awaiting_futures_volume,
-            on_setup_candidate=self.on_setup_candidate,
-        )
+                # Check if spot snapshot was awaiting volume for this exact interval
+                if fut_rvol is not None and fut_rvol_ts is not None:
+                    spot_snap = spot_state.latest_snapshots.get(candle.timeframe)
+                    if (
+                        spot_snap is not None
+                        and spot_snap.rvol is None
+                        and abs((spot_snap.timestamp - candle.timestamp).total_seconds()) <= 5.0
+                        and abs((spot_snap.timestamp - fut_rvol_ts).total_seconds()) <= 5.0
+                    ):
+                        spot_snap.rvol = round(fut_rvol, 2)
+                        spot_state.latest_snapshots[candle.timeframe] = spot_snap
 
-        # 2. Futures Candle: Check if paired spot index arrived earlier and was awaiting volume
-        paired_index = self.futures_index_map.get(candle.symbol)
-        if paired_index and paired_index in self.states and candle.timeframe in ("1m", "5m"):
-            spot_state = self.states[paired_index]
-            fut_rvol = state.latest_1m_rvol if candle.timeframe == "1m" else state.latest_5m_rvol
-            if fut_rvol is not None:
-                spot_snap = spot_state.latest_snapshots.get(candle.timeframe)
-                if (
-                    spot_snap is not None
-                    and spot_snap.rvol is None
-                    and abs((spot_snap.timestamp - candle.timestamp).total_seconds()) <= 5.0
-                ):
-                    spot_snap.rvol = round(fut_rvol, 2)
-                    spot_state.latest_snapshots[candle.timeframe] = spot_snap
-
+                # Check deferred breakout evaluation
                 if candle.timeframe in spot_state._pending_breakout_eval:
-                    spot_state.complete_breakout_evaluation(
-                        timeframe=candle.timeframe,
-                        futures_rvol=fut_rvol,
-                        on_setup_candidate=self.on_setup_candidate,
+                    pending_params = spot_state._pending_breakout_eval[candle.timeframe]
+                    pending_spot_candle: Candle = pending_params[0]
+
+                    is_same_interval = (
+                        abs((pending_spot_candle.timestamp - candle.timestamp).total_seconds()) <= 5.0
+                        and fut_rvol_ts is not None
+                        and abs((pending_spot_candle.timestamp - fut_rvol_ts).total_seconds()) <= 5.0
                     )
 
-        return snapshot
+                    if is_same_interval:
+                        if fut_rvol is not None:
+                            spot_state.complete_breakout_evaluation(
+                                timeframe=candle.timeframe,
+                                futures_rvol=fut_rvol,
+                                futures_timestamp=candle.timestamp,
+                                on_setup_candidate=self.on_setup_candidate,
+                            )
+                    elif candle.timestamp > pending_spot_candle.timestamp:
+                        # Futures candle has progressed to a future interval!
+                        # The pending spot candle missed its corresponding futures interval.
+                        # Do NOT borrow later volume! Expire pending evaluation with futures_rvol=None.
+                        spot_state.complete_breakout_evaluation(
+                            timeframe=candle.timeframe,
+                            futures_rvol=None,
+                            on_setup_candidate=self.on_setup_candidate,
+                        )
+
+            return snapshot
+
+    def expire_pending_evaluations(
+        self,
+        as_of_time: datetime,
+        timeout_seconds: Optional[float] = None,
+    ) -> None:
+        """Clock-driven expiry of pending breakout evaluations across all monitored symbols."""
+        with self._lock:
+            for state in self.states.values():
+                state.expire_pending_evaluations(
+                    as_of_time=as_of_time,
+                    timeout_seconds=timeout_seconds,
+                    on_setup_candidate=self.on_setup_candidate,
+                )
 
     def get_snapshot(self, symbol: str, timeframe: str = "1m") -> Optional[TechnicalSnapshot]:
         """Returns the latest technical snapshot for a symbol and timeframe."""
-        if symbol in self.states:
-            return self.states[symbol].latest_snapshots.get(timeframe)
-        return None
+        with self._lock:
+            if symbol in self.states:
+                return self.states[symbol].latest_snapshots.get(timeframe)
+            return None
