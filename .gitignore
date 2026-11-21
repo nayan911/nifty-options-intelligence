@@ -15,7 +15,7 @@ __pycache__/
 token.json
 
 # Local Runtime Data, Databases & Logs
-data/
+/data/
 *.duckdb
 *.duckdb.wal
 *.log
