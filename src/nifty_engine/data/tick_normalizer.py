@@ -32,6 +32,7 @@ INDEX_SYMBOLS = {
 class TickStatus(str, Enum):
     VALID_LIVE = "VALID_LIVE"          # Valid active trading tick during open market
     VALID_SNAPSHOT = "VALID_SNAPSHOT"  # Quote snapshot outside regular trading hours (holiday/weekend)
+    UNVERIFIED = "UNVERIFIED"          # Missing exchange timestamp during open market (quarantined from breakouts)
     DUPLICATE = "DUPLICATE"            # Consecutive duplicate packet dropped
     OUT_OF_ORDER = "OUT_OF_ORDER"      # Stale / back-dated tick quarantined
     MALFORMED = "MALFORMED"            # Zero/negative price or invalid structure
@@ -104,7 +105,7 @@ class TickNormalizer:
             SessionState.SPECIAL_SESSION,
         )
 
-        is_live_trading = False
+        status = TickStatus.VALID_SNAPSHOT
         if is_market_currently_open:
             if raw_tick.exchange_timestamp is not None:
                 # Exchange timestamp must match current trading date and be fresh
@@ -112,12 +113,10 @@ class TickNormalizer:
                 same_trading_date = exch_dt.date() == current_wall_time.date()
                 latency_sec = (current_wall_time - exch_dt).total_seconds()
                 is_fresh = 0 <= latency_sec <= self.max_freshness_seconds
-                is_live_trading = same_trading_date and is_fresh
+                status = TickStatus.VALID_LIVE if (same_trading_date and is_fresh) else TickStatus.VALID_SNAPSHOT
             else:
-                # Fallback to local arrival time if broker omitted exchange timestamp
-                is_live_trading = True
-
-        status = TickStatus.VALID_LIVE if is_live_trading else TickStatus.VALID_SNAPSHOT
+                # Missing exchange timestamp during open market: classify as UNVERIFIED (quarantined from breakouts)
+                status = TickStatus.UNVERIFIED
 
         # 5. Session-Specific Volume Normalization
         incremental_vol = 0
@@ -142,10 +141,17 @@ class TickNormalizer:
                         incremental_vol = 0
                     self._live_session_cum_volume[sym] = cum_vol
             else:
-                # Off-market / holiday snapshots never contaminate live session baselines
+                # Off-market / holiday snapshots and unverified ticks never contaminate live session baselines
                 incremental_vol = 0
 
         # Construct sanitized, normalized tick model
+        if status == TickStatus.VALID_LIVE:
+            event_class = "LIVE"
+        elif status == TickStatus.UNVERIFIED:
+            event_class = "UNVERIFIED"
+        else:
+            event_class = "SNAPSHOT"
+
         normalized_tick = Tick(
             symbol=sym,
             exchange_timestamp=raw_tick.exchange_timestamp,
@@ -160,11 +166,17 @@ class TickNormalizer:
             ask_qty=raw_tick.ask_qty,
             oi=raw_tick.oi,
             source=raw_tick.source,
-            event_class="LIVE" if status == TickStatus.VALID_LIVE else "SNAPSHOT",
+            event_class=event_class,
+        )
+
+        reason_str = (
+            "Normalized successfully"
+            if status == TickStatus.VALID_LIVE
+            else ("Unverified quote without exchange timestamp" if status == TickStatus.UNVERIFIED else "Holiday/offline snapshot quote")
         )
 
         return NormalizationResult(
             tick=normalized_tick,
             status=status,
-            reason="Normalized successfully" if status == TickStatus.VALID_LIVE else "Holiday/offline snapshot quote",
+            reason=reason_str,
         )

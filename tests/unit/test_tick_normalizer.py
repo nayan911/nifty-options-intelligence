@@ -133,6 +133,19 @@ def test_stale_latency_during_open_market():
     assert res.status == TickStatus.VALID_SNAPSHOT
 
 
+def test_missing_exchange_timestamp_classified_as_unverified():
+    """Regression test:
+    Market is open on Monday at 10:00 IST, but quote has exchange_timestamp=None.
+    Must be classified as UNVERIFIED, NOT VALID_LIVE, and quarantined from breakout confirmation.
+    """
+    normalizer = TickNormalizer()
+    mon_wall_time = datetime(2026, 11, 23, 10, 0, 0, tzinfo=IST)
+    t = Tick(symbol="NSE:NIFTY26NOVFUT", exchange_timestamp=None, ltp=25000.0, cumulative_volume=50000)
+    res = normalizer.normalize(t, current_time=mon_wall_time)
+    assert res.status == TickStatus.UNVERIFIED
+    assert res.tick.event_class == "UNVERIFIED"
+
+
 def test_weekend_snapshot_does_not_corrupt_monday_volume_baseline():
     """Regression test:
     Observation 1: Saturday cached quote from Friday with cumulative volume = 1,000,000.

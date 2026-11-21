@@ -62,6 +62,7 @@ class MarketDataEngine:
         # Observability & diagnostic counters
         self.total_ticks_received = 0
         self.live_ticks_accepted = 0
+        self.unverified_ticks_accepted = 0
         self.snapshots_accepted = 0
         self.duplicates_dropped = 0
         self.out_of_order_quarantined = 0
@@ -79,11 +80,13 @@ class MarketDataEngine:
         self.last_primary_tick_time: Optional[datetime] = None
         self.last_primary_network_latency: Optional[float] = None
 
-        # Scheduled Option Chain Snapshot Collection
+        # Scheduled Option Chain Snapshot Collection & Failure Backoff
         self.last_option_chain_time: Optional[datetime] = None
         self.latest_option_chain_pcr: Optional[float] = None
         self.latest_total_call_oi: Optional[int] = None
         self.latest_total_put_oi: Optional[int] = None
+        self.option_chain_failure_count: int = 0
+        self.option_chain_last_error: Optional[str] = None
 
     def _on_ws_ack(self, ack_msg: dict):
         """Callback on WebSocket subscription and status acknowledgements."""
@@ -137,11 +140,16 @@ class MarketDataEngine:
             if tick.exchange_timestamp:
                 self.last_primary_network_latency = (tick.local_timestamp - tick.exchange_timestamp).total_seconds()
 
-        # 3. Only pass live trading ticks to CandleBuilder (holiday snapshots are saved but do not form bars)
+        # 3. Only pass verified live trading ticks to CandleBuilder
         if res.status == TickStatus.VALID_LIVE:
             self.live_ticks_accepted += 1
             self.symbol_stats[sym]["live"] += 1
             self.builder.process_tick(tick)
+        elif res.status == TickStatus.UNVERIFIED:
+            self.unverified_ticks_accepted += 1
+            self.symbol_stats[sym].setdefault("unverified", 0)
+            self.symbol_stats[sym]["unverified"] += 1
+            # Quarantined: Saved to DuckDB for diagnostics, but does not form live breakout bars
         else:
             self.snapshots_accepted += 1
             self.symbol_stats[sym]["snapshot"] += 1
@@ -268,6 +276,8 @@ class MarketDataEngine:
             bnf_fut = self.master.resolve_future("BANKNIFTY")
             watchlist.extend([nifty_fut, bnf_fut])
             self.technical_engine.set_futures_ticker(nifty_fut)
+            self.technical_engine.set_index_futures_mapping(settings.PRIMARY_INDEX, nifty_fut)
+            self.technical_engine.set_index_futures_mapping(settings.BANKNIFTY_INDEX, bnf_fut)
         except Exception as e:
             print(f"[WARN] Futures resolution: {e}")
 
@@ -354,11 +364,13 @@ class MarketDataEngine:
             print(f"[WARN] Option rotation error (will retry next interval): {e}")
 
     def _poll_option_chain_if_due(self, is_open: bool) -> None:
-        """Polls full FYERS option chain matrix and persists to DuckDB."""
+        """Polls full FYERS option chain matrix and persists to DuckDB with backoff on failure."""
         now = now_ist()
         if self.last_option_chain_time is not None:
             elapsed = (now - self.last_option_chain_time).total_seconds()
-            if elapsed < 180.0:
+            # If previous attempts failed, apply backoff (30s * 2^failures, max 180s)
+            required_wait = min(180.0, max(30.0, 30.0 * (2 ** min(self.option_chain_failure_count, 3)))) if self.option_chain_failure_count > 0 else 180.0
+            if elapsed < required_wait:
                 return
 
         # Fetch option chain
@@ -374,14 +386,19 @@ class MarketDataEngine:
             self.latest_option_chain_pcr = chain.pcr
             self.latest_total_call_oi = chain.total_call_oi
             self.latest_total_put_oi = chain.total_put_oi
+            self.option_chain_failure_count = 0
+            self.option_chain_last_error = None
 
             print(
                 f"[OPTION CHAIN SNAPSHOT] Expiry: {chain.expiry} | PCR: {chain.pcr:.3f} | "
                 f"Call OI: {chain.total_call_oi:,} | Put OI: {chain.total_put_oi:,}"
             )
-        except Exception:
-            # During weekend/holiday, broker endpoint may be unavailable
-            pass
+        except Exception as e:
+            self.option_chain_failure_count += 1
+            self.option_chain_last_error = str(e)
+            self.last_option_chain_time = now  # Anchor backoff timer to avoid tight loop
+            if is_open:
+                print(f"[WARN] Option chain poll failed (attempt {self.option_chain_failure_count}): {e}")
 
     def start(self):
         """Starts streaming and monitoring pipeline."""

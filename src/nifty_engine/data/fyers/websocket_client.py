@@ -150,6 +150,28 @@ class FyersWebSocketClient:
             exch_dt = datetime.fromtimestamp(epoch, tz=IST) if epoch else None
             is_index_asset = symbol in INDEX_SYMBOLS or "-INDEX" in symbol
 
+            # Parse bid/ask prices supporting FYERS WebSocket field variations
+            raw_bid = message.get("bid") if message.get("bid") is not None else message.get("bid_price")
+            if raw_bid is None:
+                raw_bid = message.get("b_price")
+            bid_val = float(raw_bid) if raw_bid is not None and float(raw_bid) > 0 else None
+
+            raw_ask = message.get("ask") if message.get("ask") is not None else message.get("ask_price")
+            if raw_ask is None:
+                raw_ask = message.get("a_price")
+            ask_val = float(raw_ask) if raw_ask is not None and float(raw_ask) > 0 else None
+
+            # Parse bid/ask quantities supporting FYERS WebSocket field variations
+            raw_bid_qty = message.get("bid_qty") if message.get("bid_qty") is not None else message.get("b_qty")
+            if raw_bid_qty is None:
+                raw_bid_qty = message.get("bid_size")
+            bid_qty_val = int(raw_bid_qty) if raw_bid_qty is not None and int(raw_bid_qty) >= 0 else None
+
+            raw_ask_qty = message.get("ask_qty") if message.get("ask_qty") is not None else message.get("a_qty")
+            if raw_ask_qty is None:
+                raw_ask_qty = message.get("ask_size")
+            ask_qty_val = int(raw_ask_qty) if raw_ask_qty is not None and int(raw_ask_qty) >= 0 else None
+
             tick = Tick(
                 symbol=symbol,
                 exchange_timestamp=exch_dt,
@@ -158,8 +180,10 @@ class FyersWebSocketClient:
                 cumulative_volume=int(message.get("vol_traded_today", 0)) if not is_index_asset else 0,
                 incremental_volume=0,  # Will be calculated by TickNormalizer
                 is_index=is_index_asset,
-                bid=float(message.get("bid", 0)) if message.get("bid") else None,
-                ask=float(message.get("ask", 0)) if message.get("ask") else None,
+                bid=bid_val,
+                ask=ask_val,
+                bid_qty=bid_qty_val,
+                ask_qty=ask_qty_val,
                 oi=int(message.get("oi", 0)) if message.get("oi") else None,
                 source="FYERS",
             )

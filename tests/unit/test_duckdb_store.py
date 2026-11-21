@@ -103,6 +103,23 @@ def test_resample_ticks_strictly_excludes_snapshots(store):
     assert df.iloc[0]["volume"] == 200
 
 
+def test_get_ticks_defaults_to_live_and_excludes_snapshots(store):
+    """Verify get_ticks strictly isolates LIVE ticks from SNAPSHOT ticks by default."""
+    base_time = IST.localize(datetime(2026, 11, 26, 9, 15, 0))
+    t_live = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_time, ltp=25100.0, incremental_volume=100, event_class="LIVE")
+    t_snap = Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=base_time + timedelta(seconds=10), ltp=25200.0, incremental_volume=0, event_class="SNAPSHOT")
+    store.insert_ticks_bulk([t_live, t_snap])
+
+    # Default query (event_class='LIVE')
+    live_ticks = store.get_ticks(symbol="NSE:NIFTY26NOVFUT")
+    assert len(live_ticks) == 1
+    assert live_ticks[0].ltp == 25100.0
+
+    # Query with event_class=None (returns all)
+    all_ticks = store.get_ticks(symbol="NSE:NIFTY26NOVFUT", event_class=None)
+    assert len(all_ticks) == 2
+
+
 def test_save_option_chain_snapshot(store):
     now = IST.localize(datetime(2026, 11, 26, 11, 0, 0))
     snapshot = OptionChainSnapshot(

@@ -225,9 +225,15 @@ class DuckDBStore(IStorageEngine):
         self,
         symbol: str,
         start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None
+        end_time: Optional[datetime] = None,
+        event_class: Optional[str] = "LIVE",
     ) -> List[Tick]:
-        """Query raw ticks in ascending order of local_timestamp."""
+        """Query raw ticks in ascending order of local_timestamp.
+
+        Defaults to event_class='LIVE' to strictly isolate live market observations from
+        holiday/weekend snapshots during backtesting and strategy replay.
+        Pass event_class=None to retrieve all ticks including snapshots for diagnostics.
+        """
         conditions = ["symbol = ?"]
         params: List[Any] = [symbol]
         if start_time:
@@ -236,6 +242,9 @@ class DuckDBStore(IStorageEngine):
         if end_time:
             conditions.append("local_timestamp <= ?")
             params.append(end_time)
+        if event_class is not None:
+            conditions.append("event_class = ?")
+            params.append(event_class)
 
         where_clause = " AND ".join(conditions)
         query = f"""

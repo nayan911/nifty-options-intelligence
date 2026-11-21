@@ -96,3 +96,25 @@ def test_market_replay_ticks_and_clock_isolation():
     assert len(observed_prices) == 10
     assert observed_prices[0] == 24000.0
     assert observed_prices[-1] == 24009.0
+
+
+def test_market_replay_tick_stream_excludes_snapshots():
+    """Verify that load_tick_stream strictly loads LIVE ticks and excludes SNAPSHOT ticks."""
+    store = DuckDBStore(":memory:")
+    base_time = datetime(2026, 11, 23, 9, 15, 0, tzinfo=IST)
+    sym = "NSE:NIFTY26NOVFUT"
+
+    t_live = Tick(symbol=sym, local_timestamp=base_time, ltp=25100.0, incremental_volume=10, event_class="LIVE")
+    t_snap = Tick(symbol=sym, local_timestamp=base_time + timedelta(seconds=1), ltp=25200.0, incremental_volume=0, event_class="SNAPSHOT")
+    store.insert_ticks_bulk([t_live, t_snap])
+
+    replay = MarketReplayEngine(store)
+    # Default event_class='LIVE'
+    events = replay.load_tick_stream([sym])
+    assert len(events) == 1
+    assert events[0].payload.ltp == 25100.0
+    assert events[0].payload.event_class == "LIVE"
+
+    # With event_class=None (explicit diagnostic mode)
+    all_events = replay.load_tick_stream([sym], event_class=None)
+    assert len(all_events) == 2

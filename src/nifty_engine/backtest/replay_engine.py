@@ -99,11 +99,15 @@ class MarketReplayEngine:
         symbols: List[str],
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
+        event_class: Optional[str] = "LIVE",
     ) -> List[ReplayEvent]:
-        """Loads and sorts ticks for multiple symbols into an interleaved event list."""
+        """Loads and sorts ticks for multiple symbols into an interleaved event list.
+
+        Defaults to event_class='LIVE' so off-market holiday snapshots are strictly excluded from replay.
+        """
         all_events: List[ReplayEvent] = []
         for sym in symbols:
-            ticks = self.store.get_ticks(sym, start_time, end_time)
+            ticks = self.store.get_ticks(sym, start_time, end_time, event_class=event_class)
             for t in ticks:
                 ts = t.exchange_timestamp or t.local_timestamp
                 all_events.append(

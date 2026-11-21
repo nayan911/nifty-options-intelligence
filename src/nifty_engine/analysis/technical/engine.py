@@ -106,10 +106,19 @@ class SymbolTechnicalState:
         # Daily reference levels (PDH, PDL, PDC, CDO)
         self.daily_reference_levels: Optional[Dict[str, float]] = None
 
-        # Latest computed indicators and snapshot
-        self.latest_snapshot: Optional[TechnicalSnapshot] = None
+        # Multi-timeframe snapshots retained independently (1m, 5m, 15m)
+        self.latest_snapshots: Dict[str, Optional[TechnicalSnapshot]] = {
+            "1m": None,
+            "5m": None,
+            "15m": None,
+        }
         self.latest_rvol: Optional[float] = None
         self.latest_rvol_timestamp: Optional[datetime] = None
+
+    @property
+    def latest_snapshot(self) -> Optional[TechnicalSnapshot]:
+        """Backward-compatible property returning the latest 1m snapshot."""
+        return self.latest_snapshots.get("1m")
 
     def set_daily_references(self, pdh: float, pdl: float, pdc: float, cdo: float) -> None:
         """Sets daily reference prices for benchmark S/R calculation."""
@@ -381,7 +390,7 @@ class SymbolTechnicalState:
             active_setups=active_setups,
         )
 
-        self.latest_snapshot = snapshot
+        self.latest_snapshots["1m"] = snapshot
         return snapshot
 
     def _process_5m_candle(self, candle: Candle) -> TechnicalSnapshot:
@@ -412,7 +421,7 @@ class SymbolTechnicalState:
 
         self.swing_detector_5m.on_candle(candle)
 
-        return TechnicalSnapshot(
+        snap = TechnicalSnapshot(
             symbol=self.symbol,
             timestamp=candle.timestamp,
             timeframe="5m",
@@ -428,11 +437,13 @@ class SymbolTechnicalState:
             rsi=round(rsi_val, 1) if rsi_val else None,
             atr=round(atr_val, 2) if atr_val else None,
         )
+        self.latest_snapshots["5m"] = snap
+        return snap
 
     def _process_15m_candle(self, candle: Candle) -> TechnicalSnapshot:
         """Processes 15m candle: isolates 15m bar history."""
         self.candles_15m.append(candle)
-        return TechnicalSnapshot(
+        snap = TechnicalSnapshot(
             symbol=self.symbol,
             timestamp=candle.timestamp,
             timeframe="15m",
@@ -443,6 +454,8 @@ class SymbolTechnicalState:
             volume=candle.volume,
             is_warmed_up=len(self.candles_15m) >= 15,
         )
+        self.latest_snapshots["15m"] = snap
+        return snap
 
     def _create_generic_snapshot(self, candle: Candle) -> TechnicalSnapshot:
         """Fallback snapshot for unmanaged timeframes."""
@@ -471,6 +484,11 @@ class TechnicalAnalysisEngine:
         self.primary_futures = primary_futures
         self.on_setup_candidate = on_setup_candidate
 
+        # Explicit Index-to-Futures Mapping (prevents NIFTY futures confirming BANKNIFTY)
+        self.index_futures_map: Dict[str, str] = {
+            primary_index: primary_futures,
+        }
+
         self.states: Dict[str, SymbolTechnicalState] = {}
         # Pre-initialize primary index and futures states
         self._get_or_create_state(primary_index, is_index=True)
@@ -482,9 +500,15 @@ class TechnicalAnalysisEngine:
         return self.states[symbol]
 
     def set_futures_ticker(self, futures_ticker: str) -> None:
-        """Dynamically updates active futures ticker (e.g. at contract rollover)."""
+        """Dynamically updates active primary futures ticker (e.g. at contract rollover)."""
         self.primary_futures = futures_ticker
+        self.index_futures_map[self.primary_index] = futures_ticker
         self._get_or_create_state(futures_ticker, is_index=False)
+
+    def set_index_futures_mapping(self, index_symbol: str, futures_symbol: str) -> None:
+        """Explicitly pairs a spot index with its corresponding futures instrument."""
+        self.index_futures_map[index_symbol] = futures_symbol
+        self._get_or_create_state(futures_symbol, is_index=False)
 
     def set_daily_references(
         self,
@@ -503,17 +527,22 @@ class TechnicalAnalysisEngine:
         is_idx = ("INDEX" in candle.symbol) or (candle.symbol == self.primary_index)
         state = self._get_or_create_state(candle.symbol, is_index=is_idx)
 
-        # Cross-asset volume pairing: Spot index references paired Futures RVOL
-        # Enforces freshness synchronization: rejects stale volume (> 120s latency/disconnection)
+        # Cross-asset volume pairing: Spot index references its EXPLICIT paired Futures RVOL
+        # Enforces:
+        # 1. Exact paired instrument (e.g. BANKNIFTY uses BANKNIFTY FUT, never NIFTY FUT)
+        # 2. Strict chronological ordering (futures timestamp <= candle timestamp, NO lookahead)
+        # 3. Maximum freshness window (futures observation must be within 120s prior)
         futures_rvol: Optional[float] = None
-        if is_idx and self.primary_futures in self.states:
-            fut_state = self.states[self.primary_futures]
+        paired_futures = self.index_futures_map.get(candle.symbol)
+        if paired_futures and paired_futures in self.states:
+            fut_state = self.states[paired_futures]
             if fut_state.latest_rvol is not None and fut_state.latest_rvol_timestamp is not None:
-                latency_seconds = abs((candle.timestamp - fut_state.latest_rvol_timestamp).total_seconds())
-                if latency_seconds <= 120.0:
+                delta_seconds = (candle.timestamp - fut_state.latest_rvol_timestamp).total_seconds()
+                # Strict no look-ahead: futures observation cannot be in the future of the candle close
+                if 0.0 <= delta_seconds <= 120.0:
                     futures_rvol = fut_state.latest_rvol
                 else:
-                    # Futures volume is stale; do not confirm spot breakout with stale volume
+                    # Stale or future-dated volume observation rejected
                     futures_rvol = None
 
         snapshot = state.process_candle(
@@ -523,8 +552,8 @@ class TechnicalAnalysisEngine:
         )
         return snapshot
 
-    def get_snapshot(self, symbol: str) -> Optional[TechnicalSnapshot]:
-        """Returns the latest technical snapshot for a symbol."""
+    def get_snapshot(self, symbol: str, timeframe: str = "1m") -> Optional[TechnicalSnapshot]:
+        """Returns the latest technical snapshot for a symbol and timeframe."""
         if symbol in self.states:
-            return self.states[symbol].latest_snapshot
+            return self.states[symbol].latest_snapshots.get(timeframe)
         return None

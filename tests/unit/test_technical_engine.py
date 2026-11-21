@@ -311,3 +311,148 @@ def test_technical_engine_breakout_candidate_dispatch():
     assert snap.is_warmed_up is True
     assert setup.stop_loss is not None
     assert setup.target_price is not None
+
+
+def test_futures_volume_lookahead_prevention():
+    """Verify that a futures observation timestamped LATER than the spot candle
+    is strictly rejected (no future lookahead allowed during replay).
+    """
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+
+    # 1. Warm up futures to 09:35
+    for i in range(21):
+        engine.on_candle(
+            Candle(
+                symbol="NSE:NIFTY26NOVFUT",
+                timeframe="1m",
+                timestamp=base_time + timedelta(minutes=i),
+                open=25000.0,
+                high=25020.0,
+                low=24980.0,
+                close=25010.0,
+                volume=5000,
+                is_closed=True,
+            )
+        )
+
+    # Futures timestamp is currently 09:35 (minutes=20)
+    # 2. Simulate replaying a spot candle from 09:30 (5 minutes in the past of current futures state)
+    past_spot_candle = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="1m",
+        timestamp=base_time + timedelta(minutes=15),  # 09:30 < 09:35
+        open=25000.0,
+        high=25010.0,
+        low=24990.0,
+        close=25005.0,
+        volume=0,
+        is_closed=True,
+    )
+    snap = engine.on_candle(past_spot_candle)
+
+    # Invariant: Look-ahead is prohibited! delta_seconds is negative, so rvol must be None!
+    assert snap.rvol is None
+
+
+def test_explicit_index_futures_mapping_isolation():
+    """Verify that BANKNIFTY does NOT receive NIFTY futures volume and uses its own mapped contract."""
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    engine.set_index_futures_mapping("NSE:NIFTYBANK-INDEX", "NSE:BANKNIFTY26NOVFUT")
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+
+    # Feed NIFTY futures with volume
+    for i in range(20):
+        engine.on_candle(
+            Candle(
+                symbol="NSE:NIFTY26NOVFUT",
+                timeframe="1m",
+                timestamp=base_time + timedelta(minutes=i),
+                open=25000.0,
+                high=25010.0,
+                low=24990.0,
+                close=25005.0,
+                volume=10000,
+                is_closed=True,
+            )
+        )
+
+    # Feed BANKNIFTY spot candle at same timestamp
+    bnf_candle = Candle(
+        symbol="NSE:NIFTYBANK-INDEX",
+        timeframe="1m",
+        timestamp=base_time + timedelta(minutes=19),
+        open=52000.0,
+        high=52050.0,
+        low=51980.0,
+        close=52020.0,
+        volume=0,
+        is_closed=True,
+    )
+    bnf_snap = engine.on_candle(bnf_candle)
+
+    # Invariant: BANKNIFTY has NO volume from NIFTY futures!
+    assert bnf_snap.rvol is None
+
+    # Feed BANKNIFTY futures with volume
+    for i in range(20):
+        engine.on_candle(
+            Candle(
+                symbol="NSE:BANKNIFTY26NOVFUT",
+                timeframe="1m",
+                timestamp=base_time + timedelta(minutes=i),
+                open=52000.0,
+                high=52050.0,
+                low=51980.0,
+                close=52030.0,
+                volume=8000,
+                is_closed=True,
+            )
+        )
+
+    # Re-evaluate BANKNIFTY spot candle with fresh BANKNIFTY futures
+    bnf_candle_2 = Candle(
+        symbol="NSE:NIFTYBANK-INDEX",
+        timeframe="1m",
+        timestamp=base_time + timedelta(minutes=19),
+        open=52000.0,
+        high=52050.0,
+        low=51980.0,
+        close=52020.0,
+        volume=0,
+        is_closed=True,
+    )
+    bnf_snap_2 = engine.on_candle(bnf_candle_2)
+    assert bnf_snap_2.rvol is not None
+
+
+def test_multi_timeframe_snapshots_retained():
+    """Verify that get_snapshot retains independent 1m, 5m, and 15m snapshots."""
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+    sym = "NSE:NIFTY26NOVFUT"
+
+    c1m = Candle(symbol=sym, timeframe="1m", timestamp=base_time, open=25000, high=25010, low=24990, close=25005, volume=1000, is_closed=True)
+    c5m = Candle(symbol=sym, timeframe="5m", timestamp=base_time, open=25000, high=25050, low=24980, close=25040, volume=5000, is_closed=True)
+    c15m = Candle(symbol=sym, timeframe="15m", timestamp=base_time, open=25000, high=25080, low=24970, close=25070, volume=15000, is_closed=True)
+
+    engine.on_candle(c1m)
+    engine.on_candle(c5m)
+    engine.on_candle(c15m)
+
+    snap_1m = engine.get_snapshot(sym, timeframe="1m")
+    snap_5m = engine.get_snapshot(sym, timeframe="5m")
+    snap_15m = engine.get_snapshot(sym, timeframe="15m")
+
+    assert snap_1m is not None and snap_1m.timeframe == "1m" and snap_1m.close == 25005.0
+    assert snap_5m is not None and snap_5m.timeframe == "5m" and snap_5m.close == 25040.0
+    assert snap_15m is not None and snap_15m.timeframe == "15m" and snap_15m.close == 25070.0
