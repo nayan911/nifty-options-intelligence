@@ -1,0 +1,31 @@
+# Python & Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pytest_cache/
+
+# Sensitive Secrets & Credentials (NEVER COMMIT)
+.env
+*.pem
+*.key
+token.json
+
+# Local Runtime Data, Databases & Logs
+data/
+*.duckdb
+*.duckdb.wal
+*.log
+fyersApi.log
+fyersDataSocket.log
+fyersRequests.log
+
+# IDE & OS Metadata
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo

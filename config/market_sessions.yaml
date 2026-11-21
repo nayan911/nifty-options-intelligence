@@ -1,0 +1,28 @@
+# NSE Market Sessions Configuration
+version: "1.0"
+timezone: "Asia/Kolkata"
+
+# Standard session timings (IST)
+standard:
+  pre_open_start: "09:00:00"
+  pre_open_end: "09:08:00"
+  pre_open_settlement: "09:15:00"
+  cash_open: "09:15:00"
+  cash_close: "15:30:00"
+  derivatives_open: "09:15:00"
+  derivatives_close: "15:40:00"  # Current official F&O closing session
+  post_market_close: "16:00:00"
+
+# Future framework update scheduled for Dec 7, 2026 onward
+future_revisions:
+  effective_date: "2026-12-07"
+  derivatives_extended_hours_active: false  # Will be toggled upon official exchange rollout
+
+# Special Sessions (Muhurat Trading, DR Drills)
+special_sessions:
+  # Example: Muhurat Trading (Diwali)
+  "2026-11-01":
+    name: "Muhurat Trading 2026"
+    session_start: "18:15:00"
+    session_end: "19:15:00"
+    derivatives_close: "19:15:00"
