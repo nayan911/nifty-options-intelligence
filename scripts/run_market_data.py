@@ -18,6 +18,7 @@ from nifty_engine.analysis.technical.engine import (
     TechnicalAnalysisEngine,
     TechnicalSnapshot,
 )
+from nifty_engine.analysis.technical.multi_timeframe import TechnicalCandidate
 from nifty_engine.core.calendar import ExchangeCalendar
 from nifty_engine.core.config import settings
 from nifty_engine.core.interfaces import Candle, OptionType, SessionState, Tick
@@ -52,6 +53,7 @@ class MarketDataEngine:
             primary_index=settings.PRIMARY_INDEX,
             primary_futures="NSE:NIFTY26NOVFUT",
             on_setup_candidate=self._on_setup_candidate,
+            on_technical_candidate=self._on_technical_candidate,
         )
         self.ws_client = FyersWebSocketClient(
             auth_provider=self.auth,
@@ -205,6 +207,20 @@ class MarketDataEngine:
             f"Confirmed At: {snap.timestamp.strftime('%H:%M:%S')} | Trigger Price: {snap.close:.2f}\n"
             f"Technical SL: {setup.stop_loss} | Technical Target: {setup.target_price} | Trend: {snap.trend_bias}\n"
             f"{'='*75}\n"
+        )
+
+    def _on_technical_candidate(self, candidate: TechnicalCandidate) -> None:
+        """Invoked when Phase C MultiTimeframeAnalyzer confirms a unified 15m+5m+1m technical setup."""
+        print(
+            f"\n{'*'*78}\n"
+            f"  [PHASE C: QUALIFIED MULTI-TIMEFRAME TECHNICAL CANDIDATE]\n"
+            f"  {candidate.summary()}\n"
+            f"  Macro 15m Trend: {candidate.timeframe_breakdown.get('15m_trend')} | "
+            f"5m RVOL: {candidate.timeframe_breakdown.get('5m_rvol')}x | "
+            f"15m Headroom: {candidate.headroom_points:.1f}pts\n"
+            f"  Entry: {candidate.entry_price:.2f} | SL: {candidate.stop_loss:.2f} | "
+            f"T1: {candidate.target_1:.2f} | T2: {candidate.target_2:.2f} | R:R: 1:{candidate.risk_reward_ratio}\n"
+            f"{'*'*78}\n"
         )
 
     def _get_initial_spot(self) -> float:

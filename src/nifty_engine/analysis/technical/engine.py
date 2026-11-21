@@ -17,7 +17,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
-from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1093,11 +1093,21 @@ class TechnicalAnalysisEngine:
         primary_index: str = "NSE:NIFTY50-INDEX",
         primary_futures: str = "NSE:NIFTY26NOVFUT",
         on_setup_candidate: Optional[Callable[[BreakoutContext, TechnicalSnapshot], None]] = None,
+        on_technical_candidate: Optional[Callable[[Any], None]] = None,
     ):
         self._lock = threading.RLock()
         self.primary_index = primary_index
         self.primary_futures = primary_futures
         self.on_setup_candidate = on_setup_candidate
+        self.on_technical_candidate = on_technical_candidate
+        self.multi_timeframe_analyzer: Optional[Any] = None
+
+        if on_technical_candidate:
+            from nifty_engine.analysis.technical.multi_timeframe import MultiTimeframeAnalyzer
+            self.multi_timeframe_analyzer = MultiTimeframeAnalyzer(
+                engine=self,
+                on_candidate=on_technical_candidate,
+            )
 
         # Explicit Index-to-Futures Mapping (prevents NIFTY futures confirming BANKNIFTY)
         self.index_futures_map: Dict[str, str] = {
@@ -1111,6 +1121,23 @@ class TechnicalAnalysisEngine:
         # Pre-initialize primary index and futures states
         self._get_or_create_state(primary_index, is_index=True)
         self._get_or_create_state(primary_futures, is_index=False)
+
+    def _dispatch_setup_candidate(self, setup: BreakoutContext, snap: TechnicalSnapshot) -> None:
+        """Internal callback dispatcher notifying both raw setup listeners and MultiTimeframeAnalyzer."""
+        if self.on_setup_candidate:
+            self.on_setup_candidate(setup, snap)
+        if self.multi_timeframe_analyzer and setup.timeframe == "5m":
+            self.multi_timeframe_analyzer.on_5m_setup(setup, snap)
+
+    def set_multi_timeframe_candidate_callback(self, callback: Callable[[Any], None]) -> None:
+        """Configures Phase C MultiTimeframeAnalyzer candidate callback."""
+        with self._lock:
+            self.on_technical_candidate = callback
+            from nifty_engine.analysis.technical.multi_timeframe import MultiTimeframeAnalyzer
+            self.multi_timeframe_analyzer = MultiTimeframeAnalyzer(
+                engine=self,
+                on_candidate=callback,
+            )
 
     def _get_or_create_state(self, symbol: str, is_index: bool = False) -> SymbolTechnicalState:
         if symbol not in self.states:
@@ -1189,7 +1216,7 @@ class TechnicalAnalysisEngine:
                 candle=candle,
                 futures_rvol=futures_rvol,
                 awaiting_futures_volume=awaiting_futures_volume,
-                on_setup_candidate=self.on_setup_candidate,
+                on_setup_candidate=self._dispatch_setup_candidate,
             )
 
             # 2. Futures Candle: Check if paired spot index arrived earlier and was awaiting volume
@@ -1228,7 +1255,7 @@ class TechnicalAnalysisEngine:
                                 timeframe=candle.timeframe,
                                 futures_rvol=fut_rvol,
                                 futures_timestamp=candle.timestamp,
-                                on_setup_candidate=self.on_setup_candidate,
+                                on_setup_candidate=self._dispatch_setup_candidate,
                             )
                     elif candle.timestamp > pending_spot_candle.timestamp:
                         # Futures candle has progressed to a future interval!
@@ -1237,8 +1264,12 @@ class TechnicalAnalysisEngine:
                         spot_state.complete_breakout_evaluation(
                             timeframe=candle.timeframe,
                             futures_rvol=None,
-                            on_setup_candidate=self.on_setup_candidate,
+                            on_setup_candidate=self._dispatch_setup_candidate,
                         )
+
+            # 3. Phase C: Precision entry evaluation for 1m candle close
+            if snapshot and candle.timeframe == "1m" and self.multi_timeframe_analyzer:
+                self.multi_timeframe_analyzer.on_1m_candle(candle, snapshot)
 
             return snapshot
 
@@ -1253,7 +1284,7 @@ class TechnicalAnalysisEngine:
                 state.expire_pending_evaluations(
                     as_of_time=as_of_time,
                     timeout_seconds=timeout_seconds,
-                    on_setup_candidate=self.on_setup_candidate,
+                    on_setup_candidate=self._dispatch_setup_candidate,
                 )
 
     def get_snapshot(self, symbol: str, timeframe: str = "1m") -> Optional[TechnicalSnapshot]:
