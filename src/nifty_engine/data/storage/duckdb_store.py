@@ -66,6 +66,12 @@ class DuckDBStore(IStorageEngine):
             except Exception:
                 pass
 
+            # Idempotently migrate observed_at for candles
+            try:
+                cur.execute("ALTER TABLE candles ADD COLUMN IF NOT EXISTS observed_at TIMESTAMP WITH TIME ZONE")
+            except Exception:
+                pass
+
             # Idempotently migrate columns for option_chain_strikes if already existing from prior runs
             for col, dtype in [
                 ("call_oi_change", "BIGINT"),
@@ -171,8 +177,8 @@ class DuckDBStore(IStorageEngine):
             cur.execute(
                 """
                 INSERT OR REPLACE INTO candles (
-                    symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     candle.symbol,
@@ -185,6 +191,7 @@ class DuckDBStore(IStorageEngine):
                     candle.volume,
                     candle.oi,
                     candle.is_closed,
+                    candle.observed_at,
                 ]
             )
 
@@ -197,7 +204,7 @@ class DuckDBStore(IStorageEngine):
     ) -> List[Candle]:
         """Query OHLCV candles within a time range, ordered by timestamp ascending."""
         query = """
-            SELECT symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed
+            SELECT symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed, observed_at
             FROM candles
             WHERE symbol = ? AND timeframe = ? AND timestamp >= ? AND timestamp <= ?
             ORDER BY timestamp ASC
@@ -217,6 +224,7 @@ class DuckDBStore(IStorageEngine):
                 volume=r[7],
                 oi=r[8],
                 is_closed=r[9],
+                observed_at=r[10],
             )
             for r in rows
         ]

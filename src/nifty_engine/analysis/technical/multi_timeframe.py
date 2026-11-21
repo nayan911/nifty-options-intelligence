@@ -159,7 +159,27 @@ class MultiTimeframeAnalyzer:
             for sid, (setup, snap_5m, avail_at) in list(self._pending_5m_setups.items()):
                 if setup.symbol == snap_15m.symbol and snap_5m.bar_close_time == snap_15m.bar_close_time:
                     del self._pending_5m_setups[sid]
-                    self._qualify_5m_setup(setup, snap_5m, available_at=avail_at)
+                    combined_available_at = max(
+                        avail_at or snap_5m.effective_available_at,
+                        snap_15m.effective_available_at,
+                    )
+                    self._qualify_5m_setup(setup, snap_5m, available_at=combined_available_at)
+
+    def expire_pending_5m_setups(
+        self,
+        as_of_time: datetime,
+        symbol: Optional[str] = None,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        """Flushes pending 5m setups that have exceeded the timeout waiting for their 15m candle."""
+        with self._lock:
+            for sid, (setup, snap_5m, avail_at) in list(self._pending_5m_setups.items()):
+                if symbol is not None and setup.symbol != symbol:
+                    continue
+                elapsed = (as_of_time - snap_5m.bar_close_time).total_seconds()
+                if elapsed >= timeout_seconds or as_of_time.date() > snap_5m.bar_close_time.date():
+                    del self._pending_5m_setups[sid]
+                    self._qualify_5m_setup(setup, snap_5m, available_at=avail_at or snap_5m.bar_close_time)
 
     def on_5m_setup(
         self,
@@ -271,9 +291,9 @@ class MultiTimeframeAnalyzer:
 
             candle_close_time = get_bar_close_time(candle.timestamp, "1m")
 
-            # Flush any pending simultaneous 5m setups whose 15m candle did not arrive before 1m tick
+            # Flush pending simultaneous 5m setups ONLY for THIS symbol whose 15m candle did not arrive before 1m tick
             for sid, (setup, snap_5m, avail_at) in list(self._pending_5m_setups.items()):
-                if candle_close_time > snap_5m.bar_close_time:
+                if setup.symbol == candle.symbol and candle_close_time > snap_5m.bar_close_time:
                     del self._pending_5m_setups[sid]
                     self._qualify_5m_setup(setup, snap_5m, available_at=avail_at or snap_5m.bar_close_time)
 
@@ -331,7 +351,14 @@ class MultiTimeframeAnalyzer:
         # Spot index has no traded volume: check paired futures price against paired futures VWAP
         paired_futures = self.engine.index_futures_map.get(snap.symbol)
         if paired_futures:
-            fut_snap = self.engine.get_snapshot(paired_futures, timeframe=snap.timeframe, as_of=as_of)
+            fut_state = self.engine.states.get(paired_futures)
+            fut_snap = None
+            if fut_state:
+                cand_snap = fut_state.latest_snapshots.get(snap.timeframe)
+                if cand_snap and cand_snap.timestamp == snap.timestamp:
+                    fut_snap = cand_snap
+            if fut_snap is None:
+                fut_snap = self.engine.get_snapshot(paired_futures, timeframe=snap.timeframe, as_of=as_of)
             if fut_snap and fut_snap.vwap is not None:
                 max_age = self.max_1m_futures_age_seconds if snap.timeframe == "1m" else self.max_5m_futures_age_seconds
                 age = (as_of - fut_snap.bar_close_time).total_seconds()
@@ -362,7 +389,14 @@ class MultiTimeframeAnalyzer:
 
         paired_futures = self.engine.index_futures_map.get(snap.symbol)
         if paired_futures:
-            fut_snap = self.engine.get_snapshot(paired_futures, timeframe=timeframe, as_of=cutoff)
+            fut_state = self.engine.states.get(paired_futures)
+            fut_snap = None
+            if fut_state:
+                cand_snap = fut_state.latest_snapshots.get(timeframe)
+                if cand_snap and cand_snap.timestamp == snap.timestamp:
+                    fut_snap = cand_snap
+            if fut_snap is None:
+                fut_snap = self.engine.get_snapshot(paired_futures, timeframe=timeframe, as_of=cutoff)
             if fut_snap and fut_snap.vwap is not None:
                 max_age = self.max_1m_futures_age_seconds if timeframe == "1m" else self.max_5m_futures_age_seconds
                 age = (cutoff - fut_snap.bar_close_time).total_seconds()

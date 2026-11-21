@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS candles (
     volume BIGINT NOT NULL,
     oi BIGINT,
     is_closed BOOLEAN DEFAULT FALSE,
+    observed_at TIMESTAMP WITH TIME ZONE,
     PRIMARY KEY (symbol, timeframe, timestamp)
 );
 

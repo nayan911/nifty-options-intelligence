@@ -16,6 +16,7 @@ from typing import Callable, Dict, List, Optional
 import pytz
 
 from nifty_engine.core.interfaces import Candle, Tick
+from nifty_engine.utils.timezone import now_ist
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -139,7 +140,7 @@ class RealtimeCandleBuilder:
                 elif bar_start > active.start_time:
                     # Interval boundary crossed -> close previous bar
                     closed_candle = active.to_candle(is_closed=True)
-                    closed_candle.observed_at = tick_time
+                    closed_candle.observed_at = tick.local_timestamp or now_ist()
                     closed_candles.append(closed_candle)
 
                     # Start fresh bar
@@ -170,6 +171,7 @@ class RealtimeCandleBuilder:
 
                 if current_time >= bar_end_time and active.tick_count > 0:
                     closed_candle = active.to_candle(is_closed=True)
+                    closed_candle.observed_at = current_time
                     closed_candles.append(closed_candle)
                     # Remove from active
                     del self._active_bars[(symbol, tf)]

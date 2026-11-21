@@ -2250,4 +2250,240 @@ def test_market_data_runner_callback_none_headroom(capsys):
     assert "T1: 25132.50 (1.50R)" in captured.out
 
 
+def test_candle_builder_observed_at_and_duckdb_persistence(tmp_path):
+    """Verify Candle Builder: observed_at captures local receipt time and persists to DuckDB."""
+    from nifty_engine.core.interfaces import Tick
+    from nifty_engine.data.candle_builder import RealtimeCandleBuilder
+    from nifty_engine.data.storage.duckdb_store import DuckDBStore
+
+    builder = RealtimeCandleBuilder()
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0, 0))
+    t1 = IST.localize(datetime(2026, 11, 23, 10, 0, 30))
+    t2 = IST.localize(datetime(2026, 11, 23, 10, 1, 5))
+    rec1 = IST.localize(datetime(2026, 11, 23, 10, 1, 5, 250000))
+
+    # Bar 1 ticks (10:00:00 - 10:01:00)
+    builder.process_tick(Tick(symbol="NSE:NIFTY50-INDEX", ltp=25000.0, exchange_timestamp=t0, local_timestamp=t0, is_index=True))
+    builder.process_tick(Tick(symbol="NSE:NIFTY50-INDEX", ltp=25010.0, exchange_timestamp=t1, local_timestamp=t1, is_index=True))
+
+    # Tick crossing boundary at 10:01:05 with local_timestamp = rec1
+    closed = builder.process_tick(Tick(symbol="NSE:NIFTY50-INDEX", ltp=25015.0, exchange_timestamp=t2, local_timestamp=rec1, is_index=True))
+    assert len(closed) == 1
+    c1m = closed[0]
+    assert c1m.timeframe == "1m"
+    assert c1m.timestamp == t0
+    # Invariant: observed_at captures local receipt timestamp, NOT exchange timestamp!
+    assert c1m.observed_at == rec1
+
+    # Clock-driven flush test
+    t_flush = IST.localize(datetime(2026, 11, 23, 10, 3, 0))
+    flushed = builder.flush_closed_bars(current_time=t_flush)
+    assert len(flushed) >= 1
+    c_flushed = next(c for c in flushed if c.timeframe == "1m")
+    assert c_flushed.observed_at == t_flush
+
+    # Persist and restore from DuckDB
+    db_file = tmp_path / "test_pipeline.duckdb"
+    store = DuckDBStore(db_path=str(db_file))
+    store.insert_candle(c1m)
+    restored = store.get_candles("NSE:NIFTY50-INDEX", "1m", t0 - timedelta(minutes=1), t0 + timedelta(minutes=1))
+    assert len(restored) == 1
+    assert restored[0].observed_at == rec1
+
+
+def test_engine_regular_snapshots_populate_available_at():
+    """Verify TechnicalAnalysisEngine: Regular 1m, 5m, 15m snapshots populate available_at."""
+    engine = TechnicalAnalysisEngine()
+    sym = "NSE:NIFTY50-INDEX"
+    base_t = IST.localize(datetime(2026, 11, 23, 10, 0))
+    obs_1m = base_t + timedelta(minutes=1, seconds=2)
+    obs_5m = base_t + timedelta(minutes=5, seconds=3)
+    obs_15m = base_t + timedelta(minutes=15, seconds=4)
+
+    s1 = engine.on_candle(Candle(symbol=sym, timeframe="1m", timestamp=base_t, open=25000.0, high=25010.0, low=24995.0, close=25005.0, volume=0, is_closed=True, observed_at=obs_1m))
+    s5 = engine.on_candle(Candle(symbol=sym, timeframe="5m", timestamp=base_t, open=25000.0, high=25020.0, low=24990.0, close=25015.0, volume=0, is_closed=True, observed_at=obs_5m))
+    s15 = engine.on_candle(Candle(symbol=sym, timeframe="15m", timestamp=base_t, open=25000.0, high=25050.0, low=24980.0, close=25040.0, volume=0, is_closed=True, observed_at=obs_15m))
+
+    assert s1 is not None and s1.available_at == obs_1m
+    assert s5 is not None and s5.available_at == obs_5m
+    assert s15 is not None and s15.available_at == obs_15m
+
+
+def test_multi_timeframe_15m_coordination_uses_later_availability():
+    """Verify 15m Coordination: Unblocked 5m setup uses the later of 5m and 15m availability."""
+    engine = TechnicalAnalysisEngine()
+    analyzer = MultiTimeframeAnalyzer(engine=engine)
+    base_t = IST.localize(datetime(2026, 11, 23, 10, 10))  # 10:10-10:15
+    sym = "NSE:NIFTY50-INDEX"
+
+    t_5m_avail = IST.localize(datetime(2026, 11, 23, 10, 15, 2))
+    t_15m_avail = IST.localize(datetime(2026, 11, 23, 10, 15, 4))
+
+    snap_5m = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_t,
+        timeframe="5m",
+        open=25080.0,
+        high=25120.0,
+        low=25075.0,
+        close=25115.0,
+        volume=0,
+        atr=20.0,
+        rvol=2.0,
+        available_at=t_5m_avail,
+    )
+    setup = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type="PDH",
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        current_state=BreakoutState.SETUP_ELIGIBLE,
+        start_time=base_t,
+        symbol=sym,
+        timeframe="5m",
+        stop_loss=25080.0,
+    )
+
+    # 5m setup arrives at 10:15:02 on 15m boundary -> buffered because 15m is not ready yet
+    res = analyzer.on_5m_setup(setup, snap_5m, available_at=t_5m_avail)
+    assert res is None
+    assert len(analyzer._pending_5m_setups) == 1
+
+    # 15m snapshot arrives at 10:15:04 (effective_available_at = 10:15:04)
+    snap_15m = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=IST.localize(datetime(2026, 11, 23, 10, 0)),  # 10:00-10:15
+        timeframe="15m",
+        open=25000.0,
+        high=25120.0,
+        low=24980.0,
+        close=25110.0,
+        volume=0,
+        trend_bias="BULLISH",
+        available_at=t_15m_avail,
+    )
+    engine.states[sym].latest_snapshots["15m"] = snap_15m
+    engine.states[sym].snapshot_history["15m"].append(snap_15m)
+
+    # Unblock
+    analyzer.on_15m_snapshot(snap_15m)
+    assert len(analyzer._pending_5m_setups) == 0
+    assert len(analyzer.active_setups) == 1
+    active = list(analyzer.active_setups.values())[0]
+    # Invariant: Setup availability is 10:15:04 (the later timestamp), not 10:15:02!
+    assert active.available_at == t_15m_avail
+
+
+def test_multi_timeframe_pending_setups_isolated_by_symbol():
+    """Verify Symbol Isolation: Unrelated instrument candles do not flush pending setups."""
+    engine = TechnicalAnalysisEngine()
+    analyzer = MultiTimeframeAnalyzer(engine=engine)
+    base_t = IST.localize(datetime(2026, 11, 23, 10, 10))  # 10:10-10:15
+    sym_nifty = "NSE:NIFTY50-INDEX"
+    sym_rel = "NSE:RELIANCE-EQ"
+
+    snap_5m = TechnicalSnapshot(
+        symbol=sym_nifty,
+        timestamp=base_t,
+        timeframe="5m",
+        open=25080.0,
+        high=25120.0,
+        low=25075.0,
+        close=25115.0,
+        volume=0,
+        available_at=base_t + timedelta(minutes=5),
+    )
+    setup = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type="PDH",
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        current_state=BreakoutState.SETUP_ELIGIBLE,
+        start_time=base_t,
+        symbol=sym_nifty,
+        timeframe="5m",
+        stop_loss=25080.0,
+    )
+
+    analyzer.on_5m_setup(setup, snap_5m)
+    assert len(analyzer._pending_5m_setups) == 1
+
+    # 1m candle for RELIANCE arrives at 10:16 (past 10:15)
+    c_rel = Candle(symbol=sym_rel, timeframe="1m", timestamp=base_t + timedelta(minutes=5), open=2500.0, high=2510.0, low=2495.0, close=2505.0, volume=1000, is_closed=True)
+    s_rel = TechnicalSnapshot(symbol=sym_rel, timestamp=base_t + timedelta(minutes=5), timeframe="1m", open=2500.0, high=2510.0, low=2495.0, close=2505.0, volume=1000)
+
+    analyzer.on_1m_candle(c_rel, s_rel)
+    # Invariant: NIFTY setup was NOT flushed by RELIANCE candle!
+    assert len(analyzer._pending_5m_setups) == 1
+    assert setup.setup_id in analyzer._pending_5m_setups
+
+    # 1m candle for NIFTY arrives past 10:15
+    c_nifty_1m = Candle(symbol=sym_nifty, timeframe="1m", timestamp=base_t + timedelta(minutes=5), open=25110.0, high=25118.0, low=25108.0, close=25115.0, volume=0, is_closed=True)
+    s_nifty_1m = TechnicalSnapshot(symbol=sym_nifty, timestamp=base_t + timedelta(minutes=5), timeframe="1m", open=25110.0, high=25118.0, low=25108.0, close=25115.0, volume=0)
+
+    analyzer.on_1m_candle(c_nifty_1m, s_nifty_1m)
+    # Invariant: NIFTY setup is now flushed/evaluated for NIFTY
+    assert len(analyzer._pending_5m_setups) == 0
+
+
+def test_multi_timeframe_1m_entry_futures_arrival_order_invariance():
+    """Verify 1m Synchronization: Order of spot vs futures 1m candle arrival does not alter entry score or candidate."""
+    base_t = IST.localize(datetime(2026, 11, 23, 10, 5))
+    spot_sym = "NSE:NIFTY50-INDEX"
+    fut_sym = "NSE:NIFTY26NOVFUT"
+
+    def run_pipeline(spot_first: bool):
+        candidates = []
+        engine = TechnicalAnalysisEngine(
+            primary_index=spot_sym,
+            primary_futures=fut_sym,
+            on_technical_candidate=lambda c: candidates.append(c),
+        )
+        if engine.multi_timeframe_analyzer:
+            engine.multi_timeframe_analyzer.min_confluence_score = 40.0
+
+        # Setup 15m macro snapshot
+        snap_15m = TechnicalSnapshot(symbol=spot_sym, timestamp=base_t - timedelta(minutes=20), timeframe="15m", open=25000.0, high=25120.0, low=24980.0, close=25110.0, volume=0, trend_bias="BULLISH")
+        engine.states[spot_sym].latest_snapshots["15m"] = snap_15m
+        engine.states[spot_sym].snapshot_history["15m"].append(snap_15m)
+
+        # Active 5m setup
+        snap_5m = TechnicalSnapshot(symbol=spot_sym, timestamp=base_t - timedelta(minutes=5), timeframe="5m", open=25080.0, high=25120.0, low=25075.0, close=25115.0, volume=0, atr=20.0, rvol=2.0)
+        setup = BreakoutContext(level_id="PDH_25100.0", level_type="PDH", nominal_price=25100.0, direction=BreakoutDirection.BULLISH, current_state=BreakoutState.SETUP_ELIGIBLE, start_time=base_t - timedelta(minutes=5), symbol=spot_sym, timeframe="5m", stop_loss=25080.0)
+        engine.multi_timeframe_analyzer.on_5m_setup(setup, snap_5m)
+
+        # Mark futures active with a preceding candle
+        engine.on_candle(Candle(symbol=fut_sym, timeframe="1m", timestamp=base_t - timedelta(minutes=1), open=25100.0, high=25110.0, low=25095.0, close=25105.0, volume=1000, is_closed=True))
+
+        c_spot = Candle(symbol=spot_sym, timeframe="1m", timestamp=base_t, open=25110.0, high=25120.0, low=25105.0, close=25115.0, volume=0, is_closed=True)
+        # Futures candle has VWAP = 25100; close 25118 > VWAP 25100 -> bullish VWAP alignment (+10 pts)
+        c_fut = Candle(symbol=fut_sym, timeframe="1m", timestamp=base_t, open=25110.0, high=25122.0, low=25105.0, close=25118.0, volume=5000, is_closed=True)
+
+        if spot_first:
+            engine.on_candle(c_spot)
+            # Spot buffered; no candidate yet
+            assert len(candidates) == 0
+            engine.on_candle(c_fut)
+            # Futures arrives; candidate dispatched
+            assert len(candidates) == 1
+        else:
+            engine.on_candle(c_fut)
+            assert len(candidates) == 0
+            engine.on_candle(c_spot)
+            # Spot arrives; candidate dispatched immediately
+            assert len(candidates) == 1
+
+        return candidates[0]
+
+    cand_spot_first = run_pipeline(spot_first=True)
+    cand_fut_first = run_pipeline(spot_first=False)
+
+    # Invariant: Confluence scores, entry prices, and targets are strictly identical regardless of arrival order!
+    assert cand_spot_first.confluence_score == cand_fut_first.confluence_score
+    assert cand_spot_first.entry_price == cand_fut_first.entry_price
+    assert cand_spot_first.stop_loss == cand_fut_first.stop_loss
+    assert cand_spot_first.target_1 == cand_fut_first.target_1
+    assert cand_spot_first.target_2 == cand_fut_first.target_2
+
+
 
