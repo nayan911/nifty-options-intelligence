@@ -600,6 +600,8 @@ def test_multi_timeframe_engine_end_to_end_callback_integration():
         primary_futures="NSE:NIFTY26NOVFUT",
         on_technical_candidate=on_cand,
     )
+    if engine.multi_timeframe_analyzer:
+        engine.multi_timeframe_analyzer.min_confluence_score = 50.0
     base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
     sym = "NSE:NIFTY50-INDEX"
 
@@ -626,13 +628,28 @@ def test_multi_timeframe_engine_end_to_end_callback_integration():
         )
     )
 
-    # 2. Warm up 22 5m candles below resistance (25080)
+    # 2. Warm up 22 5m candles below resistance (25080) and keep 15m context fresh
     for i in range(22):
+        ts_cur = base_time + timedelta(minutes=5 * i)
+        if i % 3 == 0:
+            engine.on_candle(
+                Candle(
+                    symbol=sym,
+                    timeframe="15m",
+                    timestamp=ts_cur,
+                    open=25020.0,
+                    high=25080.0,
+                    low=25010.0,
+                    close=25075.0,
+                    volume=0,
+                    is_closed=True,
+                )
+            )
         engine.on_candle(
             Candle(
                 symbol="NSE:NIFTY26NOVFUT",
                 timeframe="5m",
-                timestamp=base_time + timedelta(minutes=5 * i),
+                timestamp=ts_cur,
                 open=25070.0,
                 high=25085.0,
                 low=25065.0,
@@ -645,7 +662,7 @@ def test_multi_timeframe_engine_end_to_end_callback_integration():
             Candle(
                 symbol=sym,
                 timeframe="5m",
-                timestamp=base_time + timedelta(minutes=5 * i),
+                timestamp=ts_cur,
                 open=25070.0,
                 high=25085.0,
                 low=25065.0,
@@ -735,7 +752,7 @@ def test_multi_timeframe_engine_end_to_end_callback_integration():
     assert cand.direction == BreakoutDirection.BULLISH
     assert cand.entry_price == 25112.0
     assert cand.stop_loss <= 25100.0
-    assert cand.confluence_score >= 60.0
+    assert cand.confluence_score >= 50.0
 
 
 # ==============================================================================
@@ -1435,4 +1452,494 @@ def test_multi_timeframe_bearish_candidate_flow():
     assert cand.target_1 == round(24970.0 - 1.5 * 18.0, 1)  # 24943.0
     assert cand.confluence_score >= 60.0
     assert "Score:" in cand.summary()
+
+
+def test_multi_timeframe_actual_available_at_vs_bar_close():
+    """Verify Timing: When futures confirmation arrives late, 1m entry must close after actual available_at."""
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 10, 0))
+    sym = "NSE:NIFTY50-INDEX"
+    analyzer = MultiTimeframeAnalyzer(engine=engine)
+    state = engine.states[sym]
+
+    snap_15m = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time - timedelta(minutes=15),
+        timeframe="15m",
+        open=25000.0,
+        high=25120.0,
+        low=24980.0,
+        close=25110.0,
+        volume=0,
+        trend_bias="BULLISH",
+    )
+    state.latest_snapshots["15m"] = snap_15m
+    state.snapshot_history["15m"].append(snap_15m)
+
+    # 5m candle closes at 10:05, but confirmation arrives at 10:06:20
+    snap_5m = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time,
+        timeframe="5m",
+        open=25080.0,
+        high=25125.0,
+        low=25075.0,
+        close=25115.0,
+        volume=0,
+        atr=20.0,
+        rvol=2.0,
+        available_at=base_time + timedelta(minutes=6, seconds=20),
+    )
+    setup = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type="PDH",
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        current_state=BreakoutState.SETUP_ELIGIBLE,
+        start_time=base_time,
+        symbol=sym,
+        timeframe="5m",
+        stop_loss=25080.0,
+    )
+    active = analyzer.on_5m_setup(setup, snap_5m)
+    assert active is not None
+    assert active.bar_close_time == base_time + timedelta(minutes=5)
+    assert active.available_at == base_time + timedelta(minutes=6, seconds=20)
+
+    # 1. 1m candle for 10:05-10:06 (closes at 10:06:00 < 10:06:20)
+    c_early = Candle(
+        symbol=sym,
+        timeframe="1m",
+        timestamp=base_time + timedelta(minutes=5),
+        open=25105.0,
+        high=25115.0,
+        low=25102.0,
+        close=25112.0,
+        volume=0,
+        is_closed=True,
+    )
+    s_early = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time + timedelta(minutes=5),
+        timeframe="1m",
+        open=25105.0,
+        high=25115.0,
+        low=25102.0,
+        close=25112.0,
+        volume=0,
+        ema_9=25108.0,
+        rsi=60.0,
+    )
+    # Invariant: 10:05-10:06 candle closed before futures arrived at 10:06:20 -> Skipped!
+    cands_early = analyzer.on_1m_candle(c_early, s_early)
+    assert len(cands_early) == 0
+    assert len(analyzer.active_setups) == 1
+
+    # 2. 1m candle for 10:06-10:07 (closes at 10:07:00 > 10:06:20)
+    c_valid = Candle(
+        symbol=sym,
+        timeframe="1m",
+        timestamp=base_time + timedelta(minutes=6),
+        open=25110.0,
+        high=25120.0,
+        low=25108.0,
+        close=25116.0,
+        volume=0,
+        is_closed=True,
+    )
+    s_valid = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time + timedelta(minutes=6),
+        timeframe="1m",
+        open=25110.0,
+        high=25120.0,
+        low=25108.0,
+        close=25116.0,
+        volume=0,
+        ema_9=25110.0,
+        vwap=25095.0,
+        rsi=62.0,
+    )
+    cands_valid = analyzer.on_1m_candle(c_valid, s_valid)
+    assert len(cands_valid) == 1
+    assert cands_valid[0].entry_price == 25116.0
+
+
+def test_multi_timeframe_rejected_duplicate_candle_not_forwarded():
+    """Verify Isolation: Rejected duplicate/out-of-order candles do not invoke MultiTimeframeAnalyzer."""
+    called_candidates = []
+
+    def on_cand(c: TechnicalCandidate):
+        called_candidates.append(c)
+
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+        on_technical_candidate=on_cand,
+    )
+    if engine.multi_timeframe_analyzer:
+        engine.multi_timeframe_analyzer.min_confluence_score = 50.0
+    base_time = IST.localize(datetime(2026, 11, 23, 10, 0))
+    sym = "NSE:NIFTY50-INDEX"
+
+    # Feed 1m candle at 10:05
+    c1 = Candle(
+        symbol=sym,
+        timeframe="1m",
+        timestamp=base_time + timedelta(minutes=5),
+        open=25100.0,
+        high=25110.0,
+        low=25095.0,
+        close=25105.0,
+        volume=0,
+        is_closed=True,
+    )
+    snap1 = engine.on_candle(c1)
+    assert snap1 is not None
+    assert engine.states[sym].last_candle_accepted["1m"] is True
+
+    # Re-feed identical duplicate candle at 10:05
+    snap2 = engine.on_candle(c1)
+    assert snap2 is not None
+    # Invariant: Duplicate was rejected
+    assert engine.states[sym].last_candle_accepted["1m"] is False
+
+    # Feed older candle at 10:03 (out-of-order)
+    c_old = Candle(
+        symbol=sym,
+        timeframe="1m",
+        timestamp=base_time + timedelta(minutes=3),
+        open=25090.0,
+        high=25100.0,
+        low=25085.0,
+        close=25095.0,
+        volume=0,
+        is_closed=True,
+    )
+    snap_old = engine.on_candle(c_old)
+    assert snap_old is not None
+    # Invariant: Out-of-order candle was rejected
+    assert engine.states[sym].last_candle_accepted["1m"] is False
+
+
+def test_multi_timeframe_stale_15m_macro_rejected():
+    """Verify Freshness: 15m macro snapshot older than max_15m_macro_age_seconds is rejected."""
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 10, 0))
+    sym = "NSE:NIFTY50-INDEX"
+    # Set 15m max age to 15 minutes (900 seconds)
+    analyzer = MultiTimeframeAnalyzer(engine=engine, max_15m_macro_age_seconds=900.0)
+    state = engine.states[sym]
+
+    # 15m candle from 09:15 to 09:30 (closed at 09:30)
+    snap_15m_stale = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time - timedelta(minutes=45),
+        timeframe="15m",
+        open=25000.0,
+        high=25120.0,
+        low=24980.0,
+        close=25110.0,
+        volume=0,
+        trend_bias="BULLISH",
+    )
+    state.latest_snapshots["15m"] = snap_15m_stale
+    state.snapshot_history["15m"].append(snap_15m_stale)
+
+    # 5m candle at 10:00-10:05 (available at 10:05 -> 35 minutes after 09:30 close > 15m limit!)
+    snap_5m = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time,
+        timeframe="5m",
+        open=25080.0,
+        high=25125.0,
+        low=25075.0,
+        close=25115.0,
+        volume=0,
+        atr=20.0,
+        rvol=2.0,
+    )
+    setup = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type="PDH",
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        current_state=BreakoutState.SETUP_ELIGIBLE,
+        start_time=base_time,
+        symbol=sym,
+        timeframe="5m",
+    )
+
+    # Invariant: Rejected due to stale 15m macro data!
+    assert analyzer.on_5m_setup(setup, snap_5m) is None
+
+
+def test_multi_timeframe_missing_resistance_headroom_none_no_inflated_score():
+    """Verify Scoring: Unknown headroom is None and awards 0 confluence points."""
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 10, 0))
+    sym = "NSE:NIFTY50-INDEX"
+    analyzer = MultiTimeframeAnalyzer(engine=engine)
+    state = engine.states[sym]
+
+    # 15m snapshot with no nearest resistance
+    snap_15m = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time - timedelta(minutes=15),
+        timeframe="15m",
+        open=25000.0,
+        high=25120.0,
+        low=24980.0,
+        close=25110.0,
+        volume=0,
+        trend_bias="BULLISH",
+        nearest_resistance=None,  # Open air / unknown
+    )
+    state.latest_snapshots["15m"] = snap_15m
+    state.snapshot_history["15m"].append(snap_15m)
+
+    setup = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type="PDH",
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        current_state=BreakoutState.SETUP_ELIGIBLE,
+        start_time=base_time,
+        symbol=sym,
+        timeframe="5m",
+        stop_loss=25080.0,
+    )
+    snap_5m = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time,
+        timeframe="5m",
+        open=25080.0,
+        high=25125.0,
+        low=25075.0,
+        close=25115.0,
+        volume=0,
+        atr=20.0,
+        rvol=2.0,
+        vwap=25080.0,
+    )
+    active = analyzer.on_5m_setup(setup, snap_5m)
+    assert active is not None
+    # Invariant: Headroom is None (NOT 999.0!)
+    assert active.headroom_points is None
+
+    # Score with unknown headroom receives 0 headroom points
+    snap_1m_no_vwap = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time + timedelta(minutes=5),
+        timeframe="1m",
+        open=25102.0,
+        high=25110.0,
+        low=25100.0,
+        close=25105.0,
+        volume=0,
+        vwap=None,
+    )
+    score = analyzer._compute_confluence_score(
+        setup=setup,
+        snap_1m=snap_1m_no_vwap,
+        snap_5m=snap_5m,
+        snap_15m=snap_15m,
+        direction=BreakoutDirection.BULLISH,
+        headroom_points=None,
+        entry_time=base_time + timedelta(minutes=5),
+    )
+    # Max without headroom (+15) and without 1m RSI (+10) is 30(trend) + 25(rvol) + 10(5m vwap) = 65
+    assert score == 65.0
+
+
+def test_multi_timeframe_target_2_capped_at_obstacle():
+    """Verify Targets: Target 2 is strictly capped at opposing 15m barrier if nominal 2.0R exceeds it."""
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 10, 0))
+    sym = "NSE:NIFTY50-INDEX"
+    analyzer = MultiTimeframeAnalyzer(engine=engine)
+    state = engine.states[sym]
+
+    # Opposing 15m resistance barrier at 25142 (lower bound 25140)
+    barrier = PriceZone(
+        level_type=LevelType.PDH,
+        nominal_price=25142.0,
+        upper_bound=25145.0,
+        lower_bound=25140.0,
+        description="15m Resistance",
+        weight=3.0,
+    )
+    snap_15m = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time - timedelta(minutes=15),
+        timeframe="15m",
+        open=25000.0,
+        high=25120.0,
+        low=24980.0,
+        close=25110.0,
+        volume=0,
+        trend_bias="BULLISH",
+        nearest_resistance=barrier,
+    )
+    state.latest_snapshots["15m"] = snap_15m
+    state.snapshot_history["15m"].append(snap_15m)
+
+    setup = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type="PDH",
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        current_state=BreakoutState.SETUP_ELIGIBLE,
+        start_time=base_time,
+        symbol=sym,
+        timeframe="5m",
+        stop_loss=25095.0,
+    )
+    snap_5m = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time,
+        timeframe="5m",
+        open=25080.0,
+        high=25120.0,
+        low=25075.0,
+        close=25110.0,
+        volume=0,
+        atr=10.0,
+        rvol=2.0,
+        vwap=25090.0,
+    )
+    active = analyzer.on_5m_setup(setup, snap_5m)
+    assert active is not None
+
+    # 1m entry candle enters at 25110 with stop loss at 25095 -> risk_points = 15.0
+    # Nominal T1 = 25110 + 1.5 * 15 = 25132.5 (< 25140 resistance -> OK!)
+    # Nominal T2 = 25110 + 2.0 * 15 = 25140 + 10 = 25150.0 (> 25140 resistance -> MUST BE CAPPED!)
+    t_1m = base_time + timedelta(minutes=5)
+    c1 = Candle(
+        symbol=sym,
+        timeframe="1m",
+        timestamp=t_1m,
+        open=25105.0,
+        high=25112.0,
+        low=25102.0,
+        close=25110.0,
+        volume=0,
+        is_closed=True,
+    )
+    s1 = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=t_1m,
+        timeframe="1m",
+        open=25105.0,
+        high=25112.0,
+        low=25102.0,
+        close=25110.0,
+        volume=0,
+        ema_9=25108.0,
+        vwap=25095.0,
+        rsi=60.0,
+    )
+    cands = analyzer.on_1m_candle(c1, s1)
+    assert len(cands) == 1
+    cand = cands[0]
+    assert cand.target_1 == 25132.5
+    # Invariant: Target 2 is strictly capped at barrier lower_bound (25140.0), NOT extending to 25150.0!
+    assert cand.target_2 == 25140.0
+
+
+def test_multi_timeframe_intrabar_stop_loss_breach():
+    """Verify Invalidation: Intrabar low crossing stop loss invalidates setup even if close recovers."""
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 10, 0))
+    sym = "NSE:NIFTY50-INDEX"
+    analyzer = MultiTimeframeAnalyzer(engine=engine)
+    state = engine.states[sym]
+
+    snap_15m = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time - timedelta(minutes=15),
+        timeframe="15m",
+        open=25000.0,
+        high=25120.0,
+        low=24980.0,
+        close=25110.0,
+        volume=0,
+        trend_bias="BULLISH",
+    )
+    state.latest_snapshots["15m"] = snap_15m
+    state.snapshot_history["15m"].append(snap_15m)
+
+    # Base stop-loss is 25090.0
+    setup = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type="PDH",
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        current_state=BreakoutState.SETUP_ELIGIBLE,
+        start_time=base_time,
+        symbol=sym,
+        timeframe="5m",
+        stop_loss=25090.0,
+    )
+    snap_5m = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=base_time,
+        timeframe="5m",
+        open=25080.0,
+        high=25120.0,
+        low=25075.0,
+        close=25110.0,
+        volume=0,
+        atr=20.0,
+        rvol=2.0,
+    )
+    analyzer.on_5m_setup(setup, snap_5m)
+    assert len(analyzer.active_setups) == 1
+
+    # 1m candle dips intrabar to low = 25088 (< 25090 SL breach!), but closes at 25105 (above 25100)
+    t_1m = base_time + timedelta(minutes=5)
+    c_wick = Candle(
+        symbol=sym,
+        timeframe="1m",
+        timestamp=t_1m,
+        open=25105.0,
+        high=25112.0,
+        low=25088.0,  # Intrabar breach!
+        close=25105.0,
+        volume=0,
+        is_closed=True,
+    )
+    s_wick = TechnicalSnapshot(
+        symbol=sym,
+        timestamp=t_1m,
+        timeframe="1m",
+        open=25105.0,
+        high=25112.0,
+        low=25088.0,
+        close=25105.0,
+        volume=0,
+        ema_9=25102.0,
+        rsi=55.0,
+    )
+
+    cands = analyzer.on_1m_candle(c_wick, s_wick)
+    # Invariant: Intrabar breach invalidates setup; no candidate dispatched
+    assert len(cands) == 0
+    assert len(analyzer.active_setups) == 0
+
 

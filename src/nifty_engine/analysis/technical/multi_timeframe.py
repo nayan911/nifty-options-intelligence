@@ -4,20 +4,21 @@ Coordinates the 3-tier hierarchical technical analysis funnel:
 1. Tier 1 (15m Macro Regime & Filter):
    - Trend direction validation (BULLISH, BEARISH, SIDEWAYS).
    - Headroom verification: requires >= 1.5x ATR distance to opposing 15m S/R barriers.
-   - Causal snapshot retrieval with zero lookahead bias.
+   - Causal snapshot retrieval with zero lookahead bias and strict freshness thresholds.
 2. Tier 2 (5m Setup Qualification):
    - Listens for 5m Breakout & Retest transitions to SETUP_ELIGIBLE.
    - Validates futures volume surge (RVOL >= 1.3x).
-   - Enforces available_at timestamp (exact 5m candle completion).
+   - Distinguishes scheduled bar_close_time from genuine data availability timestamp (available_at).
    - Pre-qualifies trade setups and buffers them for 1m entry timing.
 3. Tier 3 (1m Precision Entry Timing):
-   - Causal sequencing: 1m entry candle must close after 5m setup completion.
+   - Causal sequencing: 1m entry candle must close after genuine available_at timestamp.
    - Revalidates 15m macro context and opposing levels immediately prior to entry.
+   - Intrabar stop-loss breach check using high/low extremes.
    - Validates short-term momentum alignment (EMA 9, basis-synchronized VWAP, RSI sweet-spot).
    - Permanent invalidation for failed breakout levels or stop-loss breaches.
    - Optimizes stop-loss anchoring to recent 1m micro-swings with correct directional boundary.
-   - Re-checks that available headroom accommodates Target 1 (1.5R).
-   - Strict zero-tolerance confluence scoring: missing data awards 0 points.
+   - Enforces Target 1 obstacle clearance and strictly caps Target 2 at opposing 15m barriers.
+   - Strict zero-tolerance confluence scoring: missing/unknown data awards 0 points.
    - Emits a unified, deterministic TechnicalCandidate.
 """
 
@@ -71,16 +72,17 @@ class TechnicalCandidate:
     reward_points: float
     risk_reward_ratio: float
     confluence_score: float
-    headroom_points: float
+    headroom_points: Optional[float] = None
     timeframe_breakdown: Dict[str, Any] = field(default_factory=dict)
     is_paper_trading: bool = True
 
     def summary(self) -> str:
         """Formatted human-readable summary of the technical candidate."""
+        hd_str = f"{self.headroom_points:.1f}pts" if self.headroom_points is not None else "N/A"
         return (
             f"[{self.candidate_id}] {self.symbol} {self.direction.value} @ {self.entry_price:.2f} | "
             f"SL: {self.stop_loss:.2f} | T1: {self.target_1:.2f} (1.5R) | T2: {self.target_2:.2f} (2.0R) | "
-            f"Risk: {self.risk_points:.1f}pts | Score: {self.confluence_score:.0f}/100"
+            f"Risk: {self.risk_points:.1f}pts | Headroom: {hd_str} | Score: {self.confluence_score:.0f}/100"
         )
 
 
@@ -91,9 +93,10 @@ class Active5mSetup:
     setup: BreakoutContext
     snapshot_5m: TechnicalSnapshot
     qualified_time: datetime  # Opening timestamp of the 5m candle
-    available_at: datetime  # Exact completion timestamp of the 5m candle (bar_close_time)
+    bar_close_time: datetime  # Scheduled completion timestamp of 5m candle (snap_5m.bar_close_time)
+    available_at: datetime  # Actual timestamp when confirmation (e.g. futures volume) completed
     expiry_time: datetime  # available_at + entry_window_minutes
-    headroom_points: float
+    headroom_points: Optional[float] = None
     opposing_zone: Optional[PriceZone] = None
     state: SetupLifecycleState = SetupLifecycleState.WAITING_ENTRY
     invalidation_reason: Optional[str] = None
@@ -110,6 +113,9 @@ class MultiTimeframeAnalyzer:
         min_headroom_atr_multiple: float = 1.5,
         min_risk_points: float = 8.0,
         entry_window_minutes: int = 15,
+        max_1m_futures_age_seconds: float = 60.0,
+        max_5m_futures_age_seconds: float = 300.0,
+        max_15m_macro_age_seconds: float = 1200.0,
     ):
         self._lock = threading.RLock()
         self.engine = engine
@@ -118,6 +124,9 @@ class MultiTimeframeAnalyzer:
         self.min_headroom_atr_multiple = min_headroom_atr_multiple
         self.min_risk_points = min_risk_points
         self.entry_window_minutes = entry_window_minutes
+        self.max_1m_futures_age_seconds = max_1m_futures_age_seconds
+        self.max_5m_futures_age_seconds = max_5m_futures_age_seconds
+        self.max_15m_macro_age_seconds = max_15m_macro_age_seconds
 
         # In-flight setups waiting for 1m entry timing: {setup_id: Active5mSetup}
         self.active_setups: Dict[str, Active5mSetup] = {}
@@ -140,22 +149,30 @@ class MultiTimeframeAnalyzer:
         self,
         setup: BreakoutContext,
         snap_5m: TechnicalSnapshot,
+        available_at: Optional[datetime] = None,
     ) -> Optional[Active5mSetup]:
         """Tier 1 & Tier 2: Evaluates 15m macro regime & headroom for a newly eligible 5m setup."""
         with self._lock:
             self._check_session_rollover(snap_5m.timestamp)
 
-            # Setup qualification occurs exactly when the 5m candle closes
-            available_at = snap_5m.bar_close_time
+            bar_close = snap_5m.bar_close_time
+            # Genuine availability timestamp when all volume confirmations completed
+            actual_available_at = available_at or getattr(snap_5m, "available_at", None) or bar_close
+            actual_available_at = max(actual_available_at, bar_close)
 
-            # 1. Retrieve 15m snapshot available as of the 5m close (strictly zero lookahead)
-            snap_15m = self.engine.get_snapshot(setup.symbol, timeframe="15m", as_of=available_at)
+            # 1. Retrieve 15m snapshot available as of actual_available_at (strictly zero lookahead)
+            snap_15m = self.engine.get_snapshot(setup.symbol, timeframe="15m", as_of=actual_available_at)
             if not snap_15m:
                 # 15m structure not yet completed/observed by available_at; cannot qualify without macro context
                 return None
 
-            # Verify no future leakage: 15m bar close must be on or before 5m bar close
-            if snap_15m.bar_close_time > available_at:
+            # Verify no future leakage: 15m bar close must be on or before actual_available_at
+            if snap_15m.bar_close_time > actual_available_at:
+                return None
+
+            # Verify freshness of 15m market context
+            age_15m = (actual_available_at - snap_15m.bar_close_time).total_seconds()
+            if age_15m > self.max_15m_macro_age_seconds or snap_15m.timestamp.date() != actual_available_at.date():
                 return None
 
             # 2. Tier 1 Macro Trend Bias Filter
@@ -173,36 +190,37 @@ class MultiTimeframeAnalyzer:
                     return None
 
             # 3. Tier 1 Headroom to Opposing 15m S/R Obstacles
-            atr_5m = snap_5m.atr if snap_5m.atr is not None else 20.0
-            min_headroom = max(self.min_headroom_atr_multiple * atr_5m, 25.0)
+            atr_5m = snap_5m.atr
+            min_headroom = max(self.min_headroom_atr_multiple * atr_5m, 25.0) if atr_5m is not None else 25.0
 
             opposing_zone: Optional[PriceZone] = None
-            headroom_points = 999.0
+            headroom_points: Optional[float] = None
 
             if setup.direction == BreakoutDirection.BULLISH:
                 if snap_15m.nearest_resistance and snap_15m.nearest_resistance.nominal_price > setup.nominal_price:
                     opposing_zone = snap_15m.nearest_resistance
-                    headroom_points = opposing_zone.lower_bound - snap_5m.close
+                    headroom_points = max(0.0, opposing_zone.lower_bound - snap_5m.close)
                     if headroom_points < min_headroom:
                         # Major 15m resistance is too close; unfavorable risk-reward
                         return None
             elif setup.direction == BreakoutDirection.BEARISH:
                 if snap_15m.nearest_support and snap_15m.nearest_support.nominal_price < setup.nominal_price:
                     opposing_zone = snap_15m.nearest_support
-                    headroom_points = snap_5m.close - opposing_zone.upper_bound
+                    headroom_points = max(0.0, snap_5m.close - opposing_zone.upper_bound)
                     if headroom_points < min_headroom:
                         # Major 15m support is too close; unfavorable risk-reward
                         return None
 
             # 4. Qualify 5m setup and wait for 1m entry trigger
-            expiry_dt = available_at + timedelta(minutes=self.entry_window_minutes)
+            expiry_dt = actual_available_at + timedelta(minutes=self.entry_window_minutes)
             active = Active5mSetup(
                 setup=setup,
                 snapshot_5m=snap_5m,
                 qualified_time=snap_5m.timestamp,
-                available_at=available_at,
+                bar_close_time=bar_close,
+                available_at=actual_available_at,
                 expiry_time=expiry_dt,
-                headroom_points=max(0.0, headroom_points),
+                headroom_points=headroom_points,
                 opposing_zone=opposing_zone,
                 state=SetupLifecycleState.WAITING_ENTRY,
             )
@@ -234,8 +252,8 @@ class MultiTimeframeAnalyzer:
                     continue
 
                 # Causal Check: 1m candle must complete strictly AFTER the 5m setup became available
-                # E.g. If 5m setup completed at 10:05, a 1m candle from 10:00-10:01 (close 10:01) cannot confirm!
-                if candle_close_time <= active.available_at or candle.timestamp < active.available_at:
+                # and its opening must not precede the 5m bar close
+                if candle_close_time <= active.available_at or candle.timestamp < active.bar_close_time:
                     continue
 
                 candidate = self._evaluate_1m_entry(
@@ -276,12 +294,15 @@ class MultiTimeframeAnalyzer:
         if paired_futures:
             fut_snap = self.engine.get_snapshot(paired_futures, timeframe=snap.timeframe, as_of=as_of)
             if fut_snap and fut_snap.vwap is not None:
-                if direction == BreakoutDirection.BULLISH:
-                    return fut_snap.close >= fut_snap.vwap
-                else:
-                    return fut_snap.close <= fut_snap.vwap
+                max_age = self.max_1m_futures_age_seconds if snap.timeframe == "1m" else self.max_5m_futures_age_seconds
+                age = (as_of - fut_snap.bar_close_time).total_seconds()
+                if age <= max_age:
+                    if direction == BreakoutDirection.BULLISH:
+                        return fut_snap.close >= fut_snap.vwap
+                    else:
+                        return fut_snap.close <= fut_snap.vwap
 
-        # No VWAP available on either: does not fail holding check
+        # No fresh VWAP available on either: does not fail holding check
         return True
 
     def _evaluate_vwap_alignment(
@@ -292,6 +313,8 @@ class MultiTimeframeAnalyzer:
         as_of: Optional[datetime] = None,
     ) -> bool:
         """Checks if symbol or paired futures confirms VWAP positioning (used for positive scoring)."""
+        cutoff = as_of or snap.bar_close_time
+
         if snap.vwap is not None:
             if direction == BreakoutDirection.BULLISH:
                 return snap.close >= snap.vwap
@@ -300,12 +323,15 @@ class MultiTimeframeAnalyzer:
 
         paired_futures = self.engine.index_futures_map.get(snap.symbol)
         if paired_futures:
-            fut_snap = self.engine.get_snapshot(paired_futures, timeframe=timeframe, as_of=as_of)
+            fut_snap = self.engine.get_snapshot(paired_futures, timeframe=timeframe, as_of=cutoff)
             if fut_snap and fut_snap.vwap is not None:
-                if direction == BreakoutDirection.BULLISH:
-                    return fut_snap.close >= fut_snap.vwap
-                else:
-                    return fut_snap.close <= fut_snap.vwap
+                max_age = self.max_1m_futures_age_seconds if timeframe == "1m" else self.max_5m_futures_age_seconds
+                age = (cutoff - fut_snap.bar_close_time).total_seconds()
+                if age <= max_age:
+                    if direction == BreakoutDirection.BULLISH:
+                        return fut_snap.close >= fut_snap.vwap
+                    else:
+                        return fut_snap.close <= fut_snap.vwap
 
         return False
 
@@ -320,7 +346,22 @@ class MultiTimeframeAnalyzer:
         setup = active.setup
         nominal_lvl = setup.nominal_price
 
-        # 1. Level Holding Check: Breakout level must hold on 1m close
+        # 1. Intrabar & Close Stop-Loss Breach Check: hard invalidation boundary
+        base_sl = setup.stop_loss if setup.stop_loss is not None else (
+            nominal_lvl - 25.0 if setup.direction == BreakoutDirection.BULLISH else nominal_lvl + 25.0
+        )
+        if setup.direction == BreakoutDirection.BULLISH:
+            if candle.low <= base_sl or candle.close <= base_sl:
+                active.state = SetupLifecycleState.INVALIDATED
+                active.invalidation_reason = f"1m low {candle.low:.2f} breached base stop loss {base_sl:.2f}"
+                return None
+        else:
+            if candle.high >= base_sl or candle.close >= base_sl:
+                active.state = SetupLifecycleState.INVALIDATED
+                active.invalidation_reason = f"1m high {candle.high:.2f} breached base stop loss {base_sl:.2f}"
+                return None
+
+        # 2. Level Holding Check: Breakout level must hold on 1m close
         if setup.direction == BreakoutDirection.BULLISH:
             if candle.close < nominal_lvl:
                 active.state = SetupLifecycleState.INVALIDATED
@@ -332,26 +373,14 @@ class MultiTimeframeAnalyzer:
                 active.invalidation_reason = f"1m close {candle.close:.2f} failed to hold breakdown level {nominal_lvl:.2f}"
                 return None
 
-        # 2. Stop-Loss Breach Check: Price must not breach base stop loss
-        base_sl = setup.stop_loss if setup.stop_loss is not None else (
-            nominal_lvl - 25.0 if setup.direction == BreakoutDirection.BULLISH else nominal_lvl + 25.0
-        )
-        if setup.direction == BreakoutDirection.BULLISH and candle.close <= base_sl:
-            active.state = SetupLifecycleState.INVALIDATED
-            active.invalidation_reason = f"1m close {candle.close:.2f} breached base stop loss {base_sl:.2f}"
-            return None
-        elif setup.direction == BreakoutDirection.BEARISH and candle.close >= base_sl:
-            active.state = SetupLifecycleState.INVALIDATED
-            active.invalidation_reason = f"1m close {candle.close:.2f} breached base stop loss {base_sl:.2f}"
-            return None
-
         # 3. Revalidate 15m Macro Context as of entry candle close
         snap_15m = self.engine.get_snapshot(setup.symbol, timeframe="15m", as_of=candle_close_time)
         if not snap_15m:
             return None
 
-        # Freshness: snapshot must be from the current session and within 4 hours
-        if snap_15m.timestamp.date() != candle.timestamp.date() or (candle.timestamp - snap_15m.timestamp).total_seconds() > 14400.0:
+        # Freshness: snapshot must be from current session and within max_15m_macro_age_seconds
+        age_15m = (candle_close_time - snap_15m.bar_close_time).total_seconds()
+        if age_15m > self.max_15m_macro_age_seconds or snap_15m.timestamp.date() != candle.timestamp.date():
             return None
 
         # Macro trend bias must still align (no counter-trend entry)
@@ -367,7 +396,6 @@ class MultiTimeframeAnalyzer:
         # 4. 1m Momentum Confirmation
         if setup.direction == BreakoutDirection.BULLISH:
             # Bullish candle momentum: green candle OR confirmed above EMA 9
-            # Missing EMA 9 does NOT satisfy momentum by itself: require green candle
             if snap_1m.ema_9 is not None:
                 candle_momentum_ok = (candle.close >= snap_1m.ema_9) or (candle.close > candle.open)
             else:
@@ -430,37 +458,48 @@ class MultiTimeframeAnalyzer:
                 effective_sl = round(entry_price + self.min_risk_points, 1)
                 risk_points = self.min_risk_points
 
-        # 6. Targets & Realized Headroom Validation
+        # 6. Targets & Realized Headroom Validation (Target 1 check + Target 2 capping)
+        nominal_target_1 = (
+            round(entry_price + 1.5 * risk_points, 1)
+            if setup.direction == BreakoutDirection.BULLISH
+            else round(entry_price - 1.5 * risk_points, 1)
+        )
+        nominal_target_2 = (
+            round(entry_price + 2.0 * risk_points, 1)
+            if setup.direction == BreakoutDirection.BULLISH
+            else round(entry_price - 2.0 * risk_points, 1)
+        )
+
+        target_1 = nominal_target_1
+        target_2 = nominal_target_2
+        live_headroom: Optional[float] = None
+
         if setup.direction == BreakoutDirection.BULLISH:
-            target_1 = round(entry_price + 1.5 * risk_points, 1)
-            target_2 = round(entry_price + 2.0 * risk_points, 1)
-            reward_points = target_1 - entry_price
-
-            # Recalculate headroom from entry price to nearest 15m resistance
-            live_headroom = 999.0
             if snap_15m.nearest_resistance and snap_15m.nearest_resistance.nominal_price > entry_price:
-                live_headroom = snap_15m.nearest_resistance.lower_bound - entry_price
+                barrier_price = snap_15m.nearest_resistance.lower_bound
+                live_headroom = max(0.0, barrier_price - entry_price)
                 # Opposing 15m barrier must not block Target 1 (1.5R)
                 if live_headroom < 1.5 * risk_points:
-                    # Headroom insufficient to reach Target 1 before hitting major resistance
                     return None
+                # Cap Target 2 at the barrier price if nominal 2.0R extends past it
+                if nominal_target_2 > barrier_price:
+                    target_2 = round(barrier_price, 1)
+            reward_points = target_1 - entry_price
         else:
-            target_1 = round(entry_price - 1.5 * risk_points, 1)
-            target_2 = round(entry_price - 2.0 * risk_points, 1)
-            reward_points = entry_price - target_1
-
-            # Recalculate headroom from entry price to nearest 15m support
-            live_headroom = 999.0
             if snap_15m.nearest_support and snap_15m.nearest_support.nominal_price < entry_price:
-                live_headroom = entry_price - snap_15m.nearest_support.upper_bound
+                barrier_price = snap_15m.nearest_support.upper_bound
+                live_headroom = max(0.0, entry_price - barrier_price)
                 # Opposing 15m barrier must not block Target 1 (1.5R)
                 if live_headroom < 1.5 * risk_points:
-                    # Headroom insufficient to reach Target 1 before hitting major support
                     return None
+                # Cap Target 2 at the barrier price if nominal 2.0R extends past it
+                if nominal_target_2 < barrier_price:
+                    target_2 = round(barrier_price, 1)
+            reward_points = entry_price - target_1
 
         rr_ratio = round(reward_points / risk_points, 2) if risk_points > 0 else 0.0
 
-        # 7. Confluence Scoring (0-100) — STRICT: 0 pts for missing data
+        # 7. Confluence Scoring (0-100) — STRICT: 0 pts for missing/unknown data
         score = self._compute_confluence_score(
             setup=setup,
             snap_1m=snap_1m,
@@ -497,7 +536,7 @@ class MultiTimeframeAnalyzer:
             reward_points=round(reward_points, 1),
             risk_reward_ratio=rr_ratio,
             confluence_score=round(score, 1),
-            headroom_points=round(live_headroom, 1),
+            headroom_points=round(live_headroom, 1) if live_headroom is not None else None,
             timeframe_breakdown={
                 "15m_trend": snap_15m.trend_bias,
                 "5m_rvol": active.snapshot_5m.rvol,
@@ -517,12 +556,12 @@ class MultiTimeframeAnalyzer:
         snap_5m: TechnicalSnapshot,
         snap_15m: Optional[TechnicalSnapshot],
         direction: BreakoutDirection,
-        headroom_points: float,
+        headroom_points: Optional[float],
         entry_time: datetime,
     ) -> float:
         """Calculates 0-100 composite score across all three timeframes.
 
-        Strict zero-tolerance scoring: Missing data receives 0 points.
+        Strict zero-tolerance scoring: Missing or unknown data receives 0 points.
         """
         score = 0.0
 
@@ -557,12 +596,12 @@ class MultiTimeframeAnalyzer:
         if self._evaluate_vwap_alignment(snap_1m, direction, "1m", as_of=entry_time):
             score += 10.0
 
-        # 4. 15m Headroom (max +15 pts, inadequate = +0 pts)
-        atr_5m = snap_5m.atr if snap_5m.atr is not None else 20.0
-        if headroom_points >= 2.0 * atr_5m:
-            score += 15.0
-        elif headroom_points >= 1.5 * atr_5m:
-            score += 10.0
+        # 4. 15m Headroom (max +15 pts, unknown/missing ATR/inadequate = +0 pts)
+        if headroom_points is not None and snap_5m.atr is not None:
+            if headroom_points >= 2.0 * snap_5m.atr:
+                score += 15.0
+            elif headroom_points >= 1.5 * snap_5m.atr:
+                score += 10.0
 
         # 5. 1m Momentum Sweet-Spot (max +10 pts, missing/outside = +0 pts)
         rsi = snap_1m.rsi

@@ -86,11 +86,17 @@ class TechnicalSnapshot:
     nearest_support: Optional[PriceZone] = None
     nearest_resistance: Optional[PriceZone] = None
     active_setups: List[BreakoutContext] = field(default_factory=list)
+    available_at: Optional[datetime] = None
 
     @property
     def bar_close_time(self) -> datetime:
         """Calculates exact candle close/completion timestamp based on timeframe duration."""
         return get_bar_close_time(self.timestamp, self.timeframe)
+
+    @property
+    def effective_available_at(self) -> datetime:
+        """Returns genuine confirmation timestamp when all indicators and volume were available."""
+        return self.available_at if self.available_at is not None else self.bar_close_time
 
 
 class SymbolTechnicalState:
@@ -171,6 +177,7 @@ class SymbolTechnicalState:
         self.session_open_price: Optional[float] = None
         self.notified_setup_ids: Set[str] = set()
         self.latest_candle_timestamps: Dict[str, datetime] = {}
+        self.last_candle_accepted: Dict[str, bool] = {"1m": False, "5m": False, "15m": False}
         self._pending_breakout_eval: Dict[str, Tuple] = {}
 
     @property
@@ -267,11 +274,13 @@ class SymbolTechnicalState:
         """Routes candle strictly to its corresponding timeframe handler."""
         if not self._check_session_rollover(candle.timestamp):
             # Candle belongs to a past trading date: strictly reject!
+            self.last_candle_accepted[candle.timeframe] = False
             return self.latest_snapshots.get(candle.timeframe) or self._create_generic_snapshot(candle)
 
         # Monotonic timestamp validation: reject duplicate or out-of-order candles
         last_ts = self.latest_candle_timestamps.get(candle.timeframe)
         if last_ts is not None and candle.timestamp <= last_ts:
+            self.last_candle_accepted[candle.timeframe] = False
             if candle.timestamp == last_ts and futures_rvol is not None:
                 snap = self.latest_snapshots.get(candle.timeframe)
                 if snap is not None and snap.rvol is None:
@@ -279,6 +288,7 @@ class SymbolTechnicalState:
                     self.latest_snapshots[candle.timeframe] = snap
                     return snap
             return self.latest_snapshots.get(candle.timeframe) or self._create_generic_snapshot(candle)
+        self.last_candle_accepted[candle.timeframe] = True
         self.latest_candle_timestamps[candle.timeframe] = candle.timestamp
 
         # Flush any uncompleted pending breakout evaluation on older candle
@@ -324,6 +334,7 @@ class SymbolTechnicalState:
         rsi_val: Optional[float],
         trend_bias: str,
         on_setup_candidate: Optional[Callable[[BreakoutContext, TechnicalSnapshot], None]] = None,
+        actual_available_at: Optional[datetime] = None,
     ) -> List[BreakoutContext]:
         """Evaluates breakout state machine updates and approach transitions exactly once per candle."""
         active_map = self.active_breakouts_1m if timeframe == "1m" else self.active_breakouts_5m
@@ -388,6 +399,7 @@ class SymbolTechnicalState:
                         atr=round(atr_val, 2) if atr_val else None,
                         rvol=round(rvol_val, 2) if rvol_val else None,
                         trend_bias=trend_bias,
+                        available_at=actual_available_at,
                     )
                     on_setup_candidate(updated_ctx, snapshot_preview)
                 del active_map[lvl_id]
@@ -443,6 +455,12 @@ class SymbolTechnicalState:
         if futures_timestamp is not None and abs((candle.timestamp - futures_timestamp).total_seconds()) > 5.0:
             effective_rvol = None
 
+        actual_available_at = None
+        if futures_timestamp is not None:
+            fut_close = get_bar_close_time(futures_timestamp, timeframe)
+            spot_close = get_bar_close_time(candle.timestamp, timeframe)
+            actual_available_at = max(spot_close, fut_close)
+
         active_setups = self._evaluate_breakouts(
             timeframe=timeframe,
             candle=candle,
@@ -459,6 +477,7 @@ class SymbolTechnicalState:
             rsi_val=rsi_val,
             trend_bias=trend_bias,
             on_setup_candidate=on_setup_candidate,
+            actual_available_at=actual_available_at,
         )
 
         snap = self.latest_snapshots.get(timeframe)
@@ -466,6 +485,8 @@ class SymbolTechnicalState:
             if effective_rvol is not None:
                 snap.rvol = round(effective_rvol, 2)
             snap.active_setups = active_setups
+            if actual_available_at is not None:
+                snap.available_at = actual_available_at
             self.latest_snapshots[timeframe] = snap
 
     def expire_pending_evaluations(
@@ -1322,7 +1343,13 @@ class TechnicalAnalysisEngine:
                         )
 
             # 3. Phase C: Precision entry evaluation for 1m candle close
-            if snapshot and candle.timeframe == "1m" and self.multi_timeframe_analyzer:
+            if (
+                snapshot
+                and candle.timeframe == "1m"
+                and self.multi_timeframe_analyzer
+                and state.last_candle_accepted.get("1m", False)
+                and snapshot.timestamp == candle.timestamp
+            ):
                 self.multi_timeframe_analyzer.on_1m_candle(candle, snapshot)
 
             return snapshot
