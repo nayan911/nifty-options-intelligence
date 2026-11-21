@@ -50,7 +50,10 @@ class FyersInstrumentMaster(IInstrumentMaster):
 
     def __init__(self, cache_dir: Optional[Path] = None) -> None:
         self.cache_dir = cache_dir or settings.SYMBOL_CACHE_DIR
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         self.fo_cache_file = self.cache_dir / "NSE_FO.csv"
 
         self._df: Optional[pd.DataFrame] = None

@@ -1,9 +1,10 @@
 """Integration tests for MarketDataEngine lifecycle, exactly-once candle handling, and dynamic rotation."""
 
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
+import pandas as pd
 import pytz
 
 # Add scripts directory to path to import MarketDataEngine
@@ -13,6 +14,7 @@ sys.path.insert(0, str(scripts_dir))
 from run_market_data import MarketDataEngine
 
 from nifty_engine.core.interfaces import Tick
+from nifty_engine.data.fyers.instrument_master import NSE_FO_COLUMNS
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -74,17 +76,32 @@ def test_market_data_engine_dynamic_option_rotation():
     """Verify that option contract watchlist rotates when spot price crosses strike boundary."""
     store = DuckDBStore(db_path=":memory:")
     engine = MarketDataEngine(store=store)
-    # Load cached instrument master fixture
-    engine.master.load_master(auto_download=False)
+
+    # Deterministic mock master fixture (zero network/disk dependency for CI)
+    exp_date = date.today() + timedelta(days=5)
+    exp_dt = datetime.combine(exp_date, time(15, 30), tzinfo=IST)
+    expiry_epoch = int(exp_dt.timestamp())
+
+    rows = []
+    for s in [24950.0, 25000.0, 25050.0, 25100.0]:
+        for opt in ["CE", "PE"]:
+            rows.append([
+                f"1011{int(s)}{opt}", f"NIFTY {int(s)} {opt}", 14, 65, 0.05, "",
+                "0915-1540|1815-1915:", str(exp_date), expiry_epoch, f"NSE:NIFTY{int(s)}{opt}",
+                10, 11, 15000, "NIFTY", 26000, s, opt, "101000000026000", "None", 0, 0.0
+            ])
+
+    df = pd.DataFrame(rows, columns=NSE_FO_COLUMNS)
+    engine.master.load_from_dataframe(df)
 
     engine.active_atm_strike = 25000.0
     engine.subscribed_option_symbols = {
-        "NSE:NIFTY26NOV24950CE",
-        "NSE:NIFTY26NOV24950PE",
-        "NSE:NIFTY26NOV25000CE",
-        "NSE:NIFTY26NOV25000PE",
-        "NSE:NIFTY26NOV25050CE",
-        "NSE:NIFTY26NOV25050PE",
+        "NSE:NIFTY24950CE",
+        "NSE:NIFTY24950PE",
+        "NSE:NIFTY25000CE",
+        "NSE:NIFTY25000PE",
+        "NSE:NIFTY25050CE",
+        "NSE:NIFTY25050PE",
     }
 
     # Simulate spot moving +60 points to 25060 (ATM moves from 25000 -> 25050)
@@ -92,5 +109,10 @@ def test_market_data_engine_dynamic_option_rotation():
     engine.check_and_rotate_options()
 
     assert engine.active_atm_strike == 25050.0
+    # 24950 strikes should be rotated out and 25100 strikes rotated in
+    assert "NSE:NIFTY24950CE" not in engine.subscribed_option_symbols
+    assert "NSE:NIFTY24950PE" not in engine.subscribed_option_symbols
+    assert "NSE:NIFTY25100CE" in engine.subscribed_option_symbols
+    assert "NSE:NIFTY25100PE" in engine.subscribed_option_symbols
 
     store.close()
