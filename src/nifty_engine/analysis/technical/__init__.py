@@ -9,6 +9,8 @@ from nifty_engine.analysis.technical.engine import (
     SymbolTechnicalState,
     TechnicalAnalysisEngine,
     TechnicalSnapshot,
+    get_bar_close_time,
+    get_bar_duration,
 )
 from nifty_engine.analysis.technical.indicators import (
     compute_atr,
@@ -23,6 +25,7 @@ from nifty_engine.analysis.technical.indicators import (
 from nifty_engine.analysis.technical.multi_timeframe import (
     Active5mSetup,
     MultiTimeframeAnalyzer,
+    SetupLifecycleState,
     TechnicalCandidate,
 )
 from nifty_engine.analysis.technical.support_resistance import (
@@ -37,9 +40,12 @@ __all__ = [
     "MultiTimeframeAnalyzer",
     "TechnicalCandidate",
     "Active5mSetup",
+    "SetupLifecycleState",
     "TechnicalAnalysisEngine",
     "TechnicalSnapshot",
     "SymbolTechnicalState",
+    "get_bar_close_time",
+    "get_bar_duration",
     "BreakoutStateMachine",
     "BreakoutContext",
     "BreakoutDirection",

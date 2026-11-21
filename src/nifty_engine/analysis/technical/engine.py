@@ -16,7 +16,7 @@ Orchestrates streaming technical and structural quantitative analysis across sub
 import threading
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -40,6 +40,23 @@ from nifty_engine.analysis.technical.support_resistance import (
 )
 from nifty_engine.analysis.technical.swings import SwingDetector, SwingPoint
 from nifty_engine.core.interfaces import BreakoutState, Candle
+
+
+def get_bar_duration(timeframe: str) -> timedelta:
+    """Returns standard duration for supported candlestick timeframe."""
+    duration_map = {
+        "1m": timedelta(minutes=1),
+        "5m": timedelta(minutes=5),
+        "15m": timedelta(minutes=15),
+        "1h": timedelta(hours=1),
+        "1d": timedelta(days=1),
+    }
+    return duration_map.get(timeframe, timedelta(minutes=1))
+
+
+def get_bar_close_time(timestamp: datetime, timeframe: str) -> datetime:
+    """Computes exact close/completion timestamp for a candle with opening timestamp."""
+    return timestamp + get_bar_duration(timeframe)
 
 
 @dataclass
@@ -69,6 +86,11 @@ class TechnicalSnapshot:
     nearest_support: Optional[PriceZone] = None
     nearest_resistance: Optional[PriceZone] = None
     active_setups: List[BreakoutContext] = field(default_factory=list)
+
+    @property
+    def bar_close_time(self) -> datetime:
+        """Calculates exact candle close/completion timestamp based on timeframe duration."""
+        return get_bar_close_time(self.timestamp, self.timeframe)
 
 
 class SymbolTechnicalState:
@@ -132,6 +154,11 @@ class SymbolTechnicalState:
             "5m": None,
             "15m": None,
         }
+        self.snapshot_history: Dict[str, Deque[TechnicalSnapshot]] = {
+            "1m": deque(maxlen=60),
+            "5m": deque(maxlen=30),
+            "15m": deque(maxlen=20),
+        }
 
         # Telemetry: 1m and 5m Futures RVOL & Timestamps
         self.latest_1m_rvol: Optional[float] = None
@@ -150,6 +177,28 @@ class SymbolTechnicalState:
     def latest_snapshot(self) -> Optional[TechnicalSnapshot]:
         """Backward-compatible property returning the latest 1m snapshot."""
         return self.latest_snapshots.get("1m")
+
+    def get_snapshot(
+        self,
+        timeframe: str = "1m",
+        as_of: Optional[datetime] = None,
+    ) -> Optional[TechnicalSnapshot]:
+        """Returns the technical snapshot for a timeframe, optionally as of a specific cutoff timestamp."""
+        if as_of is None:
+            return self.latest_snapshots.get(timeframe)
+
+        # Look in reverse chronological order for the most recent snapshot completed on or before as_of
+        history = self.snapshot_history.get(timeframe)
+        if history:
+            for snap in reversed(history):
+                if snap.bar_close_time <= as_of:
+                    return snap
+
+        latest = self.latest_snapshots.get(timeframe)
+        if latest is not None and latest.bar_close_time <= as_of:
+            return latest
+
+        return None
 
     @property
     def latest_rvol(self) -> Optional[float]:
@@ -201,6 +250,8 @@ class SymbolTechnicalState:
                 "5m": None,
                 "15m": None,
             }
+            for deq in self.snapshot_history.values():
+                deq.clear()
             self.latest_candle_timestamps.clear()
             self._pending_breakout_eval.clear()
 
@@ -733,6 +784,7 @@ class SymbolTechnicalState:
         )
 
         self.latest_snapshots["1m"] = snapshot
+        self.snapshot_history["1m"].append(snapshot)
         return snapshot
 
     def _process_5m_candle(
@@ -944,6 +996,7 @@ class SymbolTechnicalState:
             active_setups=active_setups_5m,
         )
         self.latest_snapshots["5m"] = snap
+        self.snapshot_history["5m"].append(snap)
         return snap
 
     def _process_15m_candle(self, candle: Candle) -> TechnicalSnapshot:
@@ -1069,6 +1122,7 @@ class SymbolTechnicalState:
             nearest_resistance=nearest_res_15m,
         )
         self.latest_snapshots["15m"] = snap
+        self.snapshot_history["15m"].append(snap)
         return snap
 
     def _create_generic_snapshot(self, candle: Candle) -> TechnicalSnapshot:
@@ -1287,9 +1341,14 @@ class TechnicalAnalysisEngine:
                     on_setup_candidate=self._dispatch_setup_candidate,
                 )
 
-    def get_snapshot(self, symbol: str, timeframe: str = "1m") -> Optional[TechnicalSnapshot]:
-        """Returns the latest technical snapshot for a symbol and timeframe."""
+    def get_snapshot(
+        self,
+        symbol: str,
+        timeframe: str = "1m",
+        as_of: Optional[datetime] = None,
+    ) -> Optional[TechnicalSnapshot]:
+        """Returns the technical snapshot for a symbol and timeframe, optionally as of a specific cutoff timestamp."""
         with self._lock:
             if symbol in self.states:
-                return self.states[symbol].latest_snapshots.get(timeframe)
+                return self.states[symbol].get_snapshot(timeframe=timeframe, as_of=as_of)
             return None
