@@ -2487,3 +2487,415 @@ def test_multi_timeframe_1m_entry_futures_arrival_order_invariance():
 
 
 
+
+
+def test_multi_timeframe_entry_evaluation_respects_decision_at_and_filtering():
+    """Verify P0: Multi-timeframe entry evaluation strictly uses decision_at for causal filtering."""
+    base_t = IST.localize(datetime(2026, 11, 23, 10, 5))
+    spot_sym = "NSE:NIFTY50-INDEX"
+    fut_sym = "NSE:NIFTY26NOVFUT"
+
+    candidates = []
+    engine = TechnicalAnalysisEngine(
+        primary_index=spot_sym,
+        primary_futures=fut_sym,
+        on_technical_candidate=lambda c: candidates.append(c),
+    )
+    analyzer = engine.multi_timeframe_analyzer
+    analyzer.min_confluence_score = 40.0
+
+    # Mark futures feed active with a preceding candle
+    engine.on_candle(
+        Candle(
+            symbol=fut_sym,
+            timeframe="1m",
+            timestamp=base_t - timedelta(minutes=1),
+            open=25100.0,
+            high=25110.0,
+            low=25095.0,
+            close=25105.0,
+            volume=1000,
+            is_closed=True,
+        )
+    )
+
+    # 15m snapshot available at 10:00:02 (from 9:45-10:00 bar)
+    t_15m_avail = IST.localize(datetime(2026, 11, 23, 10, 0, 2))
+    snap_15m = TechnicalSnapshot(
+        symbol=spot_sym,
+        timestamp=base_t - timedelta(minutes=20),
+        timeframe="15m",
+        open=25000.0,
+        high=25120.0,
+        low=24980.0,
+        close=25110.0,
+        volume=0,
+        trend_bias="BULLISH",
+        available_at=t_15m_avail,
+    )
+    engine.states[spot_sym].snapshot_history["15m"].append(snap_15m)
+
+    # 5m setup
+    snap_5m = TechnicalSnapshot(
+        symbol=spot_sym,
+        timestamp=base_t - timedelta(minutes=5),
+        timeframe="5m",
+        open=25080.0,
+        high=25120.0,
+        low=25075.0,
+        close=25115.0,
+        volume=0,
+        atr=20.0,
+        rvol=2.0,
+    )
+    setup = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type="PDH",
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        current_state=BreakoutState.SETUP_ELIGIBLE,
+        start_time=base_t - timedelta(minutes=5),
+        symbol=spot_sym,
+        timeframe="5m",
+        stop_loss=25080.0,
+    )
+    analyzer.on_5m_setup(setup, snap_5m)
+
+    # Spot 1m candle closes at 10:06:00, but observed at 10:06:01
+    c_spot = Candle(
+        symbol=spot_sym,
+        timeframe="1m",
+        timestamp=base_t,
+        open=25110.0,
+        high=25120.0,
+        low=25105.0,
+        close=25115.0,
+        volume=0,
+        is_closed=True,
+        observed_at=IST.localize(datetime(2026, 11, 23, 10, 6, 1)),
+    )
+    # Futures arrives at 10:06:04
+    t_fut_avail = IST.localize(datetime(2026, 11, 23, 10, 6, 4))
+    c_fut = Candle(
+        symbol=fut_sym,
+        timeframe="1m",
+        timestamp=base_t,
+        open=25110.0,
+        high=25122.0,
+        low=25105.0,
+        close=25118.0,
+        volume=5000,
+        is_closed=True,
+        observed_at=t_fut_avail,
+    )
+
+    engine.on_candle(c_spot)
+    assert len(candidates) == 0
+
+    engine.on_candle(c_fut)
+    assert len(candidates) == 1
+    cand = candidates[0]
+    # Decision at is exactly the latest evidence availability (10:06:04)
+    assert cand.decision_at == t_fut_avail
+    assert cand.confirmation_status == "CONFIRMED"
+    assert cand.timeframe_breakdown["decision_at"] == t_fut_avail.isoformat()
+
+
+def test_direct_5m_breakout_callback_preserves_availability_timestamp():
+    """Verify P1: Direct 5m breakout callback preserves authentic availability timestamp."""
+    from nifty_engine.analysis.technical.support_resistance import LevelType, PriceZone
+
+    base_t = IST.localize(datetime(2026, 11, 23, 10, 10))
+    spot_sym = "NSE:NIFTY50-INDEX"
+    observed_t = IST.localize(datetime(2026, 11, 23, 10, 15, 3))
+
+    engine = TechnicalAnalysisEngine()
+    state = engine.states[spot_sym]
+    state.current_trend = "BULLISH"
+
+    pdh_zone = PriceZone(
+        level_type=LevelType.PDH,
+        nominal_price=25100.0,
+        upper_bound=25105.0,
+        lower_bound=25095.0,
+        description="PDH Resistance",
+        weight=1.0,
+    )
+
+    emitted_setups = []
+
+    def on_setup(setup, snap):
+        emitted_setups.append((setup, snap))
+
+    # Pre-configure an active breakout setup in BREAKOUT_CONFIRMED awaiting retest qualification
+    breakout_ctx = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type=LevelType.PDH,
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        current_state=BreakoutState.BREAKOUT_CONFIRMED,
+        start_time=base_t - timedelta(minutes=5),
+        symbol=spot_sym,
+        timeframe="5m",
+        stop_loss=25085.0,
+        breakout_price=25115.0,
+        breakout_candle_index=0,
+        zone=pdh_zone,
+    )
+    state.active_breakouts_5m[breakout_ctx.level_id] = breakout_ctx
+
+    # Retest candle touches zone (low 25098 in [25095, 25105]) and closes green (25112 > open 25106)
+    breakout_c = Candle(
+        symbol=spot_sym,
+        timeframe="5m",
+        timestamp=base_t,
+        open=25106.0,
+        high=25120.0,
+        low=25098.0,
+        close=25112.0,
+        volume=2500,
+        is_closed=True,
+        observed_at=observed_t,
+    )
+
+    # Evaluate breakouts directly
+    state._evaluate_breakouts(
+        timeframe="5m",
+        candle=breakout_c,
+        zones=[pdh_zone],
+        nearest_sup=None,
+        nearest_res=pdh_zone,
+        n=5,
+        atr_val=20.0,
+        rvol_val=2.0,
+        is_warmed_up=True,
+        is_provisional=False,
+        ema_9=25105.0,
+        ema_21=25095.0,
+        rsi_val=62.0,
+        trend_bias="BULLISH",
+        on_setup_candidate=on_setup,
+        actual_available_at=observed_t,
+    )
+
+    assert len(emitted_setups) == 1
+    setup, snap = emitted_setups[0]
+    assert setup.current_state == BreakoutState.SETUP_ELIGIBLE
+    # Invariant: Availability timestamp passed through to snapshot preview
+    assert snap.effective_available_at == observed_t
+
+
+def test_older_futures_candle_does_not_remove_pending_spot_entry():
+    """Verify P1: Delayed older futures candle does not discard pending spot 1m entry."""
+    base_t = IST.localize(datetime(2026, 11, 23, 10, 5))
+    spot_sym = "NSE:NIFTY50-INDEX"
+    fut_sym = "NSE:NIFTY26NOVFUT"
+
+    candidates = []
+    engine = TechnicalAnalysisEngine(
+        primary_index=spot_sym,
+        primary_futures=fut_sym,
+        on_technical_candidate=lambda c: candidates.append(c),
+    )
+    if engine.multi_timeframe_analyzer:
+        engine.multi_timeframe_analyzer.min_confluence_score = 40.0
+
+    # Mark futures active with a preceding candle
+    engine.on_candle(
+        Candle(
+            symbol=fut_sym,
+            timeframe="1m",
+            timestamp=base_t - timedelta(minutes=1),
+            open=25100.0,
+            high=25110.0,
+            low=25095.0,
+            close=25105.0,
+            volume=1000,
+            is_closed=True,
+        )
+    )
+
+    snap_15m = TechnicalSnapshot(
+        symbol=spot_sym,
+        timestamp=base_t - timedelta(minutes=20),
+        timeframe="15m",
+        open=25000.0,
+        high=25120.0,
+        low=24980.0,
+        close=25110.0,
+        volume=0,
+        trend_bias="BULLISH",
+    )
+    engine.states[spot_sym].snapshot_history["15m"].append(snap_15m)
+
+    snap_5m = TechnicalSnapshot(
+        symbol=spot_sym,
+        timestamp=base_t - timedelta(minutes=5),
+        timeframe="5m",
+        open=25080.0,
+        high=25120.0,
+        low=25075.0,
+        close=25115.0,
+        volume=0,
+        atr=20.0,
+        rvol=2.0,
+    )
+    setup = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type="PDH",
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        current_state=BreakoutState.SETUP_ELIGIBLE,
+        start_time=base_t - timedelta(minutes=5),
+        symbol=spot_sym,
+        timeframe="5m",
+        stop_loss=25080.0,
+    )
+    engine.multi_timeframe_analyzer.on_5m_setup(setup, snap_5m)
+
+    # Spot 10:05 candle arrives and is buffered
+    c_spot_1005 = Candle(
+        symbol=spot_sym,
+        timeframe="1m",
+        timestamp=base_t,
+        open=25110.0,
+        high=25120.0,
+        low=25105.0,
+        close=25115.0,
+        volume=0,
+        is_closed=True,
+    )
+    engine.on_candle(c_spot_1005)
+    assert spot_sym in engine._pending_1m_entry
+
+    # Delayed older futures candle for 10:04 arrives!
+    c_fut_1004 = Candle(
+        symbol=fut_sym,
+        timeframe="1m",
+        timestamp=base_t - timedelta(minutes=1),
+        open=25100.0,
+        high=25110.0,
+        low=25095.0,
+        close=25105.0,
+        volume=1000,
+        is_closed=True,
+    )
+    engine.on_candle(c_fut_1004)
+
+    # Invariant: Pending spot entry for 10:05 must STILL be preserved!
+    assert spot_sym in engine._pending_1m_entry
+    assert len(candidates) == 0
+
+    # Now matching futures candle for 10:05 arrives
+    c_fut_1005 = Candle(
+        symbol=fut_sym,
+        timeframe="1m",
+        timestamp=base_t,
+        open=25110.0,
+        high=25122.0,
+        low=25105.0,
+        close=25118.0,
+        volume=5000,
+        is_closed=True,
+    )
+    engine.on_candle(c_fut_1005)
+
+    # Spot entry consumed and candidate emitted!
+    assert spot_sym not in engine._pending_1m_entry
+    assert len(candidates) == 1
+    assert candidates[0].confirmation_status == "CONFIRMED"
+
+
+def test_timeout_and_missing_confirmation_status_telemetry():
+    """Verify P2: Expired 1m entry timeout sets TIMED_OUT status and awards 0 confluence for unconfirmed indicators."""
+    base_t = IST.localize(datetime(2026, 11, 23, 10, 5))
+    spot_sym = "NSE:NIFTY50-INDEX"
+    fut_sym = "NSE:NIFTY26NOVFUT"
+
+    candidates = []
+    engine = TechnicalAnalysisEngine(
+        primary_index=spot_sym,
+        primary_futures=fut_sym,
+        on_technical_candidate=lambda c: candidates.append(c),
+    )
+    if engine.multi_timeframe_analyzer:
+        engine.multi_timeframe_analyzer.min_confluence_score = 30.0
+
+    # Mark futures active with a preceding candle
+    engine.on_candle(
+        Candle(
+            symbol=fut_sym,
+            timeframe="1m",
+            timestamp=base_t - timedelta(minutes=1),
+            open=25100.0,
+            high=25110.0,
+            low=25095.0,
+            close=25105.0,
+            volume=1000,
+            is_closed=True,
+        )
+    )
+
+    snap_15m = TechnicalSnapshot(
+        symbol=spot_sym,
+        timestamp=base_t - timedelta(minutes=20),
+        timeframe="15m",
+        open=25000.0,
+        high=25120.0,
+        low=24980.0,
+        close=25110.0,
+        volume=0,
+        trend_bias="BULLISH",
+    )
+    engine.states[spot_sym].snapshot_history["15m"].append(snap_15m)
+
+    snap_5m = TechnicalSnapshot(
+        symbol=spot_sym,
+        timestamp=base_t - timedelta(minutes=5),
+        timeframe="5m",
+        open=25080.0,
+        high=25120.0,
+        low=25075.0,
+        close=25115.0,
+        volume=0,
+        atr=20.0,
+        rvol=2.0,
+    )
+    setup = BreakoutContext(
+        level_id="PDH_25100.0",
+        level_type="PDH",
+        nominal_price=25100.0,
+        direction=BreakoutDirection.BULLISH,
+        current_state=BreakoutState.SETUP_ELIGIBLE,
+        start_time=base_t - timedelta(minutes=5),
+        symbol=spot_sym,
+        timeframe="5m",
+        stop_loss=25080.0,
+    )
+    engine.multi_timeframe_analyzer.on_5m_setup(setup, snap_5m)
+
+    # Spot 1m candle arrives at 10:05 (bar close 10:06)
+    c_spot = Candle(
+        symbol=spot_sym,
+        timeframe="1m",
+        timestamp=base_t,
+        open=25110.0,
+        high=25120.0,
+        low=25105.0,
+        close=25115.0,
+        volume=0,
+        is_closed=True,
+    )
+    engine.on_candle(c_spot)
+    assert spot_sym in engine._pending_1m_entry
+
+    # 35 seconds after bar close (10:06:35), clock-driven expiry runs
+    expiry_time = base_t + timedelta(minutes=1, seconds=35)
+    engine.expire_pending_evaluations(as_of_time=expiry_time)
+
+    # Invariant: Pending entry timed out and emitted with TIMED_OUT status
+    assert spot_sym not in engine._pending_1m_entry
+    assert len(candidates) == 1
+    cand = candidates[0]
+    assert cand.confirmation_status == "TIMED_OUT"
+    assert cand.decision_at == expiry_time

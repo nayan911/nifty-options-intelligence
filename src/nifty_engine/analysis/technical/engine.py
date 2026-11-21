@@ -742,6 +742,9 @@ class SymbolTechnicalState:
 
         nearest_sup, nearest_res = self.sr_engine.find_nearest_zones(candle.close, zones)
 
+        close_time_1m = get_bar_close_time(candle.timestamp, "1m")
+        avail_at_1m = max(candle.observed_at, close_time_1m) if candle.observed_at is not None else close_time_1m
+
         # 4. Breakout State Machine (1m)
         if awaiting_futures_volume:
             self._pending_breakout_eval["1m"] = (
@@ -776,10 +779,8 @@ class SymbolTechnicalState:
                 rsi_val=rsi_val,
                 trend_bias=trend_bias,
                 on_setup_candidate=on_setup_candidate,
+                actual_available_at=avail_at_1m,
             )
-
-        close_time_1m = get_bar_close_time(candle.timestamp, "1m")
-        avail_at_1m = max(candle.observed_at, close_time_1m) if candle.observed_at is not None else close_time_1m
 
         snapshot = TechnicalSnapshot(
             symbol=self.symbol,
@@ -959,6 +960,9 @@ class SymbolTechnicalState:
 
         nearest_sup_5m, nearest_res_5m = self.sr_engine.find_nearest_zones(candle.close, zones_5m)
 
+        close_time_5m = get_bar_close_time(candle.timestamp, "5m")
+        avail_at_5m = max(candle.observed_at, close_time_5m) if candle.observed_at is not None else close_time_5m
+
         # 4. 5m Breakout State Machine (Primary Setup Detector)
         if awaiting_futures_volume:
             self._pending_breakout_eval["5m"] = (
@@ -993,10 +997,8 @@ class SymbolTechnicalState:
                 rsi_val=rsi_val,
                 trend_bias=trend_bias,
                 on_setup_candidate=on_setup_candidate,
+                actual_available_at=avail_at_5m,
             )
-
-        close_time_5m = get_bar_close_time(candle.timestamp, "5m")
-        avail_at_5m = max(candle.observed_at, close_time_5m) if candle.observed_at is not None else close_time_5m
 
         snap = TechnicalSnapshot(
             symbol=self.symbol,
@@ -1388,13 +1390,25 @@ class TechnicalAnalysisEngine:
                             # Both spot and futures 1m are ready!
                             if candle.symbol in self._pending_1m_entry:
                                 old_c, old_s, _ = self._pending_1m_entry.pop(candle.symbol)
-                                self.multi_timeframe_analyzer.on_1m_candle(old_c, old_s)
-                            self.multi_timeframe_analyzer.on_1m_candle(candle, snapshot)
+                                old_decision = max(old_s.effective_available_at, snapshot.effective_available_at)
+                                self.multi_timeframe_analyzer.on_1m_candle(
+                                    old_c, old_s, decision_at=old_decision, confirmation_status="MISSING_CONFIRMATION"
+                                )
+                            decision_at = max(
+                                snapshot.effective_available_at,
+                                fut_snap_1m.effective_available_at,
+                            )
+                            self.multi_timeframe_analyzer.on_1m_candle(
+                                candle, snapshot, decision_at=decision_at, confirmation_status="CONFIRMED"
+                            )
                         else:
                             # Flush older pending 1m candle if exists
                             if candle.symbol in self._pending_1m_entry:
                                 old_c, old_s, _ = self._pending_1m_entry.pop(candle.symbol)
-                                self.multi_timeframe_analyzer.on_1m_candle(old_c, old_s)
+                                old_decision = max(old_s.effective_available_at, snapshot.effective_available_at)
+                                self.multi_timeframe_analyzer.on_1m_candle(
+                                    old_c, old_s, decision_at=old_decision, confirmation_status="MISSING_CONFIRMATION"
+                                )
                             # Buffer spot 1m awaiting matching futures 1m candle
                             self._pending_1m_entry[candle.symbol] = (
                                 candle,
@@ -1403,20 +1417,42 @@ class TechnicalAnalysisEngine:
                             )
                     else:
                         # No active futures stream; evaluate immediately
-                        self.multi_timeframe_analyzer.on_1m_candle(candle, snapshot)
+                        self.multi_timeframe_analyzer.on_1m_candle(
+                            candle, snapshot, decision_at=snapshot.effective_available_at, confirmation_status="CONFIRMED"
+                        )
                 elif paired_index:
                     # Candle is a futures contract: check if paired spot index was waiting
                     if paired_index in self._pending_1m_entry:
-                        pending_c, pending_s, _ = self._pending_1m_entry.pop(paired_index)
+                        pending_c, pending_s, _ = self._pending_1m_entry[paired_index]
                         if abs((pending_c.timestamp - candle.timestamp).total_seconds()) <= 5.0:
                             # Matching futures candle arrived! Evaluate spot 1m entry
-                            self.multi_timeframe_analyzer.on_1m_candle(pending_c, pending_s)
+                            del self._pending_1m_entry[paired_index]
+                            decision_at = max(
+                                pending_s.effective_available_at,
+                                snapshot.effective_available_at,
+                            )
+                            self.multi_timeframe_analyzer.on_1m_candle(
+                                pending_c, pending_s, decision_at=decision_at, confirmation_status="CONFIRMED"
+                            )
                         elif candle.timestamp > pending_c.timestamp:
-                            # Futures progressed past pending spot interval; flush pending
-                            self.multi_timeframe_analyzer.on_1m_candle(pending_c, pending_s)
+                            # Futures progressed past pending spot interval; confirmation was missed!
+                            del self._pending_1m_entry[paired_index]
+                            decision_at = max(
+                                pending_s.effective_available_at,
+                                snapshot.effective_available_at,
+                            )
+                            self.multi_timeframe_analyzer.on_1m_candle(
+                                pending_c, pending_s, decision_at=decision_at, confirmation_status="MISSING_CONFIRMATION"
+                            )
+                        else:
+                            # candle.timestamp < pending_c.timestamp:
+                            # Delayed older futures candle; do not remove pending spot entry!
+                            pass
                 else:
                     # Unpaired symbol: evaluate immediately
-                    self.multi_timeframe_analyzer.on_1m_candle(candle, snapshot)
+                    self.multi_timeframe_analyzer.on_1m_candle(
+                        candle, snapshot, decision_at=snapshot.effective_available_at, confirmation_status="CONFIRMED"
+                    )
 
             # Phase C: 15m snapshot coordination unblocking simultaneous 5m setups
             if (
@@ -1450,7 +1486,9 @@ class TechnicalAnalysisEngine:
                     elapsed = (as_of_time - p_c.timestamp).total_seconds() - 60.0
                     if elapsed >= thresh or as_of_time.date() > p_c.timestamp.date():
                         del self._pending_1m_entry[sym]
-                        self.multi_timeframe_analyzer.on_1m_candle(p_c, p_s)
+                        self.multi_timeframe_analyzer.on_1m_candle(
+                            p_c, p_s, decision_at=as_of_time, confirmation_status="TIMED_OUT"
+                        )
 
                 self.multi_timeframe_analyzer.expire_pending_5m_setups(
                     as_of_time=as_of_time,

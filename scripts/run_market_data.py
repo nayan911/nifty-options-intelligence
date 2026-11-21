@@ -465,14 +465,22 @@ class MarketDataEngine:
             sys.exit(1)
 
         try:
+            loop_ticks = 0
             while self.running:
-                time.sleep(10)
-                # 1. Flush DuckDB buffer periodically
-                self.store.flush_ticks()
+                time.sleep(1)
+                loop_ticks += 1
 
-                # 2. Clock-driven candle finalization (emits bars on boundary; callback handles persistence once)
-                self.builder.flush_closed_bars(now_ist())
-                self.technical_engine.expire_pending_evaluations(now_ist())
+                # 1. Clock-driven candle finalization & timeout expiry check every 1 second
+                current_ist = now_ist()
+                self.builder.flush_closed_bars(current_ist)
+                self.technical_engine.expire_pending_evaluations(current_ist)
+
+                # Periodic 10-second maintenance operations
+                if loop_ticks % 10 != 0:
+                    continue
+
+                # 2. Flush DuckDB buffer periodically
+                self.store.flush_ticks()
 
                 # 3. Dynamic option rotation if ATM shifted
                 self.check_and_rotate_options()

@@ -78,16 +78,19 @@ class TechnicalCandidate:
     target_2_rr: float = 2.0
     headroom_points: Optional[float] = None
     timeframe_breakdown: Dict[str, Any] = field(default_factory=dict)
+    decision_at: Optional[datetime] = None
+    confirmation_status: str = "CONFIRMED"
     is_paper_trading: bool = True
 
     def summary(self) -> str:
         """Formatted human-readable summary of the technical candidate."""
         hd_str = f"{self.headroom_points:.1f}pts" if self.headroom_points is not None else "N/A"
+        dec_str = f" | Decision: {self.decision_at.strftime('%H:%M:%S')} [{self.confirmation_status}]" if self.decision_at else ""
         return (
             f"[{self.candidate_id}] {self.symbol} {self.direction.value} @ {self.entry_price:.2f} | "
             f"SL: {self.stop_loss:.2f} | T1: {self.target_1:.2f} ({self.target_1_rr:.2f}R) | "
             f"T2: {self.target_2:.2f} ({self.target_2_rr:.2f}R) | "
-            f"Risk: {self.risk_points:.1f}pts | Headroom: {hd_str} | Score: {self.confluence_score:.0f}/100"
+            f"Risk: {self.risk_points:.1f}pts | Headroom: {hd_str} | Score: {self.confluence_score:.0f}/100{dec_str}"
         )
 
 
@@ -104,6 +107,7 @@ class Active5mSetup:
     headroom_points: Optional[float] = None
     opposing_zone: Optional[PriceZone] = None
     state: SetupLifecycleState = SetupLifecycleState.WAITING_ENTRY
+    confirmation_status: str = "CONFIRMED"
     invalidation_reason: Optional[str] = None
 
 
@@ -163,7 +167,12 @@ class MultiTimeframeAnalyzer:
                         avail_at or snap_5m.effective_available_at,
                         snap_15m.effective_available_at,
                     )
-                    self._qualify_5m_setup(setup, snap_5m, available_at=combined_available_at)
+                    self._qualify_5m_setup(
+                        setup,
+                        snap_5m,
+                        available_at=combined_available_at,
+                        confirmation_status="CONFIRMED",
+                    )
 
     def expire_pending_5m_setups(
         self,
@@ -179,7 +188,12 @@ class MultiTimeframeAnalyzer:
                 elapsed = (as_of_time - snap_5m.bar_close_time).total_seconds()
                 if elapsed >= timeout_seconds or as_of_time.date() > snap_5m.bar_close_time.date():
                     del self._pending_5m_setups[sid]
-                    self._qualify_5m_setup(setup, snap_5m, available_at=avail_at or snap_5m.bar_close_time)
+                    self._qualify_5m_setup(
+                        setup,
+                        snap_5m,
+                        available_at=as_of_time,
+                        confirmation_status="TIMED_OUT",
+                    )
 
     def on_5m_setup(
         self,
@@ -203,13 +217,14 @@ class MultiTimeframeAnalyzer:
                     self._pending_5m_setups[setup.setup_id] = (setup, snap_5m, actual_available_at)
                     return None
 
-            return self._qualify_5m_setup(setup, snap_5m, actual_available_at)
+            return self._qualify_5m_setup(setup, snap_5m, actual_available_at, confirmation_status="CONFIRMED")
 
     def _qualify_5m_setup(
         self,
         setup: BreakoutContext,
         snap_5m: TechnicalSnapshot,
         available_at: datetime,
+        confirmation_status: str = "CONFIRMED",
     ) -> Optional[Active5mSetup]:
         """Core Tier 1 qualification evaluating 15m macro trend and headroom."""
         bar_close = snap_5m.bar_close_time
@@ -276,6 +291,7 @@ class MultiTimeframeAnalyzer:
             headroom_points=headroom_points,
             opposing_zone=opposing_zone,
             state=SetupLifecycleState.WAITING_ENTRY,
+            confirmation_status=confirmation_status,
         )
         self.active_setups[setup.setup_id] = active
         return active
@@ -284,22 +300,30 @@ class MultiTimeframeAnalyzer:
         self,
         candle: Candle,
         snap_1m: TechnicalSnapshot,
+        decision_at: Optional[datetime] = None,
+        confirmation_status: str = "CONFIRMED",
     ) -> List[TechnicalCandidate]:
         """Tier 3: Precision entry timing and candidate generation on 1m candle close."""
         with self._lock:
             self._check_session_rollover(candle.timestamp)
 
             candle_close_time = get_bar_close_time(candle.timestamp, "1m")
+            effective_decision_at = decision_at or max(candle_close_time, snap_1m.effective_available_at)
 
             # Flush pending simultaneous 5m setups ONLY for THIS symbol whose 15m candle did not arrive before 1m tick
             for sid, (setup, snap_5m, avail_at) in list(self._pending_5m_setups.items()):
                 if setup.symbol == candle.symbol and candle_close_time > snap_5m.bar_close_time:
                     del self._pending_5m_setups[sid]
-                    self._qualify_5m_setup(setup, snap_5m, available_at=avail_at or snap_5m.bar_close_time)
+                    self._qualify_5m_setup(
+                        setup,
+                        snap_5m,
+                        available_at=effective_decision_at,
+                        confirmation_status="MISSING_CONFIRMATION",
+                    )
 
             # 1. Purge expired active setups
             for sid, active in list(self.active_setups.items()):
-                if candle_close_time > active.expiry_time or candle.timestamp.date() > active.qualified_time.date():
+                if effective_decision_at > active.expiry_time or candle.timestamp.date() > active.qualified_time.date():
                     active.state = SetupLifecycleState.EXPIRED
                     del self.active_setups[sid]
 
@@ -320,6 +344,8 @@ class MultiTimeframeAnalyzer:
                     snap_1m=snap_1m,
                     active=active,
                     candle_close_time=candle_close_time,
+                    decision_at=effective_decision_at,
+                    confirmation_status=confirmation_status,
                 )
 
                 if candidate:
@@ -340,6 +366,7 @@ class MultiTimeframeAnalyzer:
         price: float,
         direction: BreakoutDirection,
         as_of: datetime,
+        confirmation_status: str = "CONFIRMED",
     ) -> bool:
         """Verifies price is holding the correct side of VWAP without spot/futures basis distortion."""
         if snap.vwap is not None:
@@ -349,24 +376,18 @@ class MultiTimeframeAnalyzer:
                 return price <= snap.vwap
 
         # Spot index has no traded volume: check paired futures price against paired futures VWAP
-        paired_futures = self.engine.index_futures_map.get(snap.symbol)
-        if paired_futures:
-            fut_state = self.engine.states.get(paired_futures)
-            fut_snap = None
-            if fut_state:
-                cand_snap = fut_state.latest_snapshots.get(snap.timeframe)
-                if cand_snap and cand_snap.timestamp == snap.timestamp:
-                    fut_snap = cand_snap
-            if fut_snap is None:
+        if confirmation_status == "CONFIRMED":
+            paired_futures = self.engine.index_futures_map.get(snap.symbol)
+            if paired_futures:
                 fut_snap = self.engine.get_snapshot(paired_futures, timeframe=snap.timeframe, as_of=as_of)
-            if fut_snap and fut_snap.vwap is not None:
-                max_age = self.max_1m_futures_age_seconds if snap.timeframe == "1m" else self.max_5m_futures_age_seconds
-                age = (as_of - fut_snap.bar_close_time).total_seconds()
-                if age <= max_age:
-                    if direction == BreakoutDirection.BULLISH:
-                        return fut_snap.close >= fut_snap.vwap
-                    else:
-                        return fut_snap.close <= fut_snap.vwap
+                if fut_snap and fut_snap.vwap is not None:
+                    max_age = self.max_1m_futures_age_seconds if snap.timeframe == "1m" else self.max_5m_futures_age_seconds
+                    age = (as_of - fut_snap.bar_close_time).total_seconds()
+                    if age <= max_age:
+                        if direction == BreakoutDirection.BULLISH:
+                            return fut_snap.close >= fut_snap.vwap
+                        else:
+                            return fut_snap.close <= fut_snap.vwap
 
         # No fresh VWAP available on either: does not fail holding check
         return True
@@ -377,9 +398,10 @@ class MultiTimeframeAnalyzer:
         direction: BreakoutDirection,
         timeframe: str,
         as_of: Optional[datetime] = None,
+        confirmation_status: str = "CONFIRMED",
     ) -> bool:
         """Checks if symbol or paired futures confirms VWAP positioning (used for positive scoring)."""
-        cutoff = as_of or snap.bar_close_time
+        cutoff = as_of or snap.effective_available_at
 
         if snap.vwap is not None:
             if direction == BreakoutDirection.BULLISH:
@@ -387,24 +409,18 @@ class MultiTimeframeAnalyzer:
             else:
                 return snap.close <= snap.vwap
 
-        paired_futures = self.engine.index_futures_map.get(snap.symbol)
-        if paired_futures:
-            fut_state = self.engine.states.get(paired_futures)
-            fut_snap = None
-            if fut_state:
-                cand_snap = fut_state.latest_snapshots.get(timeframe)
-                if cand_snap and cand_snap.timestamp == snap.timestamp:
-                    fut_snap = cand_snap
-            if fut_snap is None:
+        if confirmation_status == "CONFIRMED":
+            paired_futures = self.engine.index_futures_map.get(snap.symbol)
+            if paired_futures:
                 fut_snap = self.engine.get_snapshot(paired_futures, timeframe=timeframe, as_of=cutoff)
-            if fut_snap and fut_snap.vwap is not None:
-                max_age = self.max_1m_futures_age_seconds if timeframe == "1m" else self.max_5m_futures_age_seconds
-                age = (cutoff - fut_snap.bar_close_time).total_seconds()
-                if age <= max_age:
-                    if direction == BreakoutDirection.BULLISH:
-                        return fut_snap.close >= fut_snap.vwap
-                    else:
-                        return fut_snap.close <= fut_snap.vwap
+                if fut_snap and fut_snap.vwap is not None:
+                    max_age = self.max_1m_futures_age_seconds if timeframe == "1m" else self.max_5m_futures_age_seconds
+                    age = (cutoff - fut_snap.bar_close_time).total_seconds()
+                    if age <= max_age:
+                        if direction == BreakoutDirection.BULLISH:
+                            return fut_snap.close >= fut_snap.vwap
+                        else:
+                            return fut_snap.close <= fut_snap.vwap
 
         return False
 
@@ -414,10 +430,13 @@ class MultiTimeframeAnalyzer:
         snap_1m: TechnicalSnapshot,
         active: Active5mSetup,
         candle_close_time: datetime,
+        decision_at: Optional[datetime] = None,
+        confirmation_status: str = "CONFIRMED",
     ) -> Optional[TechnicalCandidate]:
         """Validates 1m execution criteria, optimizes stop loss, and calculates confluence score."""
         setup = active.setup
         nominal_lvl = setup.nominal_price
+        decision_time = decision_at or max(candle_close_time, snap_1m.effective_available_at)
 
         # 1. Intrabar & Close Stop-Loss Breach Check: hard invalidation boundary
         base_sl = setup.stop_loss if setup.stop_loss is not None else (
@@ -446,13 +465,13 @@ class MultiTimeframeAnalyzer:
                 active.invalidation_reason = f"1m close {candle.close:.2f} failed to hold breakdown level {nominal_lvl:.2f}"
                 return None
 
-        # 3. Revalidate 15m Macro Context as of entry candle close
-        snap_15m = self.engine.get_snapshot(setup.symbol, timeframe="15m", as_of=candle_close_time)
+        # 3. Revalidate 15m Macro Context as of decision_time
+        snap_15m = self.engine.get_snapshot(setup.symbol, timeframe="15m", as_of=decision_time)
         if not snap_15m:
             return None
 
         # Freshness: snapshot must be from current session and within max_15m_macro_age_seconds
-        age_15m = (candle_close_time - snap_15m.bar_close_time).total_seconds()
+        age_15m = (decision_time - snap_15m.bar_close_time).total_seconds()
         if age_15m > self.max_15m_macro_age_seconds or snap_15m.timestamp.date() != candle.timestamp.date():
             return None
 
@@ -477,8 +496,8 @@ class MultiTimeframeAnalyzer:
             if not candle_momentum_ok:
                 return None
 
-            # VWAP filter: price or paired futures must not be below VWAP
-            if not self._evaluate_vwap_holding(snap_1m, candle.close, BreakoutDirection.BULLISH, candle_close_time):
+            # VWAP filter: price or paired futures must not be below VWAP as of decision_time
+            if not self._evaluate_vwap_holding(snap_1m, candle.close, BreakoutDirection.BULLISH, as_of=decision_time, confirmation_status=confirmation_status):
                 return None
 
             # Overbought RSI exhaustion filter
@@ -494,8 +513,8 @@ class MultiTimeframeAnalyzer:
             if not candle_momentum_ok:
                 return None
 
-            # VWAP filter: price or paired futures must not be above VWAP
-            if not self._evaluate_vwap_holding(snap_1m, candle.close, BreakoutDirection.BEARISH, candle_close_time):
+            # VWAP filter: price or paired futures must not be above VWAP as of decision_time
+            if not self._evaluate_vwap_holding(snap_1m, candle.close, BreakoutDirection.BEARISH, as_of=decision_time, confirmation_status=confirmation_status):
                 return None
 
             # Oversold RSI exhaustion filter
@@ -585,13 +604,14 @@ class MultiTimeframeAnalyzer:
             snap_15m=snap_15m,
             direction=setup.direction,
             headroom_points=live_headroom,
-            entry_time=candle_close_time,
+            as_of=decision_time,
+            confirmation_status=confirmation_status,
         )
 
         if score < self.min_confluence_score:
             return None
 
-        # 8. Build Candidate
+        # 8. Build Candidate with authentic decision_at and confirmation_status
         ts_str = candle.timestamp.strftime("%Y%m%d_%H%M%S")
         candidate_id = f"{setup.symbol.replace(':', '_')}_{ts_str}_{setup.direction.value}_{setup.level_id}"
 
@@ -617,12 +637,16 @@ class MultiTimeframeAnalyzer:
             target_1_rr=t1_rr,
             target_2_rr=t2_rr,
             headroom_points=round(live_headroom, 1) if live_headroom is not None else None,
+            decision_at=decision_time,
+            confirmation_status=confirmation_status,
             timeframe_breakdown={
                 "15m_trend": snap_15m.trend_bias,
                 "5m_rvol": active.snapshot_5m.rvol,
                 "5m_vwap": active.snapshot_5m.vwap,
                 "1m_rsi": snap_1m.rsi,
                 "1m_vwap": snap_1m.vwap,
+                "decision_at": decision_time.isoformat(),
+                "confirmation_status": confirmation_status,
             },
             is_paper_trading=True,
         )
@@ -637,13 +661,16 @@ class MultiTimeframeAnalyzer:
         snap_15m: Optional[TechnicalSnapshot],
         direction: BreakoutDirection,
         headroom_points: Optional[float],
-        entry_time: datetime,
+        as_of: Optional[datetime] = None,
+        entry_time: Optional[datetime] = None,
+        confirmation_status: str = "CONFIRMED",
     ) -> float:
         """Calculates 0-100 composite score across all three timeframes.
 
         Strict zero-tolerance scoring: Missing or unknown data receives 0 points.
         """
         score = 0.0
+        decision_time = as_of or entry_time or snap_1m.effective_available_at
 
         # 1. 15m Macro Trend Alignment (max +30 pts, missing/insufficient = +0 pts)
         if snap_15m and snap_15m.trend_bias != "INSUFFICIENT_DATA":
@@ -671,9 +698,9 @@ class MultiTimeframeAnalyzer:
             score += 15.0
 
         # 3. VWAP Positioning (max +20 pts, missing = +0 pts)
-        if self._evaluate_vwap_alignment(snap_5m, direction, "5m", as_of=snap_5m.bar_close_time):
+        if self._evaluate_vwap_alignment(snap_5m, direction, "5m", as_of=snap_5m.effective_available_at, confirmation_status=confirmation_status):
             score += 10.0
-        if self._evaluate_vwap_alignment(snap_1m, direction, "1m", as_of=entry_time):
+        if self._evaluate_vwap_alignment(snap_1m, direction, "1m", as_of=decision_time, confirmation_status=confirmation_status):
             score += 10.0
 
         # 4. 15m Headroom (max +15 pts, unknown/missing ATR/inadequate = +0 pts)
