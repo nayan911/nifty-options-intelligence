@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from pathlib import Path
+import threading
 from typing import Any, List, Optional, Union
 
 import duckdb
@@ -34,30 +35,42 @@ class DuckDBStore(IStorageEngine):
 
         self.batch_size = batch_size
         self._tick_buffer: List[Tick] = []
+        self._lock = threading.Lock()
         self._conn = duckdb.connect(self.db_path)
         self._init_schemas()
 
     def _init_schemas(self) -> None:
         """Create tables and indexes if they do not exist."""
-        self._conn.execute(CREATE_TABLES_SQL)
+        with self._lock:
+            self._conn.cursor().execute(CREATE_TABLES_SQL)
 
     def insert_tick(self, tick: Tick) -> None:
         """Buffer a single tick for high-throughput single-writer batch insert."""
-        self._tick_buffer.append(tick)
-        if len(self._tick_buffer) >= self.batch_size:
-            self.flush_ticks()
+        with self._lock:
+            self._tick_buffer.append(tick)
+            if len(self._tick_buffer) >= self.batch_size:
+                self._flush_ticks_unlocked()
 
     def flush_ticks(self) -> int:
-        """Flush buffered ticks into DuckDB in a single batch."""
+        """Flush buffered ticks into DuckDB thread-safely."""
+        with self._lock:
+            return self._flush_ticks_unlocked()
+
+    def _flush_ticks_unlocked(self) -> int:
+        """Internal flush assuming self._lock is already held."""
         if not self._tick_buffer:
             return 0
         batch = list(self._tick_buffer)
         self._tick_buffer.clear()
-        self.insert_ticks_bulk(batch)
+        self._insert_ticks_bulk_unlocked(batch)
         return len(batch)
 
     def insert_ticks_bulk(self, ticks: List[Tick]) -> None:
-        """High-performance bulk insert of ticks via Apache Arrow / Pandas DataFrame."""
+        """High-performance bulk insert of ticks."""
+        with self._lock:
+            self._insert_ticks_bulk_unlocked(ticks)
+
+    def _insert_ticks_bulk_unlocked(self, ticks: List[Tick]) -> None:
         if not ticks:
             return
 
@@ -78,31 +91,33 @@ class DuckDBStore(IStorageEngine):
             for t in ticks
         ]
         df = pd.DataFrame(data)
-        self._conn.register("ticks_staging", df)
-        self._conn.execute("INSERT INTO ticks SELECT * FROM ticks_staging")
-        self._conn.unregister("ticks_staging")
+        # DuckDB directly queries local DataFrame 'df' via cursor without register/unregister contention
+        cur = self._conn.cursor()
+        cur.execute("INSERT INTO ticks SELECT * FROM df")
 
     def insert_candle(self, candle: Candle) -> None:
         """Upsert a candle (replaces if existing bar with same key is updated)."""
-        self._conn.execute(
-            """
-            INSERT OR REPLACE INTO candles (
-                symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                candle.symbol,
-                candle.timeframe,
-                candle.timestamp,
-                candle.open,
-                candle.high,
-                candle.low,
-                candle.close,
-                candle.volume,
-                candle.oi,
-                candle.is_closed,
-            ]
-        )
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO candles (
+                    symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    candle.symbol,
+                    candle.timeframe,
+                    candle.timestamp,
+                    candle.open,
+                    candle.high,
+                    candle.low,
+                    candle.close,
+                    candle.volume,
+                    candle.oi,
+                    candle.is_closed,
+                ]
+            )
 
     def get_candles(
         self,
@@ -118,7 +133,9 @@ class DuckDBStore(IStorageEngine):
             WHERE symbol = ? AND timeframe = ? AND timestamp >= ? AND timestamp <= ?
             ORDER BY timestamp ASC
         """
-        rows = self._conn.execute(query, [symbol, timeframe, start_time, end_time]).fetchall()
+        with self._lock:
+            cur = self._conn.cursor()
+            rows = cur.execute(query, [symbol, timeframe, start_time, end_time]).fetchall()
         return [
             Candle(
                 symbol=r[0],
@@ -159,7 +176,9 @@ class DuckDBStore(IStorageEngine):
             WHERE {where_clause}
             ORDER BY local_timestamp ASC
         """
-        rows = self._conn.execute(query, params).fetchall()
+        with self._lock:
+            cur = self._conn.cursor()
+            rows = cur.execute(query, params).fetchall()
         return [
             Tick(
                 symbol=r[0],
@@ -208,34 +227,15 @@ class DuckDBStore(IStorageEngine):
         if end_time:
             params.append(end_time)
 
-        return self._conn.execute(query, params).df()
+        with self._lock:
+            cur = self._conn.cursor()
+            return cur.execute(query, params).df()
 
     def save_option_chain_snapshot(self, snapshot: OptionChainSnapshot) -> None:
         """Store header and strike-level details of an option chain snapshot."""
         import uuid
         snap_id = str(uuid.uuid4())
 
-        # Insert header using api_timestamp
-        self._conn.execute(
-            """
-            INSERT INTO option_chain_snapshots (
-                snapshot_id, underlying, spot_price, timestamp, expiry,
-                total_call_oi, total_put_oi, pcr
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                snap_id,
-                snapshot.underlying,
-                snapshot.spot_price,
-                snapshot.api_timestamp,
-                snapshot.expiry,
-                snapshot.total_call_oi,
-                snapshot.total_put_oi,
-                snapshot.pcr,
-            ]
-        )
-
-        # Bulk insert strikes
         rows = []
         for s in snapshot.strikes:
             c = s.call or {}
@@ -254,11 +254,31 @@ class DuckDBStore(IStorageEngine):
                 "put_delta": p.get("delta"),
                 "put_theta": p.get("theta"),
             })
-        if rows:
-            df = pd.DataFrame(rows)
-            self._conn.register("strikes_staging", df)
-            self._conn.execute("INSERT INTO option_chain_strikes SELECT * FROM strikes_staging")
-            self._conn.unregister("strikes_staging")
+
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO option_chain_snapshots (
+                    snapshot_id, underlying, spot_price, timestamp, expiry,
+                    total_call_oi, total_put_oi, pcr
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    snap_id,
+                    snapshot.underlying,
+                    snapshot.spot_price,
+                    snapshot.api_timestamp,
+                    snapshot.expiry,
+                    snapshot.total_call_oi,
+                    snapshot.total_put_oi,
+                    snapshot.pcr,
+                ]
+            )
+
+            if rows:
+                df = pd.DataFrame(rows)
+                cur.execute("INSERT INTO option_chain_strikes SELECT * FROM df")
 
     def close(self) -> None:
         """Flush any pending buffered ticks and close connection."""

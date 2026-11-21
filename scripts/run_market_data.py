@@ -97,19 +97,21 @@ class MarketDataEngine:
     def _get_initial_spot(self) -> float:
         """Determines best reference NIFTY spot price from database or fallback."""
         try:
-            res = self.store._conn.execute(
-                "SELECT close FROM candles WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1",
-                [settings.PRIMARY_INDEX],
-            ).fetchone()
-            if res and res[0] > 0:
-                return float(res[0])
+            with self.store._lock:
+                cur = self.store._conn.cursor()
+                res = cur.execute(
+                    "SELECT close FROM candles WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1",
+                    [settings.PRIMARY_INDEX],
+                ).fetchall()
+                if res and res[0][0] > 0:
+                    return float(res[0][0])
 
-            res_tick = self.store._conn.execute(
-                "SELECT ltp FROM ticks WHERE symbol = ? ORDER BY local_timestamp DESC LIMIT 1",
-                [settings.PRIMARY_INDEX],
-            ).fetchone()
-            if res_tick and res_tick[0] > 0:
-                return float(res_tick[0])
+                res_tick = cur.execute(
+                    "SELECT ltp FROM ticks WHERE symbol = ? ORDER BY local_timestamp DESC LIMIT 1",
+                    [settings.PRIMARY_INDEX],
+                ).fetchall()
+                if res_tick and res_tick[0][0] > 0:
+                    return float(res_tick[0][0])
         except Exception:
             pass
         return 24100.0
