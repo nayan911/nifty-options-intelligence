@@ -456,3 +456,256 @@ def test_multi_timeframe_snapshots_retained():
     assert snap_1m is not None and snap_1m.timeframe == "1m" and snap_1m.close == 25005.0
     assert snap_5m is not None and snap_5m.timeframe == "5m" and snap_5m.close == 25040.0
     assert snap_15m is not None and snap_15m.timeframe == "15m" and snap_15m.close == 25070.0
+
+
+def test_15m_market_structure_provisional_and_confirmed():
+    """Verify 15-minute market structure analysis:
+    1. Early session returns is_provisional=True with structural level trend bias.
+    2. After 21 candles, indicator warm-up completes and confirmed trend bias is evaluated.
+    3. 15m Opening Range, daily reference levels, and S/R zones are computed.
+    """
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+    sym = "NSE:NIFTY50-INDEX"
+
+    engine.set_daily_references(
+        symbol=sym,
+        pdh=25100.0,
+        pdl=24900.0,
+        pdc=24950.0,
+        cdo=25000.0,
+    )
+
+    # First 15m candle (09:15-09:30): opens at CDO (25000), rallies to 25050, closes at 25040
+    c1 = Candle(
+        symbol=sym,
+        timeframe="15m",
+        timestamp=base_time,
+        open=25000.0,
+        high=25050.0,
+        low=24980.0,
+        close=25040.0,
+        volume=0,
+        is_closed=True,
+    )
+    snap1 = engine.on_candle(c1)
+    assert snap1.timeframe == "15m"
+    assert snap1.is_warmed_up is False
+    assert snap1.is_provisional is True
+    # Price (25040) > CDO (25000) and > PDC (24950) -> provisional BULLISH
+    assert snap1.trend_bias == "BULLISH"
+    assert snap1.nearest_support is not None or snap1.nearest_resistance is not None
+
+    # Feed 21 more 15m candles in a steady uptrend to warm up EMA 21
+    for i in range(1, 22):
+        c = Candle(
+            symbol=sym,
+            timeframe="15m",
+            timestamp=base_time + timedelta(minutes=15 * i),
+            open=25040.0 + (i * 10),
+            high=25055.0 + (i * 10),
+            low=25035.0 + (i * 10),
+            close=25050.0 + (i * 10),
+            volume=0,
+            is_closed=True,
+        )
+        snap = engine.on_candle(c)
+
+    assert snap.is_warmed_up is True
+    assert snap.is_provisional is False
+    assert snap.ema_9 is not None
+    assert snap.ema_21 is not None
+    assert snap.rsi is not None
+    assert snap.atr is not None
+    assert snap.ema_9 > snap.ema_21
+    assert snap.trend_bias == "BULLISH"
+
+
+def test_5m_setup_analysis_indicators_and_vwap():
+    """Verify 5-minute setup analysis:
+    1. EMA 9/21/50, RSI 14, ATR 14, and futures VWAP calculations.
+    2. 5m RVOL computation from 5m volume history.
+    3. Retains 5m snapshot.
+    """
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+    sym = "NSE:NIFTY26NOVFUT"
+
+    # Feed 22 5m candles with realistic prices and volumes
+    for i in range(22):
+        c = Candle(
+            symbol=sym,
+            timeframe="5m",
+            timestamp=base_time + timedelta(minutes=5 * i),
+            open=25000.0 + i * 5,
+            high=25015.0 + i * 5,
+            low=24995.0 + i * 5,
+            close=25010.0 + i * 5,
+            volume=5000 + i * 200,
+            is_closed=True,
+        )
+        snap = engine.on_candle(c)
+
+    assert snap.timeframe == "5m"
+    assert snap.is_warmed_up is True
+    assert snap.ema_9 is not None
+    assert snap.ema_21 is not None
+    assert snap.rsi is not None
+    assert snap.atr is not None
+    assert snap.vwap is not None
+    assert snap.vwap_upper is not None
+    assert snap.vwap_lower is not None
+    assert snap.rvol is not None
+
+    state = engine.states[sym]
+    assert state.latest_5m_rvol is not None
+
+
+def test_5m_spot_index_inherits_5m_futures_rvol():
+    """Verify cross-asset pairing on the 5-minute timeframe:
+    Spot index inherits 5m futures RVOL if within 300s window.
+    """
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+
+    # Feed 22 5m candles to futures
+    for i in range(22):
+        engine.on_candle(
+            Candle(
+                symbol="NSE:NIFTY26NOVFUT",
+                timeframe="5m",
+                timestamp=base_time + timedelta(minutes=5 * i),
+                open=25000.0,
+                high=25015.0,
+                low=24995.0,
+                close=25010.0,
+                volume=10000,
+                is_closed=True,
+            )
+        )
+
+    # 1. Spot candle at same 5m timestamp (delta = 0) inherits 5m futures RVOL
+    spot_candle = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        timestamp=base_time + timedelta(minutes=5 * 21),
+        open=25000.0,
+        high=25020.0,
+        low=24990.0,
+        close=25015.0,
+        volume=0,
+        is_closed=True,
+    )
+    snap = engine.on_candle(spot_candle)
+    assert snap.rvol is not None
+
+    # 2. Spot candle timestamped > 300s after latest futures does NOT inherit stale RVOL
+    stale_spot_candle = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="5m",
+        timestamp=base_time + timedelta(minutes=5 * 21 + 6),  # 360 seconds later
+        open=25015.0,
+        high=25025.0,
+        low=25000.0,
+        close=25020.0,
+        volume=0,
+        is_closed=True,
+    )
+    stale_snap = engine.on_candle(stale_spot_candle)
+    assert stale_snap.rvol is None
+
+
+def test_5m_breakout_state_machine_isolation_and_callback():
+    """Verify that 5m breakout state machine:
+    1. Operates independently from 1m breakout state machine.
+    2. Detects breakout and retest across 5m resistance.
+    3. Triggers candidate notification callback with timeframe="5m".
+    """
+    candidates = []
+
+    def on_cand(setup: BreakoutContext, snap: TechnicalSnapshot):
+        candidates.append((setup, snap))
+
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+        on_setup_candidate=on_cand,
+    )
+    base_time = IST.localize(datetime(2026, 11, 23, 9, 15))
+    sym = "NSE:NIFTY26NOVFUT"
+
+    engine.set_daily_references(
+        symbol=sym,
+        pdh=25100.0,
+        pdl=24900.0,
+        pdc=25000.0,
+        cdo=25020.0,
+    )
+
+    # 1. Warm up with 22 5m bars below resistance (25080)
+    for i in range(22):
+        engine.on_candle(
+            Candle(
+                symbol=sym,
+                timeframe="5m",
+                timestamp=base_time + timedelta(minutes=5 * i),
+                open=25070.0,
+                high=25085.0,
+                low=25065.0,
+                close=25080.0,
+                volume=2000,
+                is_closed=True,
+            )
+        )
+
+    # 2. 5m Breakout candle with high volume surge (RVOL > 1.3x)
+    engine.on_candle(
+        Candle(
+            symbol=sym,
+            timeframe="5m",
+            timestamp=base_time + timedelta(minutes=5 * 22),
+            open=25085.0,
+            high=25125.0,
+            low=25080.0,
+            close=25120.0,
+            volume=8000,
+            is_closed=True,
+        )
+    )
+
+    # 3. 5m Retest bar: price dips to test 25100, closes green at 25110
+    engine.on_candle(
+        Candle(
+            symbol=sym,
+            timeframe="5m",
+            timestamp=base_time + timedelta(minutes=5 * 23),
+            open=25105.0,
+            high=25115.0,
+            low=25098.0,
+            close=25110.0,
+            volume=3000,
+            is_closed=True,
+        )
+    )
+
+    assert len(candidates) >= 1
+    setup, snap = candidates[0]
+    assert setup.current_state == BreakoutState.SETUP_ELIGIBLE
+    assert setup.direction == BreakoutDirection.BULLISH
+    assert snap.timeframe == "5m"
+    assert setup.stop_loss is not None
+    assert setup.target_price is not None
+
+    # Invariant: 1m active breakouts must be completely empty/unaffected!
+    state = engine.states[sym]
+    assert len(state.active_breakouts_1m) == 0
+
