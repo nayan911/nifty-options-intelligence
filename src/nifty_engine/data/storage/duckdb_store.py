@@ -3,7 +3,7 @@
 import shutil
 import threading
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -225,6 +225,131 @@ class DuckDBStore(IStorageEngine):
                     candle.observed_at,
                 ]
             )
+
+    def insert_candles_batch(self, candles: List[Candle]) -> int:
+        """Efficiently batch-inserts candles using DuckDB parameter binding."""
+        if not candles:
+            return 0
+        rows = [
+            (
+                c.symbol,
+                c.timeframe,
+                c.timestamp,
+                c.open,
+                c.high,
+                c.low,
+                c.close,
+                c.volume,
+                c.oi,
+                c.is_closed,
+                c.observed_at,
+            )
+            for c in candles
+        ]
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.executemany(
+                """
+                INSERT OR REPLACE INTO candles (
+                    symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def get_latest_candle_timestamp(self, symbol: str, timeframe: str) -> Optional[datetime]:
+        """Returns the latest candle timestamp for a symbol and timeframe, or None if empty."""
+        query = """
+            SELECT MAX(timestamp)
+            FROM candles
+            WHERE symbol = ? AND timeframe = ? AND is_closed = TRUE
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            res = cur.execute(query, [symbol, timeframe]).fetchone()
+            if res and res[0] is not None:
+                ts = res[0]
+                if isinstance(ts, datetime):
+                    return ts
+        return None
+
+    def get_latest_completed_daily_candle(self, symbol: str, before_date: date) -> Optional[Candle]:
+        """Returns the latest completed Daily candle strictly before the given date."""
+        query = """
+            SELECT symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed, observed_at
+            FROM candles
+            WHERE symbol = ? AND timeframe IN ('D', '1D', 'd') AND CAST(timestamp AS DATE) < ? AND is_closed = TRUE
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            row = cur.execute(query, [symbol, before_date]).fetchone()
+            if row:
+                return Candle(
+                    symbol=row[0],
+                    timeframe=row[1],
+                    timestamp=row[2],
+                    open=row[3],
+                    high=row[4],
+                    low=row[5],
+                    close=row[6],
+                    volume=row[7],
+                    oi=row[8],
+                    is_closed=row[9],
+                    observed_at=row[10],
+                )
+        return None
+
+    def get_recent_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 100,
+        as_of: Optional[datetime] = None,
+    ) -> List[Candle]:
+        """Queries the N most recent candles up to as_of, returned in ascending chronological order."""
+        if as_of is None:
+            query = """
+                SELECT symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed, observed_at
+                FROM candles
+                WHERE symbol = ? AND timeframe = ? AND is_closed = TRUE
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """
+            params = [symbol, timeframe, limit]
+        else:
+            query = """
+                SELECT symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed, observed_at
+                FROM candles
+                WHERE symbol = ? AND timeframe = ? AND timestamp <= ? AND is_closed = TRUE
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """
+            params = [symbol, timeframe, as_of, limit]
+        with self._lock:
+            cur = self._conn.cursor()
+            rows = cur.execute(query, params).fetchall()
+
+        candles = [
+            Candle(
+                symbol=r[0],
+                timeframe=r[1],
+                timestamp=r[2],
+                open=r[3],
+                high=r[4],
+                low=r[5],
+                close=r[6],
+                volume=r[7],
+                oi=r[8],
+                is_closed=r[9],
+                observed_at=r[10],
+            )
+            for r in rows
+        ]
+        candles.reverse()
+        return candles
 
     def get_candles(
         self,

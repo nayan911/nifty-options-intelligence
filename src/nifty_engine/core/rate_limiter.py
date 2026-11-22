@@ -1,6 +1,7 @@
 """Centralized Token Bucket Rate Limiter for FYERS Standard API compliance."""
 
 import asyncio
+import threading
 import time
 
 from nifty_engine.core.config import settings
@@ -39,6 +40,49 @@ class AsyncTokenBucketRateLimiter(IRateLimiter):
         self.daily_reset_epoch = time.time()
 
         self._lock = asyncio.Lock()
+        self._sync_lock = threading.Lock()
+
+    def acquire_sync(self) -> None:
+        """Synchronously wait until a request token is available in all windows."""
+        with self._sync_lock:
+            while True:
+                now = time.monotonic()
+                wall_now = time.time()
+
+                if wall_now - self.daily_reset_epoch >= 86400:
+                    self.daily_requests_count = 0
+                    self.daily_reset_epoch = wall_now
+
+                if self.daily_requests_count >= self.max_daily_requests:
+                    raise RuntimeError(
+                        f"FYERS Daily API budget exhausted ({self.daily_requests_count}/{self.max_daily_requests}). "
+                        "Halted to prevent 24-hour account lockout."
+                    )
+
+                elapsed_sec = now - self.last_sec_refill
+                self.sec_tokens = min(self.sec_capacity, self.sec_tokens + elapsed_sec * self.rate_per_sec)
+                self.last_sec_refill = now
+
+                cutoff_time = now - 60.0
+                self.minute_timestamps = [t for t in self.minute_timestamps if t > cutoff_time]
+
+                has_sec_token = self.sec_tokens >= 1.0
+                has_min_token = len(self.minute_timestamps) < self.rate_per_min
+
+                if has_sec_token and has_min_token:
+                    self.sec_tokens -= 1.0
+                    self.minute_timestamps.append(now)
+                    self.daily_requests_count += 1
+                    return
+
+                sleep_delay = 0.05
+                if not has_min_token and self.minute_timestamps:
+                    oldest = self.minute_timestamps[0]
+                    sleep_delay = max(sleep_delay, (oldest + 60.0) - now + 0.01)
+                elif not has_sec_token:
+                    sleep_delay = max(sleep_delay, (1.0 - self.sec_tokens) / self.rate_per_sec)
+
+                time.sleep(min(sleep_delay, 1.0))
 
     async def acquire(self) -> None:
         """Asynchronously wait until a request token is available in all windows."""

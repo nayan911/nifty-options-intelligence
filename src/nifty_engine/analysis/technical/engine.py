@@ -254,12 +254,18 @@ class SymbolTechnicalState:
         futures_rvol: Optional[float] = None,
         awaiting_futures_volume: bool = False,
         on_setup_candidate: Optional[Callable[[BreakoutContext, TechnicalSnapshot], None]] = None,
+        is_bootstrap: bool = False,
     ) -> TechnicalSnapshot:
         """Routes candle strictly to its corresponding timeframe handler."""
-        if not self._check_session_rollover(candle.timestamp):
+        if not is_bootstrap and not self._check_session_rollover(candle.timestamp):
             # Candle belongs to a past trading date: strictly reject!
             self.last_candle_accepted[candle.timeframe] = False
             return self.latest_snapshots.get(candle.timeframe) or self._create_generic_snapshot(candle)
+
+        if is_bootstrap:
+            candle_date = candle.timestamp.date()
+            if self.current_session_date is None or candle_date > self.current_session_date:
+                self.current_session_date = candle_date
 
         # Monotonic timestamp validation: reject duplicate or out-of-order candles
         last_ts = self.latest_candle_timestamps.get(candle.timeframe)
@@ -1276,7 +1282,49 @@ class TechnicalAnalysisEngine:
             state = self._get_or_create_state(symbol, is_index="INDEX" in symbol)
             state.set_daily_references(pdh=pdh, pdl=pdl, pdc=pdc, cdo=cdo)
 
-    def on_candle(self, candle: Candle) -> Optional[TechnicalSnapshot]:
+    def prepare_session(self, session_date: date) -> None:
+        """Explicitly initializes a new trading session date across all symbol states."""
+        with self._lock:
+            for state in self.states.values():
+                if state.current_session_date is None or session_date > state.current_session_date:
+                    state.current_session_date = session_date
+                    state.session_open_price = None
+                    state.daily_reference_levels = None
+                    state.active_breakouts_1m.clear()
+                    state.active_breakouts_5m.clear()
+                    state.notified_setup_ids.clear()
+                    state.latest_1m_rvol = None
+                    state.latest_1m_rvol_timestamp = None
+                    state.latest_5m_rvol = None
+                    state.latest_5m_rvol_timestamp = None
+                    state.latest_candle_timestamps.clear()
+                    state._pending_breakout_eval.clear()
+
+    def bootstrap_candles(self, candles: List[Candle]) -> int:
+        """Bootstraps technical indicators, moving averages, and swings with historical candles.
+
+        STRICT TRADING SAFETY GUARDS:
+        1. Suppresses setup candidate and trade notifications (is_bootstrap=True).
+        2. Bypasses live session bounds check during historical replay.
+        3. Sets indicators to warmed up when sufficient history is processed.
+        """
+        if not candles:
+            return 0
+
+        # Sort ascending chronologically
+        sorted_candles = sorted(candles, key=lambda c: (c.timestamp, c.timeframe))
+        bootstrapped_count = 0
+
+        for c in sorted_candles:
+            if not c.is_closed:
+                continue
+            snap = self.on_candle(c, is_bootstrap=True)
+            if snap is not None:
+                bootstrapped_count += 1
+
+        return bootstrapped_count
+
+    def on_candle(self, candle: Candle, is_bootstrap: bool = False) -> Optional[TechnicalSnapshot]:
         """Dispatches closed candle with strict timeframe routing and synchronized volume freshness checks."""
         # Strictly reject unclosed candles
         if not candle.is_closed:
@@ -1286,8 +1334,8 @@ class TechnicalAnalysisEngine:
             is_idx = ("INDEX" in candle.symbol) or (candle.symbol in self.index_futures_map)
             state = self._get_or_create_state(candle.symbol, is_index=is_idx)
 
-            # Reject older trading dates before modifying state or forwarding to derivatives
-            if state.current_session_date is not None and candle.timestamp.date() < state.current_session_date:
+            # Reject older trading dates before modifying state or forwarding to derivatives (unless bootstrapping)
+            if not is_bootstrap and state.current_session_date is not None and candle.timestamp.date() < state.current_session_date:
                 return state.latest_snapshots.get(candle.timeframe) or state._create_generic_snapshot(candle)
 
             # Phase 3A: Update derivatives futures positioning if candle has OI
@@ -1322,11 +1370,13 @@ class TechnicalAnalysisEngine:
                     if fut_rvol_ts is None or (0 <= (candle.timestamp - fut_rvol_ts).total_seconds() <= interval_secs):
                         awaiting_futures_volume = True
 
+            dispatch_cb = None if is_bootstrap else self._dispatch_setup_candidate
             snapshot = state.process_candle(
                 candle=candle,
                 futures_rvol=futures_rvol,
                 awaiting_futures_volume=awaiting_futures_volume,
-                on_setup_candidate=self._dispatch_setup_candidate,
+                on_setup_candidate=dispatch_cb,
+                is_bootstrap=is_bootstrap,
             )
 
             # 2. Futures Candle: Check if paired spot index arrived earlier and was awaiting volume
@@ -1366,7 +1416,7 @@ class TechnicalAnalysisEngine:
                                 futures_rvol=fut_rvol,
                                 futures_timestamp=candle.timestamp,
                                 futures_observed_at=candle.observed_at,
-                                on_setup_candidate=self._dispatch_setup_candidate,
+                                on_setup_candidate=dispatch_cb,
                             )
                     elif candle.timestamp > pending_spot_candle.timestamp:
                         # Futures candle has progressed to a future interval!
@@ -1376,12 +1426,13 @@ class TechnicalAnalysisEngine:
                             timeframe=candle.timeframe,
                             futures_rvol=None,
                             futures_observed_at=candle.observed_at,
-                            on_setup_candidate=self._dispatch_setup_candidate,
+                            on_setup_candidate=dispatch_cb,
                         )
 
-            # 3. Phase C: Synchronized precision entry evaluation for 1m candle close
+            # 3. Phase C: Synchronized precision entry evaluation for 1m candle close (skip during bootstrap)
             if (
-                snapshot
+                not is_bootstrap
+                and snapshot
                 and candle.timeframe == "1m"
                 and self.multi_timeframe_analyzer
                 and state.last_candle_accepted.get("1m", False)

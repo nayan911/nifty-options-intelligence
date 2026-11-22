@@ -74,7 +74,51 @@ class FyersRestClient:
                 Candle(
                     symbol=symbol,
                     timeframe=f"{resolution}m" if resolution.isdigit() else resolution,
-                    timestamp=datetime.fromtimestamp(c[0]),
+                    timestamp=datetime.fromtimestamp(c[0], tz=IST),
+                    open=float(c[1]),
+                    high=float(c[2]),
+                    low=float(c[3]),
+                    close=float(c[4]),
+                    volume=int(c[5]),
+                    is_closed=True,
+                )
+            )
+        return candles
+
+    def get_historical_candles_sync(
+        self,
+        symbol: str,
+        resolution: str = "1",
+        date_from: str = "",
+        date_to: str = "",
+    ) -> List[Candle]:
+        """Synchronously fetch historical candles via FYERS SDK with rate limiting."""
+        self.rate_limiter.acquire_sync()
+
+        data = {
+            "symbol": symbol,
+            "resolution": resolution,
+            "date_format": "1",
+            "range_from": date_from,
+            "range_to": date_to,
+            "cont_flag": "1",
+        }
+
+        client = self._get_client()
+        response = client.history(data=data)
+
+        if not response or response.get("s") != "ok":
+            error_msg = response.get("message", "Error fetching historical data") if response else "Empty response"
+            raise RuntimeError(f"FYERS Historical Data Error ({symbol}): {error_msg}")
+
+        raw_candles = response.get("candles", [])
+        candles = []
+        for c in raw_candles:
+            candles.append(
+                Candle(
+                    symbol=symbol,
+                    timeframe=f"{resolution}m" if resolution.isdigit() else resolution,
+                    timestamp=datetime.fromtimestamp(c[0], tz=IST),
                     open=float(c[1]),
                     high=float(c[2]),
                     low=float(c[3]),

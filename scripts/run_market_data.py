@@ -33,6 +33,7 @@ from nifty_engine.data.fyers.auth import FyersAuthProvider
 from nifty_engine.data.fyers.instrument_master import FyersInstrumentMaster
 from nifty_engine.data.fyers.rest_client import FyersRestClient
 from nifty_engine.data.fyers.websocket_client import FyersWebSocketClient
+from nifty_engine.data.historical_manager import HistoricalCandleManager
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.data.tick_normalizer import TickNormalizer, TickStatus
 from nifty_engine.paper_trading.engine import PaperTradingEngine
@@ -53,6 +54,11 @@ class MarketDataEngine:
         self.master = FyersInstrumentMaster()
         self.normalizer = TickNormalizer(self.calendar)
         self.rest_client = FyersRestClient(self.auth)
+        self.historical_manager = HistoricalCandleManager(
+            rest_client=self.rest_client,
+            store=self.store,
+            calendar=self.calendar,
+        )
         self.running = True
 
         self.builder = RealtimeCandleBuilder(on_candle_close=self._on_candle_closed)
@@ -587,6 +593,28 @@ class MarketDataEngine:
             print("[OK] Instrument Master loaded (NSE_FO.csv).")
         except Exception as e:
             print(f"[WARN] Master load: {e}")
+
+        # Pre-Market Historical Backfill & Technical Warmup
+        print("\n[PRE-MARKET WARMUP] Initializing Historical Candle Manager...")
+        try:
+            core_tracked = [settings.PRIMARY_INDEX, self.technical_engine.primary_futures]
+            print(f"[PRE-MARKET WARMUP] Syncing recent Daily, 15m, and 5m bars for {core_tracked}...")
+            self.historical_manager.sync_pre_market_data(core_tracked)
+
+            print("[PRE-MARKET WARMUP] Seeding prior day levels and bootstrapping indicators...")
+            warmup_res = self.historical_manager.warm_up_technical_engine(
+                engine=self.technical_engine,
+                symbols=core_tracked,
+            )
+            for sym, info in warmup_res.items():
+                levels = info.get("daily_levels")
+                lvl_str = f"PDH: {levels['PDH']}, PDL: {levels['PDL']}, PDC: {levels['PDC']}" if levels else "None"
+                print(
+                    f"  - {sym}: Seeded {lvl_str} | Bootstrapped {info.get('bootstrapped_candles', 0)} bars | "
+                    f"5m Status: {'READY' if info.get('is_5m_warmed_up') else 'WARMING_UP'}"
+                )
+        except Exception as e:
+            print(f"[WARN] Pre-market warmup encountered exception: {e}")
 
         watchlist = self._build_watchlist()
         print(f"\nSubscribing to dynamic watchlist ({len(watchlist)} symbols within 100 quota):")
