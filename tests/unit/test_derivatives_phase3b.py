@@ -798,3 +798,46 @@ def test_contract_selector_rejects_partially_populated_rest_quotes():
     assert res3 is None
 
 
+def test_contract_selector_derives_midpoint_ltp_when_rest_quote_omits_ltp():
+    """Verify OptionContractSelector derives model LTP from fresh bid/ask midpoint when quote omits LTP."""
+    from datetime import timedelta
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    # Stale chain snapshot (100 seconds old > 30s max age)
+    stale_chain_time = t0 - timedelta(seconds=100)
+    snap = create_phase3b_chain(stale_chain_time)
+    oi_analyzer = OpenInterestAnalyzer()
+    profile = oi_analyzer.on_option_chain(snap)
+
+    # Mock quote provider returning valid contemporaneous bid and ask, but ltp is None
+    def mock_quote_provider_no_ltp(symbol: str):
+        if "25100CE" in symbol:
+            return {
+                "ltp": None,
+                "bid": 94.0,
+                "ask": 96.0,
+                "timestamp": t0 - timedelta(seconds=5),
+            }
+        return None
+
+    selector = OptionContractSelector(
+        quote_provider=mock_quote_provider_no_ltp,
+        max_quote_age_seconds=30.0,
+    )
+    res = selector.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=t0,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res is not None
+    assert res.bid == 94.0
+    assert res.ask == 96.0
+    assert res.ltp == 95.0
+    assert res.is_estimated_ltp is True
+    assert "Model price derived from fresh bid/ask midpoint (estimated LTP)" in res.selection_reasons
+    assert res.to_dict()["is_estimated_ltp"] is True
+
+
+

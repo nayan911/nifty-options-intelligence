@@ -50,6 +50,7 @@ class SelectedContract:
     selection_reasons: List[str]  # Quantitative rationale for selection
     premium_trajectory: PremiumEstimate  # Taylor-expansion premium targets
     execution_costs: ExecutionCosts  # Indian statutory fees and net R:R
+    is_estimated_ltp: bool = False  # True if LTP is estimated from fresh bid/ask midpoint
     bid_size: Optional[int] = None
     ask_size: Optional[int] = None
     quote_timestamp: Optional[datetime] = None
@@ -65,6 +66,7 @@ class SelectedContract:
             "option_type": self.option_type,
             "expiry": self.expiry.isoformat(),
             "ltp": self.ltp,
+            "is_estimated_ltp": self.is_estimated_ltp,
             "bid": self.bid,
             "ask": self.ask,
             "bid_size": self.bid_size,
@@ -282,6 +284,8 @@ class OptionContractSelector:
             if not symbol or not symbol.startswith("NSE:"):
                 continue
 
+            is_estimated_ltp: bool = False
+
             # Check for live quote refresh via quote_provider if supplied
             if self.quote_provider is not None:
                 try:
@@ -298,8 +302,21 @@ class OptionContractSelector:
                         if refreshed_ts is not None and q_bid is not None and q_ask is not None and q_ask >= q_bid:
                             bid = q_bid
                             ask = q_ask
-                            if fresh_q.get("ltp") is not None and float(fresh_q["ltp"]) > 0:
-                                ltp = float(fresh_q["ltp"])
+                            raw_ltp = fresh_q.get("ltp")
+                            if raw_ltp is not None and float(raw_ltp) > 0:
+                                ltp = float(raw_ltp)
+                                is_estimated_ltp = False
+                            else:
+                                # When fresh snapshot omits LTP, use contemporaneous bid/ask midpoint
+                                # as an estimated model price fallback rather than retaining a stale snapshot LTP
+                                ltp = round((q_bid + q_ask) / 2.0, 2)
+                                is_estimated_ltp = True
+                                logger.debug(
+                                    "On-demand quote for %s omits LTP. Derived model price from fresh bid/ask midpoint (₹%.2f)",
+                                    symbol,
+                                    ltp,
+                                )
+
                             if fresh_q.get("bid_size") is not None:
                                 bid_size = int(fresh_q["bid_size"])
                             if fresh_q.get("ask_size") is not None:
@@ -423,6 +440,9 @@ class OptionContractSelector:
                 holding_minutes=hold_mins,
             )
 
+            if is_estimated_ltp:
+                reasons.append("Model price derived from fresh bid/ask midpoint (estimated LTP)")
+
             if score >= self.min_selection_score:
                 contract = SelectedContract(
                     symbol=symbol,
@@ -433,6 +453,7 @@ class OptionContractSelector:
                     ltp=round(mkt_price, 2),
                     bid=bid,
                     ask=ask,
+                    is_estimated_ltp=is_estimated_ltp,
                     bid_size=bid_size,
                     ask_size=ask_size,
                     quote_timestamp=quote_ts,
