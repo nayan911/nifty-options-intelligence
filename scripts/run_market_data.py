@@ -220,8 +220,9 @@ class MarketDataEngine:
             f"({candle.timeframe}) C: {candle.close:.2f} | V: {candle.volume} | Bars Closed: {self.candle_count}"
         )
 
-        # Forward closed candle to paper engine for intrabar high/low breach checks
-        if hasattr(self, "paper_engine"):
+        # Forward closed 1m base candle to paper engine for intrabar high/low breach checks
+        # Restrict strictly to 1m base candles to prevent replaying overlapping multi-timeframe boundaries (e.g. 5m, 15m)
+        if hasattr(self, "paper_engine") and candle.timeframe in ("1m", "1M"):
             try:
                 self.paper_engine.on_candle(candle)
             except Exception as e:
@@ -320,6 +321,7 @@ class MarketDataEngine:
         if hasattr(self, "paper_engine"):
             paper_pos = self.paper_engine.process_technical_candidate(candidate)
             if paper_pos:
+                self.active_paper_trade_symbols.add(paper_pos.symbol)
                 if paper_pos.symbol not in self.subscribed_option_symbols:
                     try:
                         self.ws_client.subscribe([paper_pos.symbol])
@@ -443,6 +445,10 @@ class MarketDataEngine:
 
     def check_and_rotate_options(self) -> None:
         """Dynamically rotates option subscriptions when NIFTY ATM strike shifts."""
+        # Always derive active paper trading symbols directly from engine open positions
+        if hasattr(self, "paper_engine"):
+            self.active_paper_trade_symbols = {p.symbol for p in self.paper_engine.get_open_positions()}
+
         if self.current_spot_price is None or self.active_atm_strike is None:
             return
 

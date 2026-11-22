@@ -17,7 +17,7 @@ from nifty_engine.analysis.derivatives.greeks import OptionGreeks
 from nifty_engine.analysis.derivatives.oi_analysis import DirectionalBias
 from nifty_engine.analysis.technical.breakouts import BreakoutDirection
 from nifty_engine.analysis.technical.multi_timeframe import TechnicalCandidate
-from nifty_engine.core.interfaces import Candle, Tick
+from nifty_engine.core.interfaces import Candle, OptionContract, Tick
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.paper_trading.engine import PaperTradingEngine
 from nifty_engine.paper_trading.models import ExitReason, OrderSide, PositionStatus
@@ -979,6 +979,197 @@ def test_market_data_engine_wires_quote_provider_and_candle_pipeline():
     runner._on_candle_closed(candle)
     assert runner.candle_count == 1
     store.close()
+
+
+def test_candle_timing_prevents_retroactive_trades():
+    """Verify on_candle ignores higher timeframes and bars that started before position entry."""
+    engine = PaperTradingEngine(default_lots=1, slippage_points=0.5)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 10, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        entry_ltp=100.0,
+        ask=100.0,
+        sl_premium=85.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+    assert pos.entry_time == entry_ts
+
+    # 1. 15m candle spanning 10:00 to 10:15 with breached SL -> MUST BE DROPPED
+    bar_15m = Candle(
+        symbol=pos.symbol,
+        timeframe="15m",
+        timestamp=entry_ts - timedelta(minutes=10),  # 10:00
+        open=98.0,
+        high=102.0,
+        low=80.0,  # Below 85.0 SL
+        close=95.0,
+        volume=50000,
+        is_closed=True,
+    )
+    events_15m = engine.on_candle(bar_15m)
+    assert events_15m == []  # Not executed
+    assert pos.status == PositionStatus.OPEN
+
+    # 2. 1m candle starting at 10:09 (prior to 10:10 entry) closing at 10:10 -> MUST BE DROPPED
+    bar_prior = Candle(
+        symbol=pos.symbol,
+        timeframe="1m",
+        timestamp=entry_ts - timedelta(minutes=1),  # 10:09
+        open=98.0,
+        high=100.0,
+        low=80.0,  # Below 85.0 SL
+        close=95.0,
+        volume=1000,
+        is_closed=True,
+    )
+    events_prior = engine.on_candle(bar_prior)
+    assert events_prior == []
+    assert pos.status == PositionStatus.OPEN
+
+    # 3. 1m candle strictly after entry (10:10 to 10:11) breaching SL -> EXECUTED at availability time (10:11)
+    bar_valid = Candle(
+        symbol=pos.symbol,
+        timeframe="1m",
+        timestamp=entry_ts,  # 10:10
+        observed_at=entry_ts + timedelta(minutes=1),  # 10:11
+        open=98.0,
+        high=100.0,
+        low=80.0,  # Below 85.0 SL
+        close=82.0,
+        volume=1000,
+        is_closed=True,
+    )
+    events_valid = engine.on_candle(bar_valid)
+    assert len(events_valid) == 1
+    p, reason, exit_price = events_valid[0]
+    assert reason == ExitReason.STOP_LOSS
+    assert p.exit_time == entry_ts + timedelta(minutes=1)  # Availability time!
+    assert p.status == PositionStatus.CLOSED
+
+
+def test_atm_rotation_derives_protected_symbols_from_paper_engine():
+    """Verify check_and_rotate_options preserves open paper position contracts from being unsubscribed."""
+    from run_market_data import MarketDataEngine
+
+    store = DuckDBStore(db_path=":memory:")
+    runner = MarketDataEngine(store=store)
+
+    entry_ts = IST.localize(datetime(2026, 11, 26, 9, 30, 0))
+    trade_symbol = "NSE:NIFTY26NOV25000CE"
+    cand = create_mock_candidate(
+        opt_symbol=trade_symbol,
+        timestamp=entry_ts,
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+    pos = runner.paper_engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+    assert pos.symbol == trade_symbol
+
+    # Mock initial runner state
+    runner.current_spot_price = 25000.0
+    runner.active_atm_strike = 25000.0
+    runner.subscribed_option_symbols = {trade_symbol, "NSE:NIFTY26NOV25000PE"}
+
+    # Mock unsubscriptions tracker
+    unsubscribed_symbols = []
+    runner.ws_client.unsubscribe = lambda syms: unsubscribed_symbols.extend(syms)
+
+    # Mock instrument master resolution
+    runner.master.get_active_expiries = lambda und: [entry_ts.date()]
+    runner.master.resolve_option = lambda und, exp, strk, opt_type: OptionContract(
+        symbol=f"NSE:NIFTY26NOV{int(strk)}{opt_type.value}",
+        fytoken="dummy",
+        underlying="NIFTY",
+        expiry=exp,
+        strike=strk,
+        option_type=opt_type,
+    )
+
+    # Shift spot significantly: 25000 -> 25300 so 25000 is no longer in ATM +/- 50 strikes
+    runner.current_spot_price = 25300.0
+    runner.check_and_rotate_options()
+
+    # trade_symbol MUST NOT be in unsubscribed_symbols because it is protected by open paper positions
+    assert trade_symbol not in unsubscribed_symbols
+    assert trade_symbol in runner.subscribed_option_symbols
+    assert trade_symbol in runner.active_paper_trade_symbols
+    store.close()
+
+
+def test_one_lot_target1_and_pending_triggers_survive_restart(tmp_path):
+    """Verify 1-lot Target 1 breakeven SL and pending exit triggers survive engine restart."""
+    db_file = str(tmp_path / "paper_1lot_pending.duckdb")
+    store = DuckDBStore(db_path=db_file)
+
+    engine1 = PaperTradingEngine(store=store, default_lots=1, slippage_points=0.5)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 9, 30, 0))
+
+    cand = create_mock_candidate(
+        candidate_id="ONE_LOT_RESTART",
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        target_1=25140.0,
+        target_2=25180.0,
+        stop_loss=25070.0,
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+    pos1 = engine1.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos1 is not None
+    assert pos1.initial_quantity == 65  # 1 lot
+    initial_sl = pos1.stop_loss_premium
+
+    # 1. Reach Target 1 within fresh quote window
+    spot_tick_t1 = Tick(
+        symbol="NSE:NIFTY50-INDEX",
+        ltp=25145.0,
+        volume=50000,
+        local_timestamp=entry_ts + timedelta(seconds=10),
+    )
+    events_t1 = engine1.on_tick(spot_tick_t1)
+    assert len(events_t1) == 1
+    assert events_t1[0][1] == ExitReason.TARGET_1
+    assert pos1.is_t1_hit is True
+    assert pos1.is_breakeven_sl_active is True
+    assert pos1.stop_loss_premium >= pos1.entry_price + 1.0
+    assert pos1.stop_loss_premium > initial_sl
+
+    # 2. Simulate restart: verify 1-lot position restores is_t1_hit, is_breakeven_sl_active, and modified SL
+    engine2 = PaperTradingEngine(store=store, default_lots=1, slippage_points=0.5)
+    open_pos = engine2.get_open_positions()
+    assert len(open_pos) == 1
+    pos2 = open_pos[0]
+    assert pos2.position_id == pos1.position_id
+    assert pos2.is_t1_hit is True
+    assert pos2.is_breakeven_sl_active is True
+    assert pos2.stop_loss_premium == pos1.stop_loss_premium
+
+    # 3. Simulate pending trigger when quote is stale
+    stale_time = entry_ts + timedelta(minutes=10)
+    spot_tick_sl = Tick(
+        symbol="NSE:NIFTY50-INDEX",
+        ltp=25050.0,  # Breached spot SL
+        volume=50000,
+        local_timestamp=stale_time,
+    )
+    events_sl = engine2.on_tick(spot_tick_sl)
+    assert len(events_sl) == 0  # Awaiting fresh quote
+    assert pos2.is_exit_triggered is True
+    assert pos2.pending_exit_reason == ExitReason.TRAILING_STOP
+
+    # 4. Simulate second restart: verify pending exit trigger is preserved in DuckDB
+    engine3 = PaperTradingEngine(store=store, default_lots=1, slippage_points=0.5)
+    open_pos3 = engine3.get_open_positions()
+    assert len(open_pos3) == 1
+    pos3 = open_pos3[0]
+    assert pos3.is_exit_triggered is True
+    assert pos3.pending_exit_reason == ExitReason.TRAILING_STOP
+
+    store.close()
+
 
 
 

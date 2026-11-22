@@ -368,6 +368,7 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = reason
+                        self._save_position(pos)
                         logger.info("Spot SL breached for %s. Option quote stale (age %.1fs). Awaiting fresh quote.", pos.symbol, quote_age)
                     continue
 
@@ -380,6 +381,7 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = ExitReason.TARGET_2
+                        self._save_position(pos)
                         logger.info("Spot T2 reached for %s. Option quote stale (age %.1fs). Awaiting fresh quote.", pos.symbol, quote_age)
                     continue
 
@@ -392,6 +394,7 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = ExitReason.TARGET_1
+                        self._save_position(pos)
                         logger.info("Spot T1 reached for %s. Option quote stale (age %.1fs). Awaiting fresh quote.", pos.symbol, quote_age)
 
         return events
@@ -402,11 +405,34 @@ class PaperTradingEngine:
         with conservative adverse-first ordering.
         """
         events: List[Tuple[PaperPosition, ExitReason, float]] = []
-        current_time = candle.timestamp or now_ist()
+
+        # 1. Restrict intrabar boundary evaluations to base 1m bars to prevent replaying
+        # overlapping multi-timeframe boundaries (e.g. 5m and 15m).
+        if candle.timeframe and candle.timeframe not in ("1m", "1M"):
+            logger.debug(
+                "Skipping non-base candle timeframe %s for %s in paper engine",
+                candle.timeframe,
+                candle.symbol,
+            )
+            return events
+
+        # 2. Derive candle availability / completion timestamp
+        availability_time = candle.observed_at or candle.timestamp or now_ist()
+        current_time = availability_time
         sym = candle.symbol
 
         for pos_id, pos in list(self.active_positions.items()):
             if pos.status == PositionStatus.CLOSED:
+                continue
+
+            # Causal guard: Candle availability must be strictly after position was entered
+            if availability_time < pos.entry_time:
+                continue
+
+            # Causal guard: Prevent retroactive lookahead fills.
+            # If candle start time is strictly before pos.entry_time, part of the bar elapsed before
+            # the position was open, so its high/low could reflect pre-trade movements.
+            if candle.timestamp and candle.timestamp < pos.entry_time:
                 continue
 
             # Case 1: Option contract candle
@@ -484,6 +510,7 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = reason
+                        self._save_position(pos)
                     continue
 
                 # Favorable check: Target 2
@@ -503,6 +530,7 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = ExitReason.TARGET_2
+                        self._save_position(pos)
                     continue
 
                 # Favorable check: Target 1
@@ -522,6 +550,7 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = ExitReason.TARGET_1
+                        self._save_position(pos)
 
         return events
 
@@ -585,6 +614,7 @@ class PaperTradingEngine:
                 else:
                     pos.is_exit_triggered = True
                     pos.pending_exit_reason = ExitReason.TIMEOUT
+                    self._save_position(pos)
                     logger.info("Holding timeout reached for %s. Option quote stale (age %.1fs). Awaiting fresh quote.", pos.symbol, quote_age)
 
         return events
@@ -612,12 +642,14 @@ class PaperTradingEngine:
             )
             if notes:
                 pos.notes = (pos.notes or "") + f" | {notes}"
+            self._save_position(pos)
             return (pos, ExitReason.TARGET_1, exit_price)
 
         # For multi-lot positions (>= 2 lots): exit 50%
         exit_qty = (pos.remaining_quantity // (2 * pos.lot_size)) * pos.lot_size
         if exit_qty <= 0:
             pos.stop_loss_premium = max(pos.stop_loss_premium, pos.entry_price + 1.0)
+            self._save_position(pos)
             return (pos, ExitReason.TARGET_1, exit_price)
 
         exit_costs = self.cost_model.compute_fill_costs("SELL", exit_price, exit_qty)
@@ -773,6 +805,14 @@ class PaperTradingEngine:
 
         return (pos, reason, exit_price)
 
+    def _save_position(self, pos: PaperPosition) -> None:
+        """Persists position state transition to DuckDB store if available."""
+        if self.store is not None:
+            try:
+                self.store.save_paper_position(pos.to_dict())
+            except Exception as e:
+                logger.warning("Failed to persist paper position %s to DuckDB: %s", pos.position_id, e)
+
     def _fetch_fresh_quote(self, symbol: str) -> Optional[Dict[str, float]]:
         """Queries quote_provider for an on-demand quote when external triggers fire."""
         if self.quote_provider is None:
@@ -853,6 +893,12 @@ class PaperTradingEngine:
             if pending_exit_str and pending_exit_str in ExitReason._value2member_map_
             else None
         )
+        is_t1_hit = bool(row.get("is_t1_hit", False)) or (
+            status == PositionStatus.PARTIALLY_CLOSED or exit_reason == ExitReason.TARGET_2
+        )
+        is_breakeven_sl_active = bool(row.get("is_breakeven_sl_active", False)) or (
+            status == PositionStatus.PARTIALLY_CLOSED
+        )
 
         pos = PaperPosition(
             position_id=str(row.get("position_id")),
@@ -880,8 +926,8 @@ class PaperTradingEngine:
             last_quote_time=last_quote_time,
             status=status,
             exit_reason=exit_reason,
-            is_t1_hit=(status == PositionStatus.PARTIALLY_CLOSED or exit_reason == ExitReason.TARGET_2),
-            is_breakeven_sl_active=(status == PositionStatus.PARTIALLY_CLOSED),
+            is_t1_hit=is_t1_hit,
+            is_breakeven_sl_active=is_breakeven_sl_active,
             current_ltp=float(row.get("current_ltp", 0.0)),
             current_bid=float(row["current_bid"]) if row.get("current_bid") is not None else None,
             current_ask=float(row["current_ask"]) if row.get("current_ask") is not None else None,

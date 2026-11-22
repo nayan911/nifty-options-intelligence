@@ -126,6 +126,8 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     current_ask DOUBLE,
     is_exit_triggered BOOLEAN DEFAULT FALSE,
     pending_exit_reason VARCHAR,
+    is_t1_hit BOOLEAN DEFAULT FALSE,
+    is_breakeven_sl_active BOOLEAN DEFAULT FALSE,
     status VARCHAR NOT NULL,
     exit_reason VARCHAR,
     gross_pnl DOUBLE DEFAULT 0.0,

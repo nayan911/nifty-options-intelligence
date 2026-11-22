@@ -107,6 +107,8 @@ class DuckDBStore(IStorageEngine):
                 ("current_ask", "DOUBLE"),
                 ("is_exit_triggered", "BOOLEAN DEFAULT FALSE"),
                 ("pending_exit_reason", "VARCHAR"),
+                ("is_t1_hit", "BOOLEAN DEFAULT FALSE"),
+                ("is_breakeven_sl_active", "BOOLEAN DEFAULT FALSE"),
             ]:
                 try:
                     cur.execute(f"ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS {col} {dtype}")
@@ -469,9 +471,10 @@ class DuckDBStore(IStorageEngine):
                     spot_target_t1, spot_target_t2, spot_sl, entry_time,
                     exit_time, last_quote_time, current_ltp, current_bid,
                     current_ask, is_exit_triggered, pending_exit_reason,
+                    is_t1_hit, is_breakeven_sl_active,
                     status, exit_reason, gross_pnl, net_pnl, total_costs,
                     realized_rr, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     pos.get("position_id"),
@@ -502,6 +505,8 @@ class DuckDBStore(IStorageEngine):
                     pos.get("current_ask"),
                     pos.get("is_exit_triggered", False),
                     pos.get("pending_exit_reason"),
+                    pos.get("is_t1_hit", False),
+                    pos.get("is_breakeven_sl_active", False),
                     pos.get("status"),
                     pos.get("exit_reason"),
                     pos.get("gross_pnl", 0.0),
