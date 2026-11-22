@@ -251,12 +251,31 @@ class GreeksEngine:
             is_valid = False
             if is_complete:
                 try:
+                    f_iv = float(b_iv)
+                    f_delta = float(b_delta)
+                    f_gamma = float(b_gamma)
+                    f_theta = float(b_theta)
+                    f_vega = float(b_vega)
+                    f_rho = float(broker_greeks.get("rho") or 0.0)
+
+                    # 1. Require strictly finite numeric values (rejects NaN, +Inf, -Inf)
+                    is_finite = (
+                        math.isfinite(f_iv)
+                        and math.isfinite(f_delta)
+                        and math.isfinite(f_gamma)
+                        and math.isfinite(f_theta)
+                        and math.isfinite(f_vega)
+                        and math.isfinite(f_rho)
+                    )
+
+                    # 2. Domain constraints applied strictly on verified finite numbers
                     is_valid = (
-                        float(b_iv) > 0.01
-                        and abs(float(b_delta)) > 0.01
-                        and float(b_gamma) > 0.0
-                        and float(b_theta) != 0.0
-                        and float(b_vega) > 0.0
+                        is_finite
+                        and f_iv > 0.01
+                        and 0.01 < abs(f_delta) <= 1.05
+                        and f_gamma > 0.0
+                        and f_theta != 0.0
+                        and f_vega > 0.0
                     )
                 except (ValueError, TypeError):
                     is_valid = False
@@ -283,15 +302,19 @@ class GreeksEngine:
                         drift = (quote_timestamp - bg_ts).total_seconds()
                         if drift > max_age:
                             is_fresh = False
+                elif quote_timestamp is not None:
+                    # Provenance gating: If quote timestamp exists but broker Greeks omit a timestamp,
+                    # do NOT assume freshness from quote time without guaranteed provenance
+                    is_fresh = False
 
                 if is_fresh:
                     return OptionGreeks(
-                        iv=round(float(b_iv) / 100.0 if float(b_iv) > 1.0 else float(b_iv), 4),
-                        delta=round(float(b_delta), 4),
-                        gamma=round(float(b_gamma), 6),
-                        theta=round(float(b_theta), 3),
-                        vega=round(float(b_vega), 3),
-                        rho=round(float(broker_greeks.get("rho") or 0.0), 4),
+                        iv=round(f_iv / 100.0 if f_iv > 1.0 else f_iv, 4),
+                        delta=round(f_delta, 4),
+                        gamma=round(f_gamma, 6),
+                        theta=round(f_theta, 3),
+                        vega=round(f_vega, 3),
+                        rho=round(f_rho, 4),
                         is_calculated=False,
                         model_used="FYERS",
                     )

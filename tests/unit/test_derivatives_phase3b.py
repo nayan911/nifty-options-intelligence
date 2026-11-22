@@ -11,6 +11,7 @@ Exhaustively verifies:
 8. Seamless integration into DerivativesIntelligenceEngine and TechnicalCandidate payload.
 """
 
+import math
 from datetime import date, datetime
 
 import pytz
@@ -1097,6 +1098,71 @@ def test_strike_oi_analysis_explicit_greeks_timestamp():
     strike_25100 = profile.strikes[25100.0]
     assert strike_25100.call_quote_timestamp == t_quote
     assert strike_25100.call_greeks_timestamp == t_greeks
+
+
+def test_greeks_engine_rejects_non_finite_greeks():
+    """Verify GreeksEngine strictly requires math.isfinite() on all Greeks and rejects NaN or Inf."""
+    engine = GreeksEngine()
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    expiry = date(2026, 11, 26)
+
+    # 1. NaN theta (in Python, float('nan') != 0.0 is True!)
+    p_nan_theta = {"iv": 15.0, "delta": 0.50, "gamma": 0.0004, "theta": float("nan"), "vega": 10.0}
+    g1 = engine.calculate_greeks("CE", 25000.0, 25000.0, expiry, t0, 145.0, broker_greeks=p_nan_theta)
+    assert g1.model_used == "BLACK_76"
+    assert g1.is_calculated is True
+    assert math.isfinite(g1.theta)
+
+    # 2. Inf gamma
+    p_inf_gamma = {"iv": 15.0, "delta": 0.50, "gamma": float("inf"), "theta": -8.0, "vega": 10.0}
+    g2 = engine.calculate_greeks("CE", 25000.0, 25000.0, expiry, t0, 145.0, broker_greeks=p_inf_gamma)
+    assert g2.model_used == "BLACK_76"
+    assert g2.is_calculated is True
+    assert math.isfinite(g2.gamma)
+
+    # 3. -Inf delta
+    p_inf_delta = {"iv": 15.0, "delta": float("-inf"), "gamma": 0.0004, "theta": -8.0, "vega": 10.0}
+    g3 = engine.calculate_greeks("CE", 25000.0, 25000.0, expiry, t0, 145.0, broker_greeks=p_inf_delta)
+    assert g3.model_used == "BLACK_76"
+    assert g3.is_calculated is True
+    assert math.isfinite(g3.delta)
+
+    # 4. NaN IV
+    p_nan_iv = {"iv": float("nan"), "delta": 0.50, "gamma": 0.0004, "theta": -8.0, "vega": 10.0}
+    g4 = engine.calculate_greeks("CE", 25000.0, 25000.0, expiry, t0, 145.0, broker_greeks=p_nan_iv)
+    assert g4.model_used == "BLACK_76"
+    assert g4.is_calculated is True
+    assert math.isfinite(g4.iv)
+
+
+def test_contract_selector_provenance_gating_rejects_unsynchronized_snapshot():
+    """Verify OptionContractSelector rejects broker Greeks when snapshot does not guarantee synchronization."""
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    # Create chain snapshot with is_synchronized_snapshot=False and no explicit Greeks timestamps
+    snap = create_phase3b_chain(t0)
+    snap.is_synchronized_snapshot = False
+
+    oi_analyzer = OpenInterestAnalyzer()
+    profile = oi_analyzer.on_option_chain(snap)
+
+    assert profile.is_synchronized_snapshot is False
+    assert profile.strikes[25100.0].call_greeks_provenance == "INFERRED"
+    assert profile.strikes[25100.0].call_greeks_timestamp is None
+
+    selector = OptionContractSelector()
+    res = selector.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=t0,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res is not None
+    # Cannot infer freshness from quote timestamp without synchronization guarantee; must calculate Black-76
+    assert res.greeks.model_used == "BLACK_76"
+    assert res.greeks.is_calculated is True
+
 
 
 
