@@ -115,6 +115,10 @@ class DerivativesIntelligenceEngine:
         risk_points: float = 20.0,
         target_points_t1: float = 30.0,
         target_points_t2: float = 50.0,
+        entry_price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        target_1: Optional[float] = None,
+        target_2: Optional[float] = None,
         holding_minutes: Optional[float] = None,
     ) -> DerivativesAssessment:
         """Evaluates derivatives alignment for a given breakout direction and reference level.
@@ -287,16 +291,21 @@ class DerivativesIntelligenceEngine:
         # Phase 3B: Select optimal option contract and evaluate trajectory
         selected_contract = None
         if self.contract_selector is not None and not is_stale:
-            fut_price = fut_analysis.price if fut_analysis else level_price
+            actual_entry = entry_price if entry_price is not None else level_price
+            fut_price = fut_analysis.price if fut_analysis else actual_entry
             selected_contract = self.contract_selector.select_contract(
                 direction=direction,
-                spot_price=level_price,
+                spot_price=actual_entry,
                 chain_profile=oi_profile,
                 futures_price=fut_price,
                 as_of=as_of,
                 risk_points=risk_points,
                 target_points_t1=target_points_t1,
                 target_points_t2=target_points_t2,
+                entry_price=actual_entry,
+                stop_loss=stop_loss,
+                target_1=target_1,
+                target_2=target_2,
                 holding_minutes=holding_minutes,
             )
 

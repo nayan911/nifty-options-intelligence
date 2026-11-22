@@ -52,6 +52,15 @@ class StrikeOIAnalysis:
     call_volume_change: int = 0
     call_buildup: BuildupType = BuildupType.NEUTRAL
     call_directional_bias: DirectionalBias = DirectionalBias.NEUTRAL
+    # Call contract quote & Greeks metadata
+    call_symbol: str = ""
+    call_bid: Optional[float] = None
+    call_ask: Optional[float] = None
+    call_iv: Optional[float] = None
+    call_delta: Optional[float] = None
+    call_gamma: Optional[float] = None
+    call_theta: Optional[float] = None
+    call_vega: Optional[float] = None
 
     # Put contract metrics
     put_oi: int = 0
@@ -63,6 +72,15 @@ class StrikeOIAnalysis:
     put_volume_change: int = 0
     put_buildup: BuildupType = BuildupType.NEUTRAL
     put_directional_bias: DirectionalBias = DirectionalBias.NEUTRAL
+    # Put contract quote & Greeks metadata
+    put_symbol: str = ""
+    put_bid: Optional[float] = None
+    put_ask: Optional[float] = None
+    put_iv: Optional[float] = None
+    put_delta: Optional[float] = None
+    put_gamma: Optional[float] = None
+    put_theta: Optional[float] = None
+    put_vega: Optional[float] = None
 
     # Net bias across CE and PE for this strike
     net_strike_bias: DirectionalBias = DirectionalBias.NEUTRAL
@@ -373,6 +391,15 @@ class OpenInterestAnalyzer:
                 c_ltp = float(c_ltp_raw) if c_ltp_raw is not None else 0.0
                 c_vol = int(c_vol_raw) if c_vol_raw is not None else 0
 
+                c_sym = str(c_curr.get("symbol") or "")
+                c_bid = float(c_curr["bid"]) if c_curr.get("bid") is not None else None
+                c_ask = float(c_curr["ask"]) if c_curr.get("ask") is not None else None
+                c_iv = float(c_curr["iv"]) if c_curr.get("iv") is not None else None
+                c_delta = float(c_curr["delta"]) if c_curr.get("delta") is not None else None
+                c_gamma = float(c_curr["gamma"]) if c_curr.get("gamma") is not None else None
+                c_theta = float(c_curr["theta"]) if c_curr.get("theta") is not None else None
+                c_vega = float(c_curr["vega"]) if c_curr.get("vega") is not None else None
+
                 if (
                     c_prev is not None
                     and c_oi_raw is not None
@@ -418,6 +445,14 @@ class OpenInterestAnalyzer:
                 c_vol_change = 0
                 c_buildup = BuildupType.NEUTRAL
                 c_bias = DirectionalBias.NEUTRAL
+                c_sym = ""
+                c_bid = None
+                c_ask = None
+                c_iv = None
+                c_delta = None
+                c_gamma = None
+                c_theta = None
+                c_vega = None
 
             # Put analysis
             p_curr = s.put
@@ -431,6 +466,15 @@ class OpenInterestAnalyzer:
                 p_oi = int(p_oi_raw) if p_oi_raw is not None else 0
                 p_ltp = float(p_ltp_raw) if p_ltp_raw is not None else 0.0
                 p_vol = int(p_vol_raw) if p_vol_raw is not None else 0
+
+                p_sym = str(p_curr.get("symbol") or "")
+                p_bid = float(p_curr["bid"]) if p_curr.get("bid") is not None else None
+                p_ask = float(p_curr["ask"]) if p_curr.get("ask") is not None else None
+                p_iv = float(p_curr["iv"]) if p_curr.get("iv") is not None else None
+                p_delta = float(p_curr["delta"]) if p_curr.get("delta") is not None else None
+                p_gamma = float(p_curr["gamma"]) if p_curr.get("gamma") is not None else None
+                p_theta = float(p_curr["theta"]) if p_curr.get("theta") is not None else None
+                p_vega = float(p_curr["vega"]) if p_curr.get("vega") is not None else None
 
                 if (
                     p_prev is not None
@@ -477,6 +521,14 @@ class OpenInterestAnalyzer:
                 p_vol_change = 0
                 p_buildup = BuildupType.NEUTRAL
                 p_bias = DirectionalBias.NEUTRAL
+                p_sym = ""
+                p_bid = None
+                p_ask = None
+                p_iv = None
+                p_delta = None
+                p_gamma = None
+                p_theta = None
+                p_vega = None
 
             # Net strike bias
             net_bias = DirectionalBias.NEUTRAL
@@ -500,6 +552,14 @@ class OpenInterestAnalyzer:
                 call_volume_change=c_vol_change,
                 call_buildup=c_buildup,
                 call_directional_bias=c_bias,
+                call_symbol=c_sym,
+                call_bid=c_bid,
+                call_ask=c_ask,
+                call_iv=c_iv,
+                call_delta=c_delta,
+                call_gamma=c_gamma,
+                call_theta=c_theta,
+                call_vega=c_vega,
                 put_oi=p_oi,
                 put_oi_change=p_oi_change,
                 put_oi_change_pct=round(p_oi_change_pct, 2),
@@ -509,6 +569,14 @@ class OpenInterestAnalyzer:
                 put_volume_change=p_vol_change,
                 put_buildup=p_buildup,
                 put_directional_bias=p_bias,
+                put_symbol=p_sym,
+                put_bid=p_bid,
+                put_ask=p_ask,
+                put_iv=p_iv,
+                put_delta=p_delta,
+                put_gamma=p_gamma,
+                put_theta=p_theta,
+                put_vega=p_vega,
                 net_strike_bias=net_bias,
             )
 

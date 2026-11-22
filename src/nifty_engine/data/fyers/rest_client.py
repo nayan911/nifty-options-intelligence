@@ -133,17 +133,33 @@ class FyersRestClient:
         if expiry_data and isinstance(expiry_data, list):
             first_exp = expiry_data[0]
             if isinstance(first_exp, dict):
-                if first_exp.get("timestamp"):
-                    detected_expiry = datetime.fromtimestamp(first_exp["timestamp"], tz=IST).date()
-                elif first_exp.get("date"):
+                raw_exp_ts = first_exp.get("expiry") or first_exp.get("timestamp")
+                if raw_exp_ts is not None:
                     try:
-                        detected_expiry = datetime.strptime(first_exp["date"], "%d-%b-%Y").date()
-                    except ValueError:
+                        detected_expiry = datetime.fromtimestamp(int(raw_exp_ts), tz=IST).date()
+                    except (ValueError, TypeError):
                         pass
-            elif isinstance(first_exp, (int, float)):
-                detected_expiry = datetime.fromtimestamp(first_exp, tz=IST).date()
+                if detected_expiry is None and first_exp.get("date"):
+                    raw_date_str = str(first_exp["date"]).strip()
+                    for fmt in ("%d-%m-%Y", "%d-%b-%Y", "%Y-%m-%d"):
+                        try:
+                            detected_expiry = datetime.strptime(raw_date_str, fmt).date()
+                            break
+                        except ValueError:
+                            pass
+            elif isinstance(first_exp, (int, float, str)):
+                try:
+                    detected_expiry = datetime.fromtimestamp(int(first_exp), tz=IST).date()
+                except (ValueError, TypeError):
+                    pass
 
         for item in options_chain:
+            # Check for underlying spot record (FYERS reports index LTP with strike_price = -1)
+            raw_sp = float(item.get("strike_price", item.get("strike", 0.0)))
+            if raw_sp <= 0:
+                if spot_price <= 0.0 and item.get("ltp") is not None:
+                    spot_price = float(item["ltp"])
+                continue
             # Case 1: Nested structure (item contains 'ce' and/or 'pe')
             if "ce" in item or "pe" in item:
                 strike_p = float(item.get("strike_price", 0.0))

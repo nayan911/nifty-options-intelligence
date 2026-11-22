@@ -8,6 +8,7 @@ Selects the single optimal option contract (strike, expiry, CE/PE) based on:
 5. All-in execution cost viability (statutory fees, slippage, and net R:R).
 """
 
+import math
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
@@ -82,7 +83,11 @@ class SelectedContract:
 
 
 class OptionContractSelector:
-    """Evaluates option-chain strikes and selects the highest-scoring liquid contract."""
+    """Evaluates option-chain strikes and selects the highest-scoring liquid contract.
+
+    Strictly separates hard eligibility gates (real broker symbols, observed bid/ask quotes,
+    spread tolerance, volume liquidity, valid Greeks, and net R:R viability) from ranking.
+    """
 
     def __init__(
         self,
@@ -91,8 +96,10 @@ class OptionContractSelector:
         near_atm_range: int = 5,
         target_delta_min: float = 0.35,
         target_delta_max: float = 0.55,
+        min_acceptable_delta: float = 0.25,
+        max_acceptable_delta: float = 0.70,
         max_acceptable_spread_pct: float = 0.03,  # Max 3% bid-ask spread
-        min_liquidity_volume: int = 2000,
+        min_liquidity_volume: int = 500,  # Minimum required trading volume
         default_holding_minutes: float = 30.0,
         min_selection_score: float = 50.0,
     ):
@@ -101,10 +108,54 @@ class OptionContractSelector:
         self.near_atm_range = near_atm_range
         self.target_delta_min = target_delta_min
         self.target_delta_max = target_delta_max
+        self.min_acceptable_delta = min_acceptable_delta
+        self.max_acceptable_delta = max_acceptable_delta
         self.max_acceptable_spread_pct = max_acceptable_spread_pct
         self.min_liquidity_volume = min_liquidity_volume
         self.default_holding_minutes = default_holding_minutes
         self.min_selection_score = min_selection_score
+
+    def compute_forward_price(
+        self,
+        spot_price: float,
+        expiry: date,
+        current_time: datetime,
+        futures_price: Optional[float] = None,
+        futures_expiry: Optional[date] = None,
+    ) -> float:
+        """Computes contract-expiry-matched forward price.
+
+        If a monthly futures price is provided and its expiry matches the contract expiry,
+        uses futures_price directly.
+        If contract is a weekly option expiring before monthly futures, interpolates the
+        cost-of-carry basis so monthly futures basis is not falsely ascribed to a weekly option.
+        """
+        S = float(spot_price)
+        T_opt = self.greeks_engine.compute_time_to_expiry_years(expiry, current_time)
+        if T_opt <= 0.0 or S <= 0.0:
+            return max(0.05, S)
+
+        r = self.greeks_engine.default_risk_free_rate
+
+        # If no futures price or futures price equals spot, use theoretical forward
+        if futures_price is None or abs(futures_price - S) < 0.1:
+            return round(S * math.exp(r * T_opt), 2)
+
+        # If futures expiry matches option expiry, use futures price directly
+        if futures_expiry and futures_expiry == expiry:
+            return float(futures_price)
+
+        # Interpolate cost of carry from monthly futures
+        T_fut = (
+            self.greeks_engine.compute_time_to_expiry_years(futures_expiry, current_time)
+            if futures_expiry
+            else max(T_opt, 25.0 / 365.25)
+        )
+        if T_fut > 0.001 and futures_price > 0.0:
+            basis_rate = math.log(futures_price / S) / T_fut
+            return round(S * math.exp(basis_rate * T_opt), 2)
+
+        return round(S * math.exp(r * T_opt), 2)
 
     def select_contract(
         self,
@@ -116,30 +167,58 @@ class OptionContractSelector:
         risk_points: float = 20.0,
         target_points_t1: float = 30.0,
         target_points_t2: float = 50.0,
+        entry_price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        target_1: Optional[float] = None,
+        target_2: Optional[float] = None,
         holding_minutes: Optional[float] = None,
     ) -> Optional[SelectedContract]:
-        """Selects the single best option contract matching the technical breakout candidate."""
+        """Selects the single best option contract matching the technical breakout candidate.
+
+        Enforces hard eligibility gates (real broker symbols, observed bid/ask quotes,
+        liquidity, Greeks, and net R:R viability) before scoring.
+        """
         if not chain_profile or not chain_profile.strikes:
             return None
 
         current_time = as_of or chain_profile.timestamp
-        fut_price = futures_price or spot_price
         opt_type = "CE" if direction == BreakoutDirection.BULLISH else "PE"
         hold_mins = holding_minutes or self.default_holding_minutes
 
-        # Calculate spot index Target and Stop Loss levels
-        if direction == BreakoutDirection.BULLISH:
-            spot_t1 = spot_price + target_points_t1
-            spot_t2 = spot_price + target_points_t2
-            spot_sl = spot_price - risk_points
+        # Determine exact spot entry and price targets
+        spot_entry = float(entry_price) if entry_price is not None else float(spot_price)
+        if target_1 is not None and stop_loss is not None:
+            spot_t1 = float(target_1)
+            spot_sl = float(stop_loss)
+            if target_2 is not None:
+                spot_t2 = float(target_2)
+            else:
+                spot_t2 = (
+                    spot_entry + 2.0 * abs(spot_t1 - spot_entry)
+                    if direction == BreakoutDirection.BULLISH
+                    else spot_entry - 2.0 * abs(spot_t1 - spot_entry)
+                )
         else:
-            spot_t1 = spot_price - target_points_t1
-            spot_t2 = spot_price - target_points_t2
-            spot_sl = spot_price + risk_points
+            if direction == BreakoutDirection.BULLISH:
+                spot_t1 = spot_entry + target_points_t1
+                spot_t2 = spot_entry + target_points_t2
+                spot_sl = spot_entry - risk_points
+            else:
+                spot_t1 = spot_entry - target_points_t1
+                spot_t2 = spot_entry - target_points_t2
+                spot_sl = spot_entry + risk_points
+
+        # Contract-expiry-matched forward price
+        fwd_price = self.compute_forward_price(
+            spot_price=spot_entry,
+            expiry=chain_profile.expiry,
+            current_time=current_time,
+            futures_price=futures_price,
+        )
 
         # Filter near-ATM strikes
         sorted_strikes = sorted(chain_profile.strikes.keys())
-        sorted_by_dist = sorted(sorted_strikes, key=lambda k: abs(k - spot_price))
+        sorted_by_dist = sorted(sorted_strikes, key=lambda k: abs(k - spot_entry))
         candidate_strikes = sorted(sorted_by_dist[: 2 * self.near_atm_range + 1])
 
         evaluated_contracts: List[SelectedContract] = []
@@ -147,43 +226,85 @@ class OptionContractSelector:
         for strike in candidate_strikes:
             strike_data = chain_profile.strikes[strike]
 
-            # Extract raw quote details
+            # Extract authentic broker quotes and metadata (NEVER invent symbols or bid/ask)
             if opt_type == "CE":
+                symbol = strike_data.call_symbol
                 ltp = strike_data.call_ltp
                 volume = strike_data.call_volume
                 oi = strike_data.call_oi
+                bid = strike_data.call_bid
+                ask = strike_data.call_ask
+                broker_greeks = {
+                    "iv": strike_data.call_iv,
+                    "delta": strike_data.call_delta,
+                    "gamma": strike_data.call_gamma,
+                    "theta": strike_data.call_theta,
+                    "vega": strike_data.call_vega,
+                }
             else:
+                symbol = strike_data.put_symbol
                 ltp = strike_data.put_ltp
                 volume = strike_data.put_volume
                 oi = strike_data.put_oi
+                bid = strike_data.put_bid
+                ask = strike_data.put_ask
+                broker_greeks = {
+                    "iv": strike_data.put_iv,
+                    "delta": strike_data.put_delta,
+                    "gamma": strike_data.put_gamma,
+                    "theta": strike_data.put_theta,
+                    "vega": strike_data.put_vega,
+                }
 
-            if ltp <= 1.0:
+            # HARD ELIGIBILITY GATE 1: Real exchange symbol required
+            if not symbol or not symbol.startswith("NSE:"):
                 continue
 
-            # Bid/ask estimation if not directly in strike analysis
-            bid = round(max(0.05, ltp - 0.5), 2)
-            ask = round(ltp + 0.5, 2)
-            spread = max(0.2, ask - bid)
-            spread_pct = spread / ltp
+            # HARD ELIGIBILITY GATE 2: Valid, observed broker bid and ask quotes
+            if bid is None or ask is None or bid <= 0.0 or ask <= 0.0 or ask < bid:
+                continue
 
-            # Synthesize symbol if missing
-            symbol = f"NSE:{chain_profile.underlying}{int(strike)}{opt_type}"
+            spread = round(ask - bid, 2)
+            spread_pct = round(spread / ask, 4)
 
-            # Calculate Greeks
+            # HARD ELIGIBILITY GATE 3: Spread friction limit
+            if spread_pct > self.max_acceptable_spread_pct:
+                continue
+
+            # HARD ELIGIBILITY GATE 4: Liquidity volume threshold
+            if volume < self.min_liquidity_volume:
+                continue
+
+            # Effective market price for Greeks solver
+            mkt_price = ltp if ltp > 0.05 else ask
+
+            # Calculate Greeks with authentic broker fallback and contract-matched forward
             greeks = self.greeks_engine.calculate_greeks(
                 option_type=opt_type,
                 strike=strike,
-                underlying_futures=fut_price,
+                underlying_futures=fwd_price,
                 expiry=chain_profile.expiry,
                 current_time=current_time,
-                market_price=ltp,
+                market_price=mkt_price,
+                broker_greeks=broker_greeks,
             )
 
-            # Estimate premium trajectory
+            # HARD ELIGIBILITY GATE 5: Valid Greeks and Delta limits
+            if not greeks.is_calculated and greeks.model_used != "FYERS":
+                continue
+            if greeks.iv <= 0.001:
+                continue
+            if not (self.min_acceptable_delta <= abs(greeks.delta) <= self.max_acceptable_delta):
+                continue
+
+            # Realistic entry premium: Buyer buys on the Ask price
+            entry_premium = ask
+
+            # Estimate option premium trajectory based on exact technical entry/targets
             premium_est = self.cost_model.estimate_premium_trajectory(
                 greeks=greeks,
-                entry_premium=ltp,
-                spot_entry=spot_price,
+                entry_premium=entry_premium,
+                spot_entry=spot_entry,
                 spot_target_t1=spot_t1,
                 spot_target_t2=spot_t2,
                 spot_sl=spot_sl,
@@ -191,17 +312,22 @@ class OptionContractSelector:
                 holding_minutes=hold_mins,
             )
 
-            # Evaluate execution costs and net edge
+            # Evaluate exact asymmetric Indian execution costs
             costs = self.cost_model.calculate_execution_costs(
-                entry_premium=ltp,
+                entry_premium=entry_premium,
                 target_premium_t1=premium_est.target_premium_t1,
                 stop_loss_premium=premium_est.stop_loss_premium,
                 bid_ask_spread=spread,
+                underlying=chain_profile.underlying,
             )
 
-            # Score the contract (0.0 to 100.0)
+            # HARD ELIGIBILITY GATE 6: Net Reward-to-Risk viability
+            if not costs.is_cost_viable:
+                continue
+
+            # Score the eligible contract (0.0 to 100.0)
             score, reasons = self._score_contract(
-                ltp=ltp,
+                ltp=mkt_price,
                 volume=volume,
                 spread_pct=spread_pct,
                 greeks=greeks,
@@ -216,7 +342,7 @@ class OptionContractSelector:
                     strike=strike,
                     option_type=opt_type,
                     expiry=chain_profile.expiry,
-                    ltp=ltp,
+                    ltp=round(mkt_price, 2),
                     bid=bid,
                     ask=ask,
                     spread=spread,
@@ -235,8 +361,8 @@ class OptionContractSelector:
         if not evaluated_contracts:
             return None
 
-        # Return the highest-scoring viable contract
-        evaluated_contracts.sort(key=lambda c: (c.execution_costs.is_cost_viable, c.selection_score), reverse=True)
+        # Return the highest-scoring eligible contract
+        evaluated_contracts.sort(key=lambda c: c.selection_score, reverse=True)
         return evaluated_contracts[0]
 
     def _score_contract(

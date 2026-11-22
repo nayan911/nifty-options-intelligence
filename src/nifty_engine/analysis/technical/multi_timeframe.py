@@ -653,6 +653,10 @@ class MultiTimeframeAnalyzer:
                 risk_points=round(risk_points, 1),
                 target_points_t1=round(reward_1, 1),
                 target_points_t2=round(reward_2, 1),
+                entry_price=round(entry_price, 2),
+                stop_loss=round(effective_sl, 2),
+                target_1=round(target_1, 2),
+                target_2=round(target_2, 2),
             )
 
         breakdown = {

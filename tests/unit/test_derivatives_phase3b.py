@@ -64,7 +64,7 @@ def create_phase3b_chain(
             OptionChainStrike(
                 strike=strike,
                 call={
-                    "symbol": f"NSE:NIFTY{int(strike)}CE",
+                    "symbol": f"NSE:NIFTY26NOV{int(strike)}CE",
                     "ltp": c_ltp,
                     "oi": c_oi,
                     "volume": c_vol,
@@ -77,7 +77,7 @@ def create_phase3b_chain(
                     "vega": 12.0,
                 },
                 put={
-                    "symbol": f"NSE:NIFTY{int(strike)}PE",
+                    "symbol": f"NSE:NIFTY26NOV{int(strike)}PE",
                     "ltp": p_ltp,
                     "oi": p_oi,
                     "volume": p_vol,
@@ -280,12 +280,14 @@ def test_second_order_taylor_premium_movement():
     )
 
     # Invariants:
-    # Target 1: delta move (0.50 * 30 = 15.0) + gamma (0.5 * 0.0004 * 900 = 0.18) - theta (8 * 30/375 = 0.64)
-    expected_gain_t1 = (0.50 * 30.0) + (0.5 * 0.0004 * 900.0) - (8.0 * (30.0 / 375.0))
+    # Target 1: delta move (0.50 * 30 = 15.0) + gamma (0.5 * 0.0004 * 900 = 0.18) - trading-day theta
+    trading_day_theta = 8.0 * (365.25 / 250.0)
+    expected_theta_loss = trading_day_theta * (30.0 / 375.0)
+    expected_gain_t1 = (0.50 * 30.0) + (0.5 * 0.0004 * 900.0) - expected_theta_loss
     assert abs(est_call.target_premium_t1 - (100.0 + expected_gain_t1)) < 0.1
     assert est_call.target_premium_t2 > est_call.target_premium_t1
     assert est_call.stop_loss_premium < 100.0
-    assert est_call.theta_cost == round(8.0 * (30.0 / 375.0), 2)
+    assert est_call.theta_cost == round(expected_theta_loss, 2)
 
     # Quadratic spot move solver
     req_move = model.calculate_required_spot_move_for_premium_target(greeks_call, target_premium_gain=15.0)
@@ -423,7 +425,7 @@ def test_derivatives_assessment_enriches_candidate_with_selected_contract():
 
     # Invariants:
     assert assessment.selected_contract is not None
-    assert assessment.selected_contract.symbol == "NSE:NIFTY25100CE"
+    assert assessment.selected_contract.symbol == "NSE:NIFTY26NOV25100CE"
     assert assessment.selected_contract.option_type == "CE"
     assert assessment.selected_contract.selection_score >= 70.0
     assert assessment.selected_contract.premium_trajectory.target_premium_t1 > 0.0
@@ -432,7 +434,212 @@ def test_derivatives_assessment_enriches_candidate_with_selected_contract():
     as_dict = assessment.to_dict()
     assert "selected_contract" in as_dict
     contract_dict = as_dict["selected_contract"]
-    assert contract_dict["symbol"] == "NSE:NIFTY25100CE"
+    assert contract_dict["symbol"] == "NSE:NIFTY26NOV25100CE"
     assert contract_dict["strike"] == 25100.0
     assert contract_dict["is_cost_viable"] is True
     assert "target_premium_t1" in contract_dict
+
+
+# ---------------------------------------------------------------------------
+# 5. Contract Integrity, Eligibility Gates & Asymmetric Cost Tests
+# ---------------------------------------------------------------------------
+
+
+def test_contract_selector_rejects_missing_or_invalid_broker_quotes():
+    """Verify OptionContractSelector rejects contracts with missing symbols, inverted/missing bid-ask, or extreme spreads."""
+    selector = OptionContractSelector(
+        min_liquidity_volume=1000,
+        max_acceptable_spread_pct=0.03,
+    )
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+
+    # 1. Missing symbol -> must reject (never synthesize!)
+    invalid_snap1 = OptionChainSnapshot(
+        underlying="NIFTY",
+        spot_price=25100.0,
+        api_timestamp=t0,
+        expiry=date(2026, 11, 26),
+        strikes=[
+            OptionChainStrike(
+                strike=25100.0,
+                call={
+                    "symbol": "",  # Missing symbol!
+                    "ltp": 95.0,
+                    "oi": 10000,
+                    "volume": 5000,
+                    "bid": 94.5,
+                    "ask": 95.5,
+                },
+            )
+        ],
+    )
+    oi_analyzer = OpenInterestAnalyzer()
+    profile1 = oi_analyzer.on_option_chain(invalid_snap1)
+    res1 = selector.select_contract(BreakoutDirection.BULLISH, 25100.0, profile1, as_of=t0)
+    assert res1 is None, "Should reject contract with missing exchange symbol"
+
+    # 2. Missing/negative bid/ask quotes -> must reject (never manufacture synthetic quotes!)
+    invalid_snap2 = OptionChainSnapshot(
+        underlying="NIFTY",
+        spot_price=25100.0,
+        api_timestamp=t0,
+        expiry=date(2026, 11, 26),
+        strikes=[
+            OptionChainStrike(
+                strike=25100.0,
+                call={
+                    "symbol": "NSE:NIFTY26NOV25100CE",
+                    "ltp": 95.0,
+                    "oi": 10000,
+                    "volume": 5000,
+                    "bid": None,  # Missing bid!
+                    "ask": 95.5,
+                },
+            )
+        ],
+    )
+    profile2 = oi_analyzer.on_option_chain(invalid_snap2)
+    res2 = selector.select_contract(BreakoutDirection.BULLISH, 25100.0, profile2, as_of=t0)
+    assert res2 is None, "Should reject contract with missing broker bid"
+
+    # 3. Inverted quote (ask < bid) -> must reject
+    invalid_snap3 = OptionChainSnapshot(
+        underlying="NIFTY",
+        spot_price=25100.0,
+        api_timestamp=t0,
+        expiry=date(2026, 11, 26),
+        strikes=[
+            OptionChainStrike(
+                strike=25100.0,
+                call={
+                    "symbol": "NSE:NIFTY26NOV25100CE",
+                    "ltp": 95.0,
+                    "oi": 10000,
+                    "volume": 5000,
+                    "bid": 98.0,
+                    "ask": 94.0,  # Ask < Bid!
+                },
+            )
+        ],
+    )
+    profile3 = oi_analyzer.on_option_chain(invalid_snap3)
+    res3 = selector.select_contract(BreakoutDirection.BULLISH, 25100.0, profile3, as_of=t0)
+    assert res3 is None, "Should reject inverted broker quote"
+
+    # 4. Wide spread (spread_pct > max_acceptable_spread_pct = 3%) -> must reject
+    invalid_snap4 = OptionChainSnapshot(
+        underlying="NIFTY",
+        spot_price=25100.0,
+        api_timestamp=t0,
+        expiry=date(2026, 11, 26),
+        strikes=[
+            OptionChainStrike(
+                strike=25100.0,
+                call={
+                    "symbol": "NSE:NIFTY26NOV25100CE",
+                    "ltp": 95.0,
+                    "oi": 10000,
+                    "volume": 5000,
+                    "bid": 90.0,
+                    "ask": 96.0,  # 6.0 pt spread on 96.0 = 6.25% spread (> 3%)
+                },
+            )
+        ],
+    )
+    profile4 = oi_analyzer.on_option_chain(invalid_snap4)
+    res4 = selector.select_contract(BreakoutDirection.BULLISH, 25100.0, profile4, as_of=t0)
+    assert res4 is None, "Should reject illiquid contract with wide spread"
+
+
+def test_contract_selector_exact_technical_entry_alignment():
+    """Verify option premium trajectory evaluates remaining move from technical entry_price, not nominal breakout level."""
+    selector = OptionContractSelector()
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    chain_snap = create_phase3b_chain(api_time=t0, spot=25100.0)
+    oi_analyzer = OpenInterestAnalyzer()
+    profile = oi_analyzer.on_option_chain(chain_snap)
+
+    # Breakout level is 25100.0, but actual entry confirmed at 25120.0
+    # Technical targets: T1 = 25165 (+45 pts remaining), T2 = 25200 (+80 pts), SL = 25105 (-15 pts)
+    selected = selector.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,  # Nominal level
+        chain_profile=profile,
+        futures_price=25125.0,
+        as_of=t0,
+        entry_price=25120.0,  # Actual technical entry
+        stop_loss=25105.0,
+        target_1=25165.0,
+        target_2=25200.0,
+    )
+
+    assert selected is not None
+    traj = selected.premium_trajectory
+    # Required spot move to T1 must be exactly 45.0 (25165 - 25120), not (25165 - 25100 = 65)!
+    assert traj.required_spot_move_t1 == 45.0
+    # Entry premium used for trajectory must be the Ask price (95.5), not LTP (95.0)
+    assert traj.initial_premium == selected.ask
+
+
+def test_contract_selector_broker_greeks_and_forward_price():
+    """Verify contract selector preserves broker Greeks and interpolates forward price for weekly options."""
+    selector = OptionContractSelector()
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    chain_snap = create_phase3b_chain(api_time=t0, spot=25100.0)
+    oi_analyzer = OpenInterestAnalyzer()
+    profile = oi_analyzer.on_option_chain(chain_snap)
+
+    # Weekly option expiring 26-Nov, monthly futures at 25200 (+100 pts basis)
+    fwd = selector.compute_forward_price(
+        spot_price=25100.0,
+        expiry=date(2026, 11, 26),
+        current_time=t0,
+        futures_price=25200.0,
+        futures_expiry=date(2026, 12, 31),  # 38 days away
+    )
+    # The 3-day weekly forward should NOT have the full 100 pt basis of 38-day futures!
+    assert 25100.0 < fwd < 25125.0
+
+    selected = selector.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        futures_price=fwd,
+        as_of=t0,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert selected is not None
+    # Broker Greeks passed through
+    assert selected.greeks.model_used == "FYERS"
+    assert selected.greeks.delta == 0.50
+
+
+def test_asymmetric_target_and_sl_execution_costs():
+    """Verify execution cost model calculates separate asymmetric statutory fees for Target and SL exits."""
+    model = PremiumCostModel(lot_size=65)
+
+    # Buy at ₹100, Target at ₹140 (+40 pts gain), Stop Loss at ₹80 (-20 pts loss)
+    costs = model.calculate_execution_costs(
+        entry_premium=100.0,
+        target_premium_t1=140.0,
+        stop_loss_premium=80.0,
+        bid_ask_spread=1.0,
+        slippage_points=0.5,
+    )
+
+    # STT at target (0.15% on 140 * 65 = 13.65) must be higher than STT at SL (0.15% on 80 * 65 = 7.80)
+    assert costs.stt_target > costs.stt_sl
+    assert abs(costs.stt_target - 13.65) <= 0.05
+    assert abs(costs.stt_sl - 7.80) <= 0.05
+
+    # Total statutory fees at Target > Total statutory fees at SL
+    assert costs.total_statutory_target_rupees > costs.total_statutory_sl_rupees
+
+    # Friction points at target > friction points at SL
+    assert costs.target_friction_points > costs.sl_friction_points
+
+    # Net reward = gross reward (40.0) - target_friction
+    assert costs.net_reward_points_t1 == round(40.0 - costs.target_friction_points, 2)
+    # Net risk = gross risk (20.0) + sl_friction
+    assert costs.net_risk_points == round(20.0 + costs.sl_friction_points, 2)
