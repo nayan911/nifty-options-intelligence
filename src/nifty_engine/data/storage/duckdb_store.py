@@ -102,6 +102,11 @@ class DuckDBStore(IStorageEngine):
             for col, dtype in [
                 ("initial_stop_loss_premium", "DOUBLE"),
                 ("last_quote_time", "TIMESTAMP WITH TIME ZONE"),
+                ("current_ltp", "DOUBLE"),
+                ("current_bid", "DOUBLE"),
+                ("current_ask", "DOUBLE"),
+                ("is_exit_triggered", "BOOLEAN DEFAULT FALSE"),
+                ("pending_exit_reason", "VARCHAR"),
             ]:
                 try:
                     cur.execute(f"ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS {col} {dtype}")
@@ -462,9 +467,11 @@ class DuckDBStore(IStorageEngine):
                     entry_price, exit_price, target_premium_t1, target_premium_t2,
                     stop_loss_premium, initial_stop_loss_premium, spot_entry,
                     spot_target_t1, spot_target_t2, spot_sl, entry_time,
-                    exit_time, last_quote_time, status, exit_reason,
-                    gross_pnl, net_pnl, total_costs, realized_rr, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    exit_time, last_quote_time, current_ltp, current_bid,
+                    current_ask, is_exit_triggered, pending_exit_reason,
+                    status, exit_reason, gross_pnl, net_pnl, total_costs,
+                    realized_rr, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     pos.get("position_id"),
@@ -490,6 +497,11 @@ class DuckDBStore(IStorageEngine):
                     pos.get("entry_time"),
                     pos.get("exit_time"),
                     pos.get("last_quote_time"),
+                    pos.get("current_ltp"),
+                    pos.get("current_bid"),
+                    pos.get("current_ask"),
+                    pos.get("is_exit_triggered", False),
+                    pos.get("pending_exit_reason"),
                     pos.get("status"),
                     pos.get("exit_reason"),
                     pos.get("gross_pnl", 0.0),

@@ -6,6 +6,7 @@ Indian statutory costs (STT 0.15%, Brokerage, GST, Stamp Duty), and DuckDB persi
 """
 
 from datetime import date, datetime, timedelta
+from typing import Dict
 
 import pytz
 
@@ -19,7 +20,7 @@ from nifty_engine.analysis.technical.multi_timeframe import TechnicalCandidate
 from nifty_engine.core.interfaces import Candle, Tick
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.paper_trading.engine import PaperTradingEngine
-from nifty_engine.paper_trading.models import ExitReason, PositionStatus
+from nifty_engine.paper_trading.models import ExitReason, OrderSide, PositionStatus
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -810,5 +811,174 @@ def test_on_candle_spot_targets_call_and_put():
     assert len(ev_put) == 1
     assert ev_put[0][1] == ExitReason.TARGET_2
     assert pos_put.status == PositionStatus.CLOSED
+
+
+def test_tick_freshness_uses_receipt_time_vs_exchange_time():
+    """Verify tick freshness validation evaluates receipt time against exchange time."""
+    engine = PaperTradingEngine(max_quote_age_seconds=30.0)
+    receipt_ts = IST.localize(datetime(2026, 11, 26, 10, 5, 0))
+    stale_exchange_ts = receipt_ts - timedelta(seconds=45)  # 45s latency > 30s max
+
+    tick_stale = Tick(
+        symbol="NSE:NIFTY50-INDEX",
+        ltp=25100.0,
+        volume=1000,
+        exchange_timestamp=stale_exchange_ts,
+        local_timestamp=receipt_ts,
+    )
+    # Stale tick should be rejected
+    events = engine.on_tick(tick_stale)
+    assert events == []
+
+    # Fresh tick (latency = 2s <= 30s)
+    fresh_exchange_ts = receipt_ts - timedelta(seconds=2)
+    tick_fresh = Tick(
+        symbol="NSE:NIFTY50-INDEX",
+        ltp=25105.0,
+        volume=1000,
+        exchange_timestamp=fresh_exchange_ts,
+        local_timestamp=receipt_ts,
+    )
+    # Process fresh tick (no positions open, returns empty list without dropping)
+    events = engine.on_tick(tick_fresh)
+    assert events == []
+
+
+def test_duckdb_recovery_restores_pending_triggers_quotes_and_trades(tmp_path):
+    """Verify DuckDB state recovery restores pending exit triggers, quotes, and execution trades."""
+    db_file = str(tmp_path / "paper_recovery_hardening.duckdb")
+    store = DuckDBStore(db_path=db_file)
+
+    engine1 = PaperTradingEngine(store=store, default_lots=2, slippage_points=0.5)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 9, 30, 0))
+
+    cand = create_mock_candidate(
+        candidate_id="RECOVERY_HARDENED",
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        target_1=25140.0,
+        target_2=25180.0,
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+    pos1 = engine1.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos1 is not None
+
+    # T1 triggered within fresh quote window -> partial exit
+    spot_tick_t1 = Tick(
+        symbol="NSE:NIFTY50-INDEX",
+        ltp=25145.0,
+        volume=50000,
+        local_timestamp=entry_ts + timedelta(seconds=10),
+    )
+    engine1.on_tick(spot_tick_t1)
+    assert pos1.status == PositionStatus.PARTIALLY_CLOSED
+    assert len(pos1.trades) == 2  # Buy + T1 Sell
+
+    # Simulate pending exit trigger with stale quote
+    pos1.is_exit_triggered = True
+    pos1.pending_exit_reason = ExitReason.STOP_LOSS
+    pos1.current_ltp = 105.0
+    pos1.current_bid = 104.5
+    pos1.current_ask = 105.5
+    store.save_paper_position(pos1.to_dict())
+
+    # Now create engine2 from the same DuckDB store
+    engine2 = PaperTradingEngine(store=store, default_lots=2, slippage_points=0.5)
+    recovered = engine2.get_open_positions()
+    assert len(recovered) == 1
+    pos2 = recovered[0]
+
+    assert pos2.position_id == pos1.position_id
+    assert pos2.status == PositionStatus.PARTIALLY_CLOSED
+    assert pos2.is_exit_triggered is True
+    assert pos2.pending_exit_reason == ExitReason.STOP_LOSS
+    assert pos2.current_ltp == 105.0
+    assert pos2.current_bid == 104.5
+    assert pos2.current_ask == 105.5
+    assert len(pos2.trades) == 2  # Reconstructed from paper orders!
+    assert pos2.trades[0].side == OrderSide.BUY
+    assert pos2.trades[1].side == OrderSide.SELL
+
+    store.close()
+
+
+def test_quote_provider_fallback_in_on_candle():
+    """Verify on_candle queries quote_provider when quote is stale during spot breach."""
+    fetched = False
+
+    def mock_quote_provider(symbol: str) -> Dict[str, float]:
+        nonlocal fetched
+        fetched = True
+        return {"ltp": 82.0, "bid": 81.5, "ask": 82.5}
+
+    engine = PaperTradingEngine(
+        quote_provider=mock_quote_provider,
+        default_lots=1,
+        slippage_points=0.5,
+        max_quote_age_seconds=10.0,
+    )
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        stop_loss=25070.0,
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+
+    # Candle 60s later breaches spot SL
+    stale_bar = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="1m",
+        timestamp=entry_ts + timedelta(seconds=60),
+        open=25080.0,
+        high=25085.0,
+        low=25065.0,  # Breached 25070 SL
+        close=25075.0,
+        volume=20000,
+        is_closed=True,
+    )
+
+    events = engine.on_candle(stale_bar)
+    assert fetched is True
+    assert len(events) == 1
+    p, reason, exit_price = events[0]
+    assert reason == ExitReason.STOP_LOSS
+    assert exit_price == 81.0  # 81.5 bid - 0.5 slippage
+    assert p.status == PositionStatus.CLOSED
+
+
+def test_market_data_engine_wires_quote_provider_and_candle_pipeline():
+    """Verify MarketDataEngine constructor wires quote provider and on_candle properly."""
+    from run_market_data import MarketDataEngine
+
+    # Use in-memory DuckDB for test isolation
+    store = DuckDBStore(db_path=":memory:")
+    runner = MarketDataEngine(store=store)
+
+    assert runner.paper_engine is not None
+    assert runner.paper_engine.quote_provider is not None
+    assert callable(runner.paper_engine.quote_provider)
+
+    # Verify candle close forwards to paper_engine
+    candle = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="1m",
+        timestamp=IST.localize(datetime(2026, 11, 26, 10, 0, 0)),
+        open=25100.0,
+        high=25110.0,
+        low=25095.0,
+        close=25105.0,
+        volume=1000,
+        is_closed=True,
+    )
+    runner._on_candle_closed(candle)
+    assert runner.candle_count == 1
+    store.close()
+
 
 

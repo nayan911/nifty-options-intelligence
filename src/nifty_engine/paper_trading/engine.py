@@ -259,14 +259,20 @@ class PaperTradingEngine:
         """Processes verified live tick updates for subscribed options or primary underlying spot."""
         events: List[Tuple[PaperPosition, ExitReason, float]] = []
         sym = tick.symbol
-        current_time = tick.exchange_timestamp or tick.local_timestamp or now_ist()
+        receipt_time = tick.local_timestamp or now_ist()
+        exchange_time = tick.exchange_timestamp or receipt_time
 
-        # Reject stale ticks if exchange timestamp is significantly behind current clock
+        # Reject stale ticks if exchange timestamp is significantly behind receipt clock
         if tick.exchange_timestamp:
-            tick_age = (current_time - tick.exchange_timestamp).total_seconds()
-            if tick_age > self.max_quote_age_seconds:
-                logger.debug("Dropping stale tick for %s (age %.1fs > %.1fs)", sym, tick_age, self.max_quote_age_seconds)
+            tick_latency = (receipt_time - tick.exchange_timestamp).total_seconds()
+            if tick_latency > self.max_quote_age_seconds:
+                logger.debug(
+                    "Dropping stale tick for %s (latency %.1fs > %.1fs)",
+                    sym, tick_latency, self.max_quote_age_seconds,
+                )
                 return events
+
+        current_time = exchange_time
 
         # 1. Contract Tick: Update Option M2M and evaluate premium triggers
         for pos_id, pos in list(self.active_positions.items()):
@@ -464,6 +470,13 @@ class PaperTradingEngine:
                 spot_sl_hit = (candle.low <= pos.spot_sl) if is_call else (candle.high >= pos.spot_sl)
                 if spot_sl_hit:
                     reason = ExitReason.TRAILING_STOP if pos.is_breakeven_sl_active else ExitReason.STOP_LOSS
+                    if not is_fresh and self.quote_provider is not None:
+                        fresh_quote = self._fetch_fresh_quote(pos.symbol)
+                        if fresh_quote and fresh_quote.get("bid", 0) > 0:
+                            opt_price = fresh_quote["bid"]
+                            pos.current_bid = opt_price
+                            pos.last_quote_time = current_time
+                            is_fresh = True
                     if is_fresh and opt_price > 0:
                         ev = self._execute_full_exit(pos, opt_price, reason, current_time, notes="Intrabar spot SL breach")
                         if ev:
@@ -476,6 +489,13 @@ class PaperTradingEngine:
                 # Favorable check: Target 2
                 spot_t2_hit = (candle.high >= pos.spot_target_t2) if is_call else (candle.low <= pos.spot_target_t2)
                 if spot_t2_hit:
+                    if not is_fresh and self.quote_provider is not None:
+                        fresh_quote = self._fetch_fresh_quote(pos.symbol)
+                        if fresh_quote and fresh_quote.get("bid", 0) > 0:
+                            opt_price = fresh_quote["bid"]
+                            pos.current_bid = opt_price
+                            pos.last_quote_time = current_time
+                            is_fresh = True
                     if is_fresh and opt_price > 0:
                         ev = self._execute_full_exit(pos, opt_price, ExitReason.TARGET_2, current_time, notes="Intrabar spot T2 reached")
                         if ev:
@@ -488,6 +508,13 @@ class PaperTradingEngine:
                 # Favorable check: Target 1
                 spot_t1_hit = (candle.high >= pos.spot_target_t1) if is_call else (candle.low <= pos.spot_target_t1)
                 if not pos.is_t1_hit and spot_t1_hit:
+                    if not is_fresh and self.quote_provider is not None:
+                        fresh_quote = self._fetch_fresh_quote(pos.symbol)
+                        if fresh_quote and fresh_quote.get("bid", 0) > 0:
+                            opt_price = fresh_quote["bid"]
+                            pos.current_bid = opt_price
+                            pos.last_quote_time = current_time
+                            is_fresh = True
                     if is_fresh and opt_price > 0:
                         ev = self._execute_partial_exit_t1(pos, opt_price, current_time, notes="Intrabar spot T1 reached")
                         if ev:
@@ -771,28 +798,31 @@ class PaperTradingEngine:
             return
 
         try:
-            # 1. Recover closed positions and accumulate historical performance
+            # 1. Recover orders first so trade histories can be mapped to positions
+            orders_rows = self.store.get_paper_orders()
+            orders_by_pos: Dict[str, List[PaperOrder]] = {}
+            for o_row in orders_rows:
+                order = self._row_to_order(o_row)
+                self.orders[order.order_id] = order
+                if order.position_id:
+                    orders_by_pos.setdefault(order.position_id, []).append(order)
+
+            # 2. Recover closed positions and accumulate historical performance
             closed_rows = self.store.get_paper_positions(status=PositionStatus.CLOSED.value)
             for row in closed_rows:
-                pos = self._row_to_position(row)
+                pos = self._row_to_position(row, orders=orders_by_pos.get(str(row.get("position_id")), []))
                 self.closed_positions.append(pos)
                 self.total_realized_gross_pnl += pos.gross_pnl
                 self.total_realized_net_pnl += pos.net_pnl
                 self.total_costs_paid += pos.total_costs
 
-            # 2. Recover active open and partially closed positions
+            # 3. Recover active open and partially closed positions
             for st in (PositionStatus.OPEN.value, PositionStatus.PARTIALLY_CLOSED.value):
                 active_rows = self.store.get_paper_positions(status=st)
                 for row in active_rows:
-                    pos = self._row_to_position(row)
+                    pos = self._row_to_position(row, orders=orders_by_pos.get(str(row.get("position_id")), []))
                     self.active_positions[pos.position_id] = pos
                     self.subscribed_option_symbols.add(pos.symbol)
-
-            # 3. Recover orders
-            orders_rows = self.store.get_paper_orders()
-            for o_row in orders_rows:
-                order = self._row_to_order(o_row)
-                self.orders[order.order_id] = order
 
             logger.info(
                 "Recovered %d active and %d closed paper positions from DuckDB. Historical Net P&L: ₹%.2f",
@@ -803,8 +833,8 @@ class PaperTradingEngine:
         except Exception as e:
             logger.warning("Failed to recover paper trading state from DuckDB: %s", e)
 
-    def _row_to_position(self, row: Dict[str, Any]) -> PaperPosition:
-        """Constructs PaperPosition instance from DuckDB dictionary row."""
+    def _row_to_position(self, row: Dict[str, Any], orders: Optional[List[PaperOrder]] = None) -> PaperPosition:
+        """Constructs PaperPosition instance from DuckDB dictionary row and order history."""
         entry_time = self._parse_dt(row.get("entry_time")) or now_ist()
         exit_time = self._parse_dt(row.get("exit_time"))
         last_quote_time = self._parse_dt(row.get("last_quote_time")) or entry_time
@@ -815,6 +845,14 @@ class PaperTradingEngine:
 
         reason_str = row.get("exit_reason")
         exit_reason = ExitReason(reason_str) if reason_str and reason_str in ExitReason._value2member_map_ else None
+
+        is_exit_triggered = bool(row.get("is_exit_triggered", False))
+        pending_exit_str = row.get("pending_exit_reason")
+        pending_exit_reason = (
+            ExitReason(pending_exit_str)
+            if pending_exit_str and pending_exit_str in ExitReason._value2member_map_
+            else None
+        )
 
         pos = PaperPosition(
             position_id=str(row.get("position_id")),
@@ -844,12 +882,91 @@ class PaperTradingEngine:
             exit_reason=exit_reason,
             is_t1_hit=(status == PositionStatus.PARTIALLY_CLOSED or exit_reason == ExitReason.TARGET_2),
             is_breakeven_sl_active=(status == PositionStatus.PARTIALLY_CLOSED),
+            current_ltp=float(row.get("current_ltp", 0.0)),
+            current_bid=float(row["current_bid"]) if row.get("current_bid") is not None else None,
+            current_ask=float(row["current_ask"]) if row.get("current_ask") is not None else None,
+            is_exit_triggered=is_exit_triggered,
+            pending_exit_reason=pending_exit_reason,
             gross_pnl=float(row.get("gross_pnl", 0.0)),
             net_pnl=float(row.get("net_pnl", 0.0)),
             total_costs=float(row.get("total_costs", 0.0)),
             realized_rr=float(row["realized_rr"]) if row.get("realized_rr") is not None else None,
             notes=row.get("notes"),
         )
+
+        # Restore execution history (trades)
+        trades: List[PositionTrade] = []
+        if orders:
+            for order in sorted(orders, key=lambda o: o.created_at):
+                if order.status != OrderStatus.FILLED:
+                    continue
+                price = order.filled_price or pos.entry_price
+                qty = order.quantity
+                is_buy = (order.side == OrderSide.BUY)
+                costs = self.cost_model.compute_fill_costs(
+                    side="BUY" if is_buy else "SELL",
+                    price=price,
+                    quantity=qty,
+                )["total_costs"]
+                trade_reason = None
+                if not is_buy:
+                    trade_reason = pos.exit_reason if (pos.status == PositionStatus.CLOSED and qty == pos.remaining_quantity) else ExitReason.TARGET_1
+                trade = PositionTrade(
+                    trade_id=f"tr_{order.order_id}",
+                    order_id=order.order_id,
+                    side=order.side,
+                    quantity=qty,
+                    price=price,
+                    timestamp=order.filled_at or order.created_at,
+                    turnover=round(price * qty, 2),
+                    costs=costs,
+                    reason=trade_reason,
+                )
+                trades.append(trade)
+
+        if not trades and pos.entry_price > 0:
+            entry_costs = self.cost_model.compute_fill_costs(
+                side="BUY",
+                price=pos.entry_price,
+                quantity=pos.initial_quantity,
+            )["total_costs"]
+            trades.append(
+                PositionTrade(
+                    trade_id=f"tr_init_{pos.position_id}",
+                    order_id=f"ord_init_{pos.position_id}",
+                    side=OrderSide.BUY,
+                    quantity=pos.initial_quantity,
+                    price=pos.entry_price,
+                    timestamp=pos.entry_time,
+                    turnover=round(pos.entry_price * pos.initial_quantity, 2),
+                    costs=entry_costs,
+                    reason=None,
+                )
+            )
+            if pos.status == PositionStatus.PARTIALLY_CLOSED:
+                closed_qty = pos.initial_quantity - pos.remaining_quantity
+                if closed_qty > 0:
+                    t1_price = pos.target_premium_t1 or pos.entry_price
+                    t1_costs = self.cost_model.compute_fill_costs(
+                        side="SELL",
+                        price=t1_price,
+                        quantity=closed_qty,
+                    )["total_costs"]
+                    trades.append(
+                        PositionTrade(
+                            trade_id=f"tr_t1_{pos.position_id}",
+                            order_id=f"ord_t1_{pos.position_id}",
+                            side=OrderSide.SELL,
+                            quantity=closed_qty,
+                            price=t1_price,
+                            timestamp=pos.last_quote_time or pos.entry_time,
+                            turnover=round(t1_price * closed_qty, 2),
+                            costs=t1_costs,
+                            reason=ExitReason.TARGET_1,
+                        )
+                    )
+
+        pos.trades = trades
         return pos
 
     def _row_to_order(self, row: Dict[str, Any]) -> PaperOrder:

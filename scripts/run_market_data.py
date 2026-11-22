@@ -6,6 +6,7 @@ and out-of-order quarantine, builds 1m/5m/15m OHLCV bars, and persists data into
 """
 
 import asyncio
+import logging
 import sys
 import time
 from datetime import datetime
@@ -35,6 +36,7 @@ from nifty_engine.paper_trading.engine import PaperTradingEngine
 from nifty_engine.utils.timezone import now_ist
 
 IST = pytz.timezone("Asia/Kolkata")
+logger = logging.getLogger(__name__)
 
 
 class MarketDataEngine:
@@ -62,6 +64,7 @@ class MarketDataEngine:
         self.paper_engine = PaperTradingEngine(
             store=self.store,
             instrument_master=self.master,
+            quote_provider=self._get_live_quote,
             on_trade_event=self._on_paper_trade_event,
         )
         self.ws_client = FyersWebSocketClient(
@@ -98,6 +101,21 @@ class MarketDataEngine:
         self.latest_total_put_oi: Optional[int] = None
         self.option_chain_failure_count: int = 0
         self.option_chain_last_error: Optional[str] = None
+
+    def _get_live_quote(self, symbol: str) -> Optional[Dict[str, float]]:
+        """Provides on-demand authentic broker quote snapshot for paper engine."""
+        try:
+            client = self.auth.get_client()
+            q_res = client.quotes(data={"symbols": symbol})
+            if q_res and q_res.get("s") == "ok" and q_res.get("d"):
+                val = q_res["d"][0].get("v", {})
+                ltp = float(val.get("lp", 0.0))
+                bid = float(val.get("bid", ltp))
+                ask = float(val.get("ask", ltp))
+                return {"ltp": ltp, "bid": bid, "ask": ask}
+        except Exception as e:
+            logger.debug("Failed on-demand quote lookup for %s: %s", symbol, e)
+        return None
 
     def _on_ws_ack(self, ack_msg: dict):
         """Callback on WebSocket subscription and status acknowledgements."""
@@ -201,6 +219,13 @@ class MarketDataEngine:
             f"[{candle.timestamp.strftime('%H:%M:%S')}] {candle.symbol} "
             f"({candle.timeframe}) C: {candle.close:.2f} | V: {candle.volume} | Bars Closed: {self.candle_count}"
         )
+
+        # Forward closed candle to paper engine for intrabar high/low breach checks
+        if hasattr(self, "paper_engine"):
+            try:
+                self.paper_engine.on_candle(candle)
+            except Exception as e:
+                logger.warning("Paper engine candle processing error for %s: %s", candle.symbol, e)
 
         # Real-time quantitative technical analysis
         try:
