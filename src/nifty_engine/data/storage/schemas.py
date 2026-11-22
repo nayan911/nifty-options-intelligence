@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     filled_price DOUBLE,
     slippage DOUBLE DEFAULT 0.0,
     is_estimated_fill BOOLEAN DEFAULT FALSE,
+    reason VARCHAR,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
     filled_at TIMESTAMP WITH TIME ZONE,
     rejection_reason VARCHAR

@@ -8,6 +8,7 @@ Selects the single optimal option contract (strike, expiry, CE/PE) based on:
 5. All-in execution cost viability (statutory fees, slippage, and net R:R).
 """
 
+import logging
 import math
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -24,6 +25,7 @@ from nifty_engine.analysis.derivatives.greeks import GreeksEngine, OptionGreeks
 from nifty_engine.analysis.derivatives.oi_analysis import OIProfile
 from nifty_engine.analysis.technical.breakouts import BreakoutDirection
 
+logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
 
@@ -285,34 +287,54 @@ class OptionContractSelector:
                 try:
                     fresh_q = self.quote_provider(symbol)
                     if fresh_q:
-                        if fresh_q.get("ltp") is not None:
-                            ltp = float(fresh_q["ltp"])
-                        if fresh_q.get("bid") is not None:
-                            bid = float(fresh_q["bid"])
-                        if fresh_q.get("ask") is not None:
-                            ask = float(fresh_q["ask"])
-                        if fresh_q.get("bid_size") is not None:
-                            bid_size = int(fresh_q["bid_size"])
-                        if fresh_q.get("ask_size") is not None:
-                            ask_size = int(fresh_q["ask_size"])
-                        quote_ts = fresh_q.get("timestamp") or fresh_q.get("quote_time") or current_time
-                except Exception:
-                    pass
+                        refreshed_ts = fresh_q.get("timestamp") or fresh_q.get("quote_time")
+                        if refreshed_ts is not None:
+                            if fresh_q.get("ltp") is not None:
+                                ltp = float(fresh_q["ltp"])
+                            if fresh_q.get("bid") is not None:
+                                bid = float(fresh_q["bid"])
+                            if fresh_q.get("ask") is not None:
+                                ask = float(fresh_q["ask"])
+                            if fresh_q.get("bid_size") is not None:
+                                bid_size = int(fresh_q["bid_size"])
+                            if fresh_q.get("ask_size") is not None:
+                                ask_size = int(fresh_q["ask_size"])
+                            quote_ts = refreshed_ts
+                        else:
+                            logger.debug(
+                                "Discarding on-demand quote for %s: missing broker quote timestamp",
+                                symbol,
+                            )
+                except Exception as e:
+                    logger.debug("Quote provider lookup failed for %s: %s", symbol, e)
 
             # HARD ELIGIBILITY GATE 2: Valid, observed broker bid and ask quotes
             if bid is None or ask is None or bid <= 0.0 or ask <= 0.0 or ask < bid:
                 continue
 
             # HARD ELIGIBILITY GATE 3: Quote Freshness
-            if quote_ts:
-                delta_sec = (current_time - quote_ts).total_seconds()
-                if delta_sec < -self.clock_skew_tolerance_seconds:
-                    continue
-                quote_age = max(0.0, delta_sec)
-            else:
-                quote_age = 0.0
+            if not quote_ts:
+                logger.debug("Contract %s rejected: missing quote timestamp", symbol)
+                continue
+
+            delta_sec = (current_time - quote_ts).total_seconds()
+            if delta_sec < -self.clock_skew_tolerance_seconds:
+                logger.debug(
+                    "Contract %s rejected: quote timestamp is in the future (skew %.1fs > allowed %.1fs)",
+                    symbol,
+                    -delta_sec,
+                    self.clock_skew_tolerance_seconds,
+                )
+                continue
+            quote_age = max(0.0, delta_sec)
 
             if quote_age > self.max_quote_age_seconds:
+                logger.debug(
+                    "Contract %s rejected: quote timestamp is stale (age %.1fs > %.1fs)",
+                    symbol,
+                    quote_age,
+                    self.max_quote_age_seconds,
+                )
                 continue
 
             spread = round(ask - bid, 2)

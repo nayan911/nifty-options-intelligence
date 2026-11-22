@@ -1946,6 +1946,60 @@ def test_order_level_estimated_fill_persistence_and_recovery(tmp_path):
     store.close()
 
 
+def test_duckdb_recovery_restores_exact_exit_reason_not_target1(tmp_path):
+    """Verify engine recovery restores exact exit reason (e.g. STOP_LOSS) and never misclassifies as TARGET_1."""
+    db_path = tmp_path / "test_exit_reason_recovery.duckdb"
+    store = DuckDBStore(db_path=db_path)
+
+    engine = PaperTradingEngine(store=store, default_lots=1, slippage_points=0.5)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+    cand = create_mock_candidate(
+        candidate_id="SL_RECOVERY_TEST",
+        timestamp=entry_ts,
+        entry_ltp=100.0,
+        ask=100.0,
+        sl_premium=85.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+
+    # Option drops and hits stop loss
+    sl_tick = Tick(
+        symbol=pos.symbol,
+        ltp=84.0,
+        bid=83.5,
+        ask=84.5,
+        volume=2000,
+        local_timestamp=entry_ts + timedelta(minutes=5),
+    )
+    events = engine.on_tick(sl_tick)
+    assert len(events) == 1
+    assert pos.status == PositionStatus.CLOSED
+    assert pos.exit_reason == ExitReason.STOP_LOSS
+    assert pos.remaining_quantity == 0
+    assert pos.trades[-1].reason == ExitReason.STOP_LOSS
+
+    # Verify orders table has reason persisted
+    orders = store.get_paper_orders(pos.position_id)
+    assert len(orders) == 2
+    assert orders[1]["reason"] == "STOP_LOSS"
+
+    # Simulate process restart and recover from DuckDB
+    engine_recovered = PaperTradingEngine(store=store)
+    assert len(engine_recovered.closed_positions) == 1
+    rec_pos = engine_recovered.closed_positions[0]
+    assert rec_pos.position_id == pos.position_id
+    assert rec_pos.exit_reason == ExitReason.STOP_LOSS
+    assert len(rec_pos.trades) == 2
+
+    # CRITICAL CHECK: recovered sell trade reason MUST be STOP_LOSS, NOT TARGET_1!
+    assert rec_pos.trades[1].side == OrderSide.SELL
+    assert rec_pos.trades[1].reason == ExitReason.STOP_LOSS
+
+    store.close()
+
+
+
 
 
 

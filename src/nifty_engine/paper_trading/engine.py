@@ -783,6 +783,7 @@ class PaperTradingEngine:
             filled_price=exit_price,
             slippage_points=self.slippage_points,
             is_estimated_fill=False,
+            reason=ExitReason.TARGET_1,
             created_at=current_time,
             filled_at=current_time,
             status=OrderStatus.FILLED,
@@ -848,6 +849,7 @@ class PaperTradingEngine:
             filled_price=exit_price,
             slippage_points=self.slippage_points,
             is_estimated_fill=is_estimated_fill,
+            reason=reason,
             created_at=current_time,
             filled_at=current_time,
             status=OrderStatus.FILLED,
@@ -1165,9 +1167,9 @@ class PaperTradingEngine:
         # Restore execution history (trades)
         trades: List[PositionTrade] = []
         if orders:
-            for order in sorted(orders, key=lambda o: o.created_at):
-                if order.status != OrderStatus.FILLED:
-                    continue
+            filled_orders = [o for o in orders if o.status == OrderStatus.FILLED]
+            sell_orders = [o for o in filled_orders if o.side == OrderSide.SELL]
+            for order in sorted(filled_orders, key=lambda o: o.created_at):
                 price = order.filled_price or pos.entry_price
                 qty = order.quantity
                 is_buy = (order.side == OrderSide.BUY)
@@ -1178,7 +1180,13 @@ class PaperTradingEngine:
                 )["total_costs"]
                 trade_reason = None
                 if not is_buy:
-                    trade_reason = pos.exit_reason if (pos.status == PositionStatus.CLOSED and qty == pos.remaining_quantity) else ExitReason.TARGET_1
+                    trade_reason = getattr(order, "reason", None)
+                    if trade_reason is None:
+                        is_final_sell = (
+                            pos.status == PositionStatus.CLOSED
+                            and (not sell_orders or order == sell_orders[-1])
+                        )
+                        trade_reason = pos.exit_reason if is_final_sell else ExitReason.TARGET_1
                 trade = PositionTrade(
                     trade_id=f"tr_{order.order_id}",
                     order_id=order.order_id,
@@ -1249,6 +1257,13 @@ class PaperTradingEngine:
         st_str = row.get("status", "FILLED")
         st = OrderStatus(st_str) if st_str in OrderStatus._value2member_map_ else OrderStatus.FILLED
 
+        reason_str = row.get("reason")
+        order_reason = (
+            ExitReason(reason_str)
+            if reason_str and reason_str in ExitReason._value2member_map_
+            else None
+        )
+
         return PaperOrder(
             order_id=str(row.get("order_id")),
             position_id=row.get("position_id"),
@@ -1264,6 +1279,7 @@ class PaperTradingEngine:
             filled_price=float(row["filled_price"]) if row.get("filled_price") is not None else None,
             slippage_points=float(row.get("slippage", 0.0)),
             is_estimated_fill=bool(row.get("is_estimated_fill", False)),
+            reason=order_reason,
             rejection_reason=row.get("rejection_reason"),
         )
 

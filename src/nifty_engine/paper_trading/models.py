@@ -59,6 +59,7 @@ class PaperOrder:
     is_estimated_fill: bool = False
     filled_at: Optional[datetime] = None
     rejection_reason: Optional[str] = None
+    reason: Optional[ExitReason] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -74,6 +75,7 @@ class PaperOrder:
             "filled_price": self.filled_price,
             "slippage": self.slippage_points,
             "is_estimated_fill": self.is_estimated_fill,
+            "reason": self.reason.value if isinstance(self.reason, ExitReason) else (str(self.reason) if self.reason else None),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "filled_at": self.filled_at.isoformat() if self.filled_at else None,
             "rejection_reason": self.rejection_reason,

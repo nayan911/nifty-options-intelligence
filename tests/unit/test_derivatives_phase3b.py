@@ -643,3 +643,70 @@ def test_asymmetric_target_and_sl_execution_costs():
     assert costs.net_reward_points_t1 == round(40.0 - costs.target_friction_points, 2)
     # Net risk = gross risk (20.0) + sl_friction
     assert costs.net_risk_points == round(20.0 + costs.sl_friction_points, 2)
+
+
+def test_contract_selector_rejects_timestamp_less_rest_quotes():
+    """Verify OptionContractSelector rejects on-demand REST quotes missing broker timestamps."""
+    from datetime import timedelta
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    # Option chain snapshot from 100 seconds ago (stale > 30s)
+    stale_chain_time = t0 - timedelta(seconds=100)
+    snap = create_phase3b_chain(stale_chain_time)
+    oi_analyzer = OpenInterestAnalyzer()
+    profile = oi_analyzer.on_option_chain(snap)
+
+    # 1. Quote provider returns fresh bid/ask but WITHOUT timestamp (timestamp=None)
+    def mock_quote_provider_no_ts(symbol: str):
+        if "25100CE" in symbol:
+            return {
+                "ltp": 95.0,
+                "bid": 94.5,
+                "ask": 95.5,
+                "timestamp": None,
+            }
+        return None
+
+    selector_no_ts = OptionContractSelector(
+        quote_provider=mock_quote_provider_no_ts,
+        max_quote_age_seconds=30.0,
+    )
+    # Because quote has no timestamp, it cannot substitute current_time;
+    # underlying chain quote is stale (100s old), so contract MUST be rejected!
+    res_no_ts = selector_no_ts.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=t0,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res_no_ts is None
+
+    # 2. Quote provider returns fresh bid/ask WITH authentic broker timestamp (5s old)
+    def mock_quote_provider_valid_ts(symbol: str):
+        if "25100CE" in symbol:
+            return {
+                "ltp": 95.0,
+                "bid": 94.5,
+                "ask": 95.5,
+                "timestamp": t0 - timedelta(seconds=5),
+            }
+        return None
+
+    selector_valid = OptionContractSelector(
+        quote_provider=mock_quote_provider_valid_ts,
+        max_quote_age_seconds=30.0,
+    )
+    res_valid = selector_valid.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=t0,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res_valid is not None
+    assert res_valid.bid == 94.5
+    assert res_valid.ask == 95.5
+    assert res_valid.quote_age_seconds == 5.0
+
