@@ -11,6 +11,10 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional
 
+from nifty_engine.analysis.derivatives.contract_selector import (
+    OptionContractSelector,
+    SelectedContract,
+)
 from nifty_engine.analysis.derivatives.oi_analysis import (
     DirectionalBias,
     FuturesOIAnalysis,
@@ -51,6 +55,7 @@ class DerivativesAssessment:
     decision_at: Optional[datetime] = None
     confirmation_status: str = "CONFIRMED"
     is_stale: bool = False
+    selected_contract: Optional[SelectedContract] = None
 
     @property
     def confidence_score(self) -> float:
@@ -59,7 +64,7 @@ class DerivativesAssessment:
 
     def to_dict(self) -> dict:
         """Serializes assessment for logging and telemetry."""
-        return {
+        res = {
             "assessment_type": self.assessment_type.value,
             "direction": self.direction.value,
             "alignment_score": round(self.alignment_score, 2),
@@ -75,6 +80,9 @@ class DerivativesAssessment:
             "call_wall": self.oi_profile.call_wall_strike if self.oi_profile else None,
             "put_wall": self.oi_profile.put_wall_strike if self.oi_profile else None,
         }
+        if self.selected_contract is not None:
+            res["selected_contract"] = self.selected_contract.to_dict()
+        return res
 
 
 class DerivativesIntelligenceEngine:
@@ -84,10 +92,12 @@ class DerivativesIntelligenceEngine:
         self,
         oi_analyzer: Optional[OpenInterestAnalyzer] = None,
         pcr_engine: Optional[PCREngine] = None,
+        contract_selector: Optional[OptionContractSelector] = None,
         primary_futures: str = "NSE:NIFTY26NOVFUT",
     ):
         self.oi_analyzer = oi_analyzer or OpenInterestAnalyzer()
         self.pcr_engine = pcr_engine or PCREngine()
+        self.contract_selector = contract_selector or OptionContractSelector()
         self.primary_futures = primary_futures
 
     def set_futures_ticker(self, futures_ticker: str) -> None:
@@ -102,6 +112,10 @@ class DerivativesIntelligenceEngine:
         underlying: str = "NIFTY",
         futures_symbol: Optional[str] = None,
         confirmation_status: str = "CONFIRMED",
+        risk_points: float = 20.0,
+        target_points_t1: float = 30.0,
+        target_points_t2: float = 50.0,
+        holding_minutes: Optional[float] = None,
     ) -> DerivativesAssessment:
         """Evaluates derivatives alignment for a given breakout direction and reference level.
 
@@ -270,6 +284,22 @@ class DerivativesIntelligenceEngine:
             assessment_type = DerivativesAssessmentType.NEUTRAL
             alignment = 0.5
 
+        # Phase 3B: Select optimal option contract and evaluate trajectory
+        selected_contract = None
+        if self.contract_selector is not None and not is_stale:
+            fut_price = fut_analysis.price if fut_analysis else level_price
+            selected_contract = self.contract_selector.select_contract(
+                direction=direction,
+                spot_price=level_price,
+                chain_profile=oi_profile,
+                futures_price=fut_price,
+                as_of=as_of,
+                risk_points=risk_points,
+                target_points_t1=target_points_t1,
+                target_points_t2=target_points_t2,
+                holding_minutes=holding_minutes,
+            )
+
         return DerivativesAssessment(
             assessment_type=assessment_type,
             direction=direction,
@@ -286,4 +316,5 @@ class DerivativesIntelligenceEngine:
             decision_at=as_of,
             confirmation_status=confirmation_status,
             is_stale=False,
+            selected_contract=selected_contract,
         )

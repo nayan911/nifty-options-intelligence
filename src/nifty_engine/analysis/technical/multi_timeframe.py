@@ -650,6 +650,9 @@ class MultiTimeframeAnalyzer:
                 underlying=underlying,
                 futures_symbol=futures_symbol,
                 confirmation_status=confirmation_status,
+                risk_points=round(risk_points, 1),
+                target_points_t1=round(reward_1, 1),
+                target_points_t2=round(reward_2, 1),
             )
 
         breakdown = {
