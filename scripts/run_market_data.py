@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Set
 
 import pytz
 
+from nifty_engine.analysis.derivatives import DerivativesIntelligenceEngine
 from nifty_engine.analysis.technical.breakouts import BreakoutContext
 from nifty_engine.analysis.technical.engine import (
     TechnicalAnalysisEngine,
@@ -49,11 +50,13 @@ class MarketDataEngine:
         self.running = True
 
         self.builder = RealtimeCandleBuilder(on_candle_close=self._on_candle_closed)
+        self.derivatives_engine = DerivativesIntelligenceEngine(primary_futures="NSE:NIFTY26NOVFUT")
         self.technical_engine = TechnicalAnalysisEngine(
             primary_index=settings.PRIMARY_INDEX,
             primary_futures="NSE:NIFTY26NOVFUT",
             on_setup_candidate=self._on_setup_candidate,
             on_technical_candidate=self._on_technical_candidate,
+            derivatives_engine=self.derivatives_engine,
         )
         self.ws_client = FyersWebSocketClient(
             auth_provider=self.auth,
@@ -219,6 +222,17 @@ class MarketDataEngine:
         t1_rr_str = f"{candidate.target_1_rr:.2f}R" if hasattr(candidate, "target_1_rr") else "1.50R"
         t2_rr_str = f"{candidate.target_2_rr:.2f}R" if hasattr(candidate, "target_2_rr") else "2.00R"
 
+        deriv_str = ""
+        if getattr(candidate, "derivatives_assessment", None) is not None:
+            da = candidate.derivatives_assessment
+            reasons_summary = ", ".join(da.reasons[:2]) if da.reasons else "None"
+            contra_summary = ", ".join(da.contra_reasons[:2]) if da.contra_reasons else "None"
+            deriv_str = (
+                f"  Derivatives Assessment: {da.assessment_type.value} "
+                f"(Alignment: {da.alignment_score:.2f}, Quality: {da.data_quality_score:.2f}) | "
+                f"Reasons: {reasons_summary} | Contra: {contra_summary}\n"
+            )
+
         print(
             f"\n{'*'*78}\n"
             f"  [PHASE C: QUALIFIED MULTI-TIMEFRAME TECHNICAL CANDIDATE]\n"
@@ -226,6 +240,7 @@ class MarketDataEngine:
             f"  Macro 15m Trend: {candidate.timeframe_breakdown.get('15m_trend')} | "
             f"5m RVOL: {candidate.timeframe_breakdown.get('5m_rvol')}x | "
             f"15m Headroom: {headroom_str}\n"
+            f"{deriv_str}"
             f"  Entry: {candidate.entry_price:.2f} | SL: {candidate.stop_loss:.2f} | "
             f"T1: {candidate.target_1:.2f} ({t1_rr_str}) | T2: {candidate.target_2:.2f} ({t2_rr_str}) | R:R: 1:{candidate.risk_reward_ratio}\n"
             f"{'*'*78}\n"
@@ -406,6 +421,7 @@ class MarketDataEngine:
             loop.close()
 
             self.store.save_option_chain_snapshot(chain)
+            self.technical_engine.on_option_chain(chain, as_of=now)
             self.last_option_chain_time = now
             self.latest_option_chain_pcr = chain.pcr
             self.latest_total_call_oi = chain.total_call_oi

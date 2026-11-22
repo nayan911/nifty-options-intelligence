@@ -196,3 +196,48 @@ def test_market_data_engine_mixed_timeframe_handling():
 
     store.close()
 
+
+
+
+def test_market_data_engine_derivatives_integration():
+    """Verify P0: MarketDataEngine initializes DerivativesIntelligenceEngine and connects live option chain polling."""
+    store = DuckDBStore(db_path=":memory:")
+    engine = MarketDataEngine(store=store)
+
+    # 1. Verify derivatives_engine was initialized on MarketDataEngine and wired to TechnicalAnalysisEngine
+    assert engine.derivatives_engine is not None
+    assert engine.technical_engine.derivatives_engine is engine.derivatives_engine
+
+    # 2. Simulate option chain payload arrival
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    from nifty_engine.core.interfaces import OptionChainSnapshot, OptionChainStrike
+    chain = OptionChainSnapshot(
+        underlying="NIFTY",
+        spot_price=25100.0,
+        api_timestamp=t0,
+        expiry=date(2026, 11, 26),
+        strikes=[
+            OptionChainStrike(
+                strike=25100.0,
+                call={"symbol": "NSE:NIFTY25100CE", "oi": 100000, "ltp": 80.0, "volume": 10000},
+                put={"symbol": "NSE:NIFTY25100PE", "oi": 80000, "ltp": 70.0, "volume": 8000},
+            )
+        ],
+        total_call_oi=100000,
+        total_put_oi=80000,
+        pcr=0.8,
+    )
+
+    # Dispatch to technical engine (as done in _poll_option_chain_if_due)
+    engine.technical_engine.on_option_chain(chain, as_of=t0)
+
+    # Verify OI profile and PCR metrics were populated in derivatives engine
+    profile = engine.derivatives_engine.oi_analyzer.get_profile(underlying="NIFTY", as_of=t0)
+    pcr = engine.derivatives_engine.pcr_engine.get_pcr(underlying="NIFTY", as_of=t0)
+
+    assert profile is not None
+    assert profile.spot_price == 25100.0
+    assert pcr is not None
+    assert pcr.aggregate_oi_pcr == 0.8
+
+    store.close()

@@ -2,11 +2,11 @@
 
 Provides strike-level options and futures OI flow analysis, buildup classification
 with proper directional semantics (CE vs PE), dynamic Call/Put walls, Max Pain,
-and multi-window timestamped comparisons.
+and multi-window timestamped comparisons with strict symbol, timeframe, and expiry isolation.
 """
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -72,6 +72,7 @@ class FuturesOIAnalysis:
     """Futures price and OI positioning analysis."""
 
     symbol: str
+    timeframe: str
     timestamp: datetime
     price: float
     price_change: float
@@ -87,6 +88,7 @@ class FuturesOIAnalysis:
 class OIProfile:
     """Consolidated Open Interest profile for an option chain snapshot."""
 
+    underlying: str
     timestamp: datetime
     expiry: date
     spot_price: float
@@ -98,7 +100,6 @@ class OIProfile:
     strikes: Dict[float, StrikeOIAnalysis]
     near_atm_strikes: List[StrikeOIAnalysis]
     aggregate_bias: DirectionalBias
-    futures_analysis: Optional[FuturesOIAnalysis] = None
     observation_interval_seconds: float = 0.0
     is_stale: bool = False
 
@@ -111,42 +112,89 @@ class OpenInterestAnalyzer:
 
     def __init__(
         self,
-        min_oi_change_threshold_pct: float = 2.0,
-        min_oi_change_contracts: int = 500,
-        min_price_change_pct: float = 0.5,
+        # Option thresholds
+        min_opt_oi_change_threshold_pct: float = 1.5,
+        min_opt_oi_change_contracts: int = 300,
+        min_opt_price_change_points: float = 1.0,
+        min_opt_price_change_pct: float = 1.5,
+        # Futures thresholds (points and percentage tailored to underlying index futures)
+        min_fut_oi_change_threshold_pct: float = 0.1,
+        min_fut_oi_change_contracts: int = 150,
+        min_fut_price_change_points: float = 3.0,
+        min_fut_price_change_pct: float = 0.02,
+        # Freshness and observation limits
         max_snapshot_age_seconds: float = 360.0,
+        max_futures_age_seconds: float = 600.0,
         near_atm_strikes_count: int = 5,
         history_max_len: int = 50,
+        # Backward compatibility aliases
+        min_oi_change_threshold_pct: Optional[float] = None,
+        min_oi_change_contracts: Optional[int] = None,
+        min_price_change_pct: Optional[float] = None,
     ):
-        self.min_oi_change_threshold_pct = min_oi_change_threshold_pct
-        self.min_oi_change_contracts = min_oi_change_contracts
-        self.min_price_change_pct = min_price_change_pct
+        if min_oi_change_threshold_pct is not None:
+            min_opt_oi_change_threshold_pct = min_oi_change_threshold_pct
+            min_fut_oi_change_threshold_pct = min_oi_change_threshold_pct
+        if min_oi_change_contracts is not None:
+            min_opt_oi_change_contracts = min_oi_change_contracts
+            min_fut_oi_change_contracts = min_oi_change_contracts
+        if min_price_change_pct is not None:
+            min_opt_price_change_pct = min_price_change_pct
+            min_fut_price_change_pct = min_price_change_pct
+
+        self.min_opt_oi_change_threshold_pct = min_opt_oi_change_threshold_pct
+        self.min_opt_oi_change_contracts = min_opt_oi_change_contracts
+        self.min_opt_price_change_points = min_opt_price_change_points
+        self.min_opt_price_change_pct = min_opt_price_change_pct
+
+        self.min_fut_oi_change_threshold_pct = min_fut_oi_change_threshold_pct
+        self.min_fut_oi_change_contracts = min_fut_oi_change_contracts
+        self.min_fut_price_change_points = min_fut_price_change_points
+        self.min_fut_price_change_pct = min_fut_price_change_pct
+
         self.max_snapshot_age_seconds = max_snapshot_age_seconds
+        self.max_futures_age_seconds = max_futures_age_seconds
         self.near_atm_strikes_count = near_atm_strikes_count
         self.history_max_len = history_max_len
 
-        # Snapshot history partitioned by expiry date to guarantee expiry isolation
-        self._chain_history: Dict[date, Deque[OptionChainSnapshot]] = {}
-        # Latest profile per expiry date
-        self.latest_profiles: Dict[date, OIProfile] = {}
+        # Current trading session date
+        self.current_session_date: Optional[date] = None
 
-        # Futures tracking: rolling history of (timestamp, price, oi)
-        self._futures_history: Deque[Tuple[datetime, float, int]] = deque(maxlen=history_max_len)
-        self.latest_futures_analysis: Optional[FuturesOIAnalysis] = None
+        # Snapshot & Profile history partitioned by (underlying, expiry)
+        self._chain_history: Dict[Tuple[str, date], Deque[OptionChainSnapshot]] = {}
+        self._profile_history: Dict[Tuple[str, date], Deque[OIProfile]] = {}
+        self.latest_profiles: Dict[Tuple[str, date], OIProfile] = {}
+
+        # Futures tracking partitioned strictly by (symbol, timeframe)
+        self._futures_history: Dict[Tuple[str, str], Deque[FuturesOIAnalysis]] = {}
+        self.latest_futures_analysis: Dict[Tuple[str, str], FuturesOIAnalysis] = {}
 
     def on_futures_candle(self, candle: Candle) -> Optional[FuturesOIAnalysis]:
-        """Updates futures OI and price state from a newly closed candle."""
-        if candle.oi is None or candle.close <= 0.0:
-            return self.latest_futures_analysis
+        """Updates futures OI and price state from a newly closed candle with symbol and timeframe isolation."""
+        if not candle.is_closed or candle.oi is None or candle.close <= 0.0:
+            return None
 
+        key = (candle.symbol, candle.timeframe)
+        if key not in self._futures_history:
+            self._futures_history[key] = deque(maxlen=self.history_max_len)
+
+        history = self._futures_history[key]
         current_time = candle.timestamp
         current_price = candle.close
         current_oi = candle.oi
 
-        if not self._futures_history:
-            self._futures_history.append((current_time, current_price, current_oi))
-            self.latest_futures_analysis = FuturesOIAnalysis(
+        # Reject duplicate or out-of-order candles
+        if history and current_time <= history[-1].timestamp:
+            return history[-1]
+
+        # Session rollover tracking
+        if self.current_session_date is None or current_time.date() > self.current_session_date:
+            self.current_session_date = current_time.date()
+
+        if not history:
+            analysis = FuturesOIAnalysis(
                 symbol=candle.symbol,
+                timeframe=candle.timeframe,
                 timestamp=current_time,
                 price=current_price,
                 price_change=0.0,
@@ -157,15 +205,15 @@ class OpenInterestAnalyzer:
                 buildup=BuildupType.NEUTRAL,
                 directional_bias=DirectionalBias.NEUTRAL,
             )
-            return self.latest_futures_analysis
+            history.append(analysis)
+            self.latest_futures_analysis[key] = analysis
+            return analysis
 
-        prev_time, prev_price, prev_oi = self._futures_history[-1]
-        self._futures_history.append((current_time, current_price, current_oi))
-
-        price_diff = current_price - prev_price
-        price_diff_pct = (price_diff / prev_price * 100.0) if prev_price > 0 else 0.0
-        oi_diff = current_oi - prev_oi
-        oi_diff_pct = (oi_diff / prev_oi * 100.0) if prev_oi > 0 else 0.0
+        prev = history[-1]
+        price_diff = current_price - prev.price
+        price_diff_pct = (price_diff / prev.price * 100.0) if prev.price > 0 else 0.0
+        oi_diff = current_oi - prev.oi
+        oi_diff_pct = (oi_diff / prev.oi * 100.0) if prev.oi > 0 else 0.0
 
         buildup, bias = self._classify_buildup(
             price_change=price_diff,
@@ -175,8 +223,9 @@ class OpenInterestAnalyzer:
             instrument_type="FUT",
         )
 
-        self.latest_futures_analysis = FuturesOIAnalysis(
+        analysis = FuturesOIAnalysis(
             symbol=candle.symbol,
+            timeframe=candle.timeframe,
             timestamp=current_time,
             price=current_price,
             price_change=round(price_diff, 2),
@@ -187,40 +236,86 @@ class OpenInterestAnalyzer:
             buildup=buildup,
             directional_bias=bias,
         )
-        return self.latest_futures_analysis
+        history.append(analysis)
+        self.latest_futures_analysis[key] = analysis
+        return analysis
+
+    def get_futures_analysis(
+        self,
+        symbol: Optional[str] = None,
+        timeframe: str = "5m",
+        as_of: Optional[datetime] = None,
+    ) -> Optional[FuturesOIAnalysis]:
+        """Retrieves causal futures positioning analysis as of a specific cutoff timestamp."""
+        # If symbol not specified, find matching primary symbol in history
+        matching_keys = [k for k in self._futures_history if (symbol is None or k[0] == symbol) and k[1] == timeframe]
+        if not matching_keys:
+            # Fall back to any timeframe (e.g. 1m) if requested timeframe (e.g. 5m) is not yet populated
+            matching_keys = [k for k in self._futures_history if (symbol is None or k[0] == symbol)]
+            if not matching_keys:
+                return None
+
+        key = matching_keys[0]
+        history = self._futures_history[key]
+        if not history:
+            return None
+
+        if as_of is None:
+            return history[-1]
+
+        # Reverse lookup for most recent observation on or before as_of
+        for obs in reversed(history):
+            if obs.timestamp <= as_of:
+                age = (as_of - obs.timestamp).total_seconds()
+                if age <= self.max_futures_age_seconds:
+                    return obs
+                return None
+
+        return None
 
     def on_option_chain(
         self,
         snapshot: OptionChainSnapshot,
         as_of: Optional[datetime] = None,
-    ) -> OIProfile:
-        """Processes an incoming OptionChainSnapshot.
+    ) -> Optional[OIProfile]:
+        """Processes an incoming OptionChainSnapshot with underlying and expiry isolation.
 
-        Calculates actual interval changes between consecutive snapshots for the same expiry,
+        Calculates actual interval changes between consecutive snapshots for the same contract set,
         classifies directional CE/PE buildup, and identifies Call/Put walls.
         """
+        underlying = snapshot.underlying.upper()
         expiry = snapshot.expiry
-        if expiry not in self._chain_history:
-            self._chain_history[expiry] = deque(maxlen=self.history_max_len)
+        current_time = as_of or snapshot.api_timestamp
 
-        history = self._chain_history[expiry]
+        # Session date update
+        if self.current_session_date is None or current_time.date() > self.current_session_date:
+            self.current_session_date = current_time.date()
+
+        # Ignore expired contracts
+        if expiry < self.current_session_date:
+            return None
+
+        key = (underlying, expiry)
+        if key not in self._chain_history:
+            self._chain_history[key] = deque(maxlen=self.history_max_len)
+            self._profile_history[key] = deque(maxlen=self.history_max_len)
+
+        history = self._chain_history[key]
+        # Reject duplicate or out-of-order snapshots
+        if history and snapshot.api_timestamp <= history[-1].api_timestamp:
+            return self._profile_history[key][-1] if self._profile_history[key] else None
+
         prev_snapshot: Optional[OptionChainSnapshot] = history[-1] if history else None
         history.append(snapshot)
 
-        current_time = as_of or snapshot.api_timestamp
         interval_seconds = 0.0
         if prev_snapshot is not None:
             interval_seconds = max(0.0, (snapshot.api_timestamp - prev_snapshot.api_timestamp).total_seconds())
 
-        is_stale = False
-        if (current_time - snapshot.api_timestamp).total_seconds() > self.max_snapshot_age_seconds:
-            is_stale = True
+        is_stale = (current_time - snapshot.api_timestamp).total_seconds() > self.max_snapshot_age_seconds
 
-        # Build strike map of previous snapshot for exact delta calculations
-        prev_strikes_map = {}
-        if prev_snapshot is not None:
-            for s in prev_snapshot.strikes:
-                prev_strikes_map[s.strike] = s
+        # Map previous strikes for exact delta calculations
+        prev_strikes_map = {s.strike: s for s in prev_snapshot.strikes} if prev_snapshot is not None else {}
 
         strikes_analysis: Dict[float, StrikeOIAnalysis] = {}
         max_call_oi = -1
@@ -228,70 +323,107 @@ class OpenInterestAnalyzer:
         max_put_oi = -1
         put_wall_strike = 0.0
 
-        bullish_count = 0
-        bearish_count = 0
-
         for s in snapshot.strikes:
             strike = s.strike
             prev_s = prev_strikes_map.get(strike)
 
             # Call analysis
-            c_curr = s.call or {}
-            c_prev = (prev_s.call or {}) if prev_s else {}
-            c_oi = int(c_curr.get("oi", 0))
-            c_ltp = float(c_curr.get("ltp", 0.0))
-            c_vol = int(c_curr.get("volume", 0))
+            c_curr = s.call
+            c_prev = prev_s.call if prev_s else None
 
-            c_prev_oi = int(c_prev.get("oi", c_oi))
-            c_prev_ltp = float(c_prev.get("ltp", c_ltp))
-            c_prev_vol = int(c_prev.get("volume", c_vol))
+            if c_curr is not None:
+                c_oi = int(c_curr.get("oi", 0))
+                c_ltp = float(c_curr.get("ltp", 0.0))
+                c_vol = int(c_curr.get("volume", 0))
 
-            c_oi_change = c_oi - c_prev_oi
-            c_oi_change_pct = (c_oi_change / c_prev_oi * 100.0) if c_prev_oi > 0 else 0.0
-            c_ltp_change = c_ltp - c_prev_ltp
-            c_ltp_change_pct = (c_ltp_change / c_prev_ltp * 100.0) if c_prev_ltp > 0 else 0.0
-            c_vol_change = c_vol - c_prev_vol
+                if c_prev is not None:
+                    c_prev_oi = int(c_prev.get("oi", c_oi))
+                    c_prev_ltp = float(c_prev.get("ltp", c_ltp))
+                    c_prev_vol = int(c_prev.get("volume", c_vol))
 
-            c_buildup, c_bias = self._classify_buildup(
-                price_change=c_ltp_change,
-                price_change_pct=c_ltp_change_pct,
-                oi_change=c_oi_change,
-                oi_change_pct=c_oi_change_pct,
-                instrument_type="CE",
-            )
+                    c_oi_change = c_oi - c_prev_oi
+                    c_oi_change_pct = (c_oi_change / c_prev_oi * 100.0) if c_prev_oi > 0 else 0.0
+                    c_ltp_change = c_ltp - c_prev_ltp
+                    c_ltp_change_pct = (c_ltp_change / c_prev_ltp * 100.0) if c_prev_ltp > 0 else 0.0
+                    c_vol_change = c_vol - c_prev_vol
+                else:
+                    # Newly appearing strike: establish baseline, zero delta
+                    c_oi_change = 0
+                    c_oi_change_pct = 0.0
+                    c_ltp_change = 0.0
+                    c_ltp_change_pct = 0.0
+                    c_vol_change = 0
 
-            if c_oi > max_call_oi:
-                max_call_oi = c_oi
-                call_wall_strike = strike
+                c_buildup, c_bias = self._classify_buildup(
+                    price_change=c_ltp_change,
+                    price_change_pct=c_ltp_change_pct,
+                    oi_change=c_oi_change,
+                    oi_change_pct=c_oi_change_pct,
+                    instrument_type="CE",
+                )
+
+                if c_oi > max_call_oi:
+                    max_call_oi = c_oi
+                    call_wall_strike = strike
+            else:
+                c_oi = 0
+                c_oi_change = 0
+                c_oi_change_pct = 0.0
+                c_ltp = 0.0
+                c_ltp_change = 0.0
+                c_vol = 0
+                c_vol_change = 0
+                c_buildup = BuildupType.NEUTRAL
+                c_bias = DirectionalBias.NEUTRAL
 
             # Put analysis
-            p_curr = s.put or {}
-            p_prev = (prev_s.put or {}) if prev_s else {}
-            p_oi = int(p_curr.get("oi", 0))
-            p_ltp = float(p_curr.get("ltp", 0.0))
-            p_vol = int(p_curr.get("volume", 0))
+            p_curr = s.put
+            p_prev = prev_s.put if prev_s else None
 
-            p_prev_oi = int(p_prev.get("oi", p_oi))
-            p_prev_ltp = float(p_prev.get("ltp", p_ltp))
-            p_prev_vol = int(p_prev.get("volume", p_vol))
+            if p_curr is not None:
+                p_oi = int(p_curr.get("oi", 0))
+                p_ltp = float(p_curr.get("ltp", 0.0))
+                p_vol = int(p_curr.get("volume", 0))
 
-            p_oi_change = p_oi - p_prev_oi
-            p_oi_change_pct = (p_oi_change / p_prev_oi * 100.0) if p_prev_oi > 0 else 0.0
-            p_ltp_change = p_ltp - p_prev_ltp
-            p_ltp_change_pct = (p_ltp_change / p_prev_ltp * 100.0) if p_prev_ltp > 0 else 0.0
-            p_vol_change = p_vol - p_prev_vol
+                if p_prev is not None:
+                    p_prev_oi = int(p_prev.get("oi", p_oi))
+                    p_prev_ltp = float(p_prev.get("ltp", p_ltp))
+                    p_prev_vol = int(p_prev.get("volume", p_vol))
 
-            p_buildup, p_bias = self._classify_buildup(
-                price_change=p_ltp_change,
-                price_change_pct=p_ltp_change_pct,
-                oi_change=p_oi_change,
-                oi_change_pct=p_oi_change_pct,
-                instrument_type="PE",
-            )
+                    p_oi_change = p_oi - p_prev_oi
+                    p_oi_change_pct = (p_oi_change / p_prev_oi * 100.0) if p_prev_oi > 0 else 0.0
+                    p_ltp_change = p_ltp - p_prev_ltp
+                    p_ltp_change_pct = (p_ltp_change / p_prev_ltp * 100.0) if p_prev_ltp > 0 else 0.0
+                    p_vol_change = p_vol - p_prev_vol
+                else:
+                    # Newly appearing strike: establish baseline, zero delta
+                    p_oi_change = 0
+                    p_oi_change_pct = 0.0
+                    p_ltp_change = 0.0
+                    p_ltp_change_pct = 0.0
+                    p_vol_change = 0
 
-            if p_oi > max_put_oi:
-                max_put_oi = p_oi
-                put_wall_strike = strike
+                p_buildup, p_bias = self._classify_buildup(
+                    price_change=p_ltp_change,
+                    price_change_pct=p_ltp_change_pct,
+                    oi_change=p_oi_change,
+                    oi_change_pct=p_oi_change_pct,
+                    instrument_type="PE",
+                )
+
+                if p_oi > max_put_oi:
+                    max_put_oi = p_oi
+                    put_wall_strike = strike
+            else:
+                p_oi = 0
+                p_oi_change = 0
+                p_oi_change_pct = 0.0
+                p_ltp = 0.0
+                p_ltp_change = 0.0
+                p_vol = 0
+                p_vol_change = 0
+                p_buildup = BuildupType.NEUTRAL
+                p_bias = DirectionalBias.NEUTRAL
 
             # Net strike bias
             net_bias = DirectionalBias.NEUTRAL
@@ -303,11 +435,6 @@ class OpenInterestAnalyzer:
                 net_bias = DirectionalBias.BULLISH
             elif p_bias == DirectionalBias.BEARISH and c_bias == DirectionalBias.NEUTRAL:
                 net_bias = DirectionalBias.BEARISH
-
-            if net_bias == DirectionalBias.BULLISH:
-                bullish_count += 1
-            elif net_bias == DirectionalBias.BEARISH:
-                bearish_count += 1
 
             strikes_analysis[strike] = StrikeOIAnalysis(
                 strike=strike,
@@ -355,6 +482,7 @@ class OpenInterestAnalyzer:
         max_pain = self._calculate_max_pain(snapshot)
 
         profile = OIProfile(
+            underlying=underlying,
             timestamp=snapshot.api_timestamp,
             expiry=expiry,
             spot_price=snapshot.spot_price,
@@ -366,26 +494,24 @@ class OpenInterestAnalyzer:
             strikes=strikes_analysis,
             near_atm_strikes=near_atm,
             aggregate_bias=aggregate_bias,
-            futures_analysis=self.latest_futures_analysis,
             observation_interval_seconds=interval_seconds,
             is_stale=is_stale,
         )
-        self.latest_profiles[expiry] = profile
+        self._profile_history[key].append(profile)
+        self.latest_profiles[key] = profile
         return profile
 
     def analyze_concentration_near_level(
         self,
         level: float,
+        underlying: str = "NIFTY",
         expiry: Optional[date] = None,
+        as_of: Optional[datetime] = None,
         tolerance_points: float = 50.0,
     ) -> Dict[str, Any]:
-        """Analyzes Call vs Put OI accumulation and net flow near a specific technical level.
-
-        Useful for checking whether Call writers are aggressively defending a resistance level
-        or Put writers are supporting a breakout.
-        """
-        profile = self.get_latest_profile(expiry)
-        if not profile or not profile.strikes:
+        """Analyzes Call vs Put OI accumulation and net flow near a specific technical level as of cutoff."""
+        profile = self.get_profile(underlying=underlying, expiry=expiry, as_of=as_of)
+        if not profile or not profile.strikes or profile.is_stale:
             return {
                 "level": level,
                 "total_call_oi": 0,
@@ -422,12 +548,12 @@ class OpenInterestAnalyzer:
 
         # Call writers are active if Call OI increased with Price falling or flat
         call_writers_active = (
-            call_oi_change >= self.min_oi_change_contracts
+            call_oi_change >= self.min_opt_oi_change_contracts
             and any(s.call_buildup == BuildupType.SHORT_BUILDUP for s in matching)
         )
         # Put writers are active if Put OI increased with Put price falling (support writing)
         put_writers_active = (
-            put_oi_change >= self.min_oi_change_contracts
+            put_oi_change >= self.min_opt_oi_change_contracts
             and any(s.put_buildup == BuildupType.SHORT_BUILDUP for s in matching)
         )
 
@@ -449,15 +575,54 @@ class OpenInterestAnalyzer:
             "is_available": True,
         }
 
-    def get_latest_profile(self, expiry: Optional[date] = None) -> Optional[OIProfile]:
-        """Returns the latest profile, optionally filtered by expiry date."""
-        if expiry is not None:
-            return self.latest_profiles.get(expiry)
-        if not self.latest_profiles:
+    def get_profile(
+        self,
+        underlying: str = "NIFTY",
+        expiry: Optional[date] = None,
+        as_of: Optional[datetime] = None,
+    ) -> Optional[OIProfile]:
+        """Returns the OI profile for an underlying and expiry, causal as of a cutoff timestamp."""
+        matching_keys = [
+            k for k in self._profile_history if k[0].upper() == underlying.upper() and (expiry is None or k[1] == expiry)
+        ]
+        if not matching_keys:
             return None
-        # Return nearest expiry profile
-        sorted_expiries = sorted(self.latest_profiles.keys())
-        return self.latest_profiles[sorted_expiries[0]]
+
+        # Exclude expired contracts
+        active_keys = [
+            k for k in matching_keys if (self.current_session_date is None or k[1] >= self.current_session_date)
+        ]
+        if not active_keys:
+            active_keys = matching_keys
+
+        # Select nearest active expiry
+        active_keys.sort(key=lambda k: k[1])
+        key = active_keys[0]
+
+        history = self._profile_history[key]
+        if not history:
+            return None
+
+        if as_of is None:
+            return history[-1]
+
+        # Reverse lookup for snapshot on or before as_of
+        for prof in reversed(history):
+            if prof.timestamp <= as_of:
+                # Dynamically recompute freshness relative to as_of
+                age = (as_of - prof.timestamp).total_seconds()
+                is_stale = age > self.max_snapshot_age_seconds
+                return replace(prof, is_stale=is_stale)
+
+        return None
+
+    def get_latest_profile(
+        self,
+        underlying: str = "NIFTY",
+        expiry: Optional[date] = None,
+    ) -> Optional[OIProfile]:
+        """Backward-compatible helper returning latest profile."""
+        return self.get_profile(underlying=underlying, expiry=expiry, as_of=None)
 
     def _classify_buildup(
         self,
@@ -469,32 +634,30 @@ class OpenInterestAnalyzer:
     ) -> Tuple[BuildupType, DirectionalBias]:
         """Classifies positioning heuristic and assigns strict directional bias per instrument type.
 
-        CE:
-        - Price UP, OI UP   -> Long Buildup  -> BULLISH (Call Buying)
-        - Price DOWN, OI UP -> Short Buildup -> BEARISH (Call Writing / Resistance)
-        - Price UP, OI DOWN -> Short Covering -> BULLISH (Call Short Covering)
-        - Price DOWN, OI DOWN -> Long Unwinding -> BEARISH (Call Long Liquidation)
-
-        PE:
-        - Price UP, OI UP   -> Long Buildup  -> BEARISH (Put Buying / Hedging)
-        - Price DOWN, OI UP -> Short Buildup -> BULLISH (Put Writing / Support)
-        - Price UP, OI DOWN -> Short Covering -> BEARISH (Put Short Covering)
-        - Price DOWN, OI DOWN -> Long Unwinding -> BULLISH (Put Long Liquidation)
-
-        FUT:
-        - Price UP, OI UP   -> Long Buildup  -> BULLISH
-        - Price DOWN, OI UP -> Short Buildup -> BEARISH
-        - Price UP, OI DOWN -> Short Covering -> BULLISH
-        - Price DOWN, OI DOWN -> Long Unwinding -> BEARISH
+        Crucial rule: For a non-neutral buildup, BOTH price change AND OI change must be
+        statistically significant! If price is flat or OI is flat, it is NEUTRAL.
         """
-        # Statistical filter: ignore trivial fluctuations below significance thresholds
-        is_oi_significant = (
-            abs(oi_change) >= self.min_oi_change_contracts
-            and abs(oi_change_pct) >= self.min_oi_change_threshold_pct
-        )
-        is_price_significant = abs(price_change_pct) >= self.min_price_change_pct
+        if instrument_type == "FUT":
+            is_oi_significant = (
+                abs(oi_change) >= self.min_fut_oi_change_contracts
+                and abs(oi_change_pct) >= self.min_fut_oi_change_threshold_pct
+            )
+            is_price_significant = (
+                abs(price_change) >= self.min_fut_price_change_points
+                or abs(price_change_pct) >= self.min_fut_price_change_pct
+            )
+        else:
+            is_oi_significant = (
+                abs(oi_change) >= self.min_opt_oi_change_contracts
+                and abs(oi_change_pct) >= self.min_opt_oi_change_threshold_pct
+            )
+            is_price_significant = (
+                abs(price_change) >= self.min_opt_price_change_points
+                or abs(price_change_pct) >= self.min_opt_price_change_pct
+            )
 
-        if not is_oi_significant and not is_price_significant:
+        # Both variables must have non-zero, statistically meaningful movement
+        if not is_oi_significant or not is_price_significant:
             return BuildupType.NEUTRAL, DirectionalBias.NEUTRAL
 
         price_up = price_change > 0
@@ -527,12 +690,7 @@ class OpenInterestAnalyzer:
         return buildup, bias
 
     def _calculate_max_pain(self, snapshot: OptionChainSnapshot) -> Optional[float]:
-        """Calculates optional descriptive Max Pain strike.
-
-        Total payout to option holders at settlement price K is:
-        Sum(Call_OI * max(0, K - Strike)) + Sum(Put_OI * max(0, Strike - K))
-        The strike K with the lowest total payout is Max Pain.
-        """
+        """Calculates optional descriptive Max Pain strike."""
         if not snapshot.strikes:
             return None
 
@@ -547,10 +705,8 @@ class OpenInterestAnalyzer:
                 call_oi = (s.call or {}).get("oi", 0)
                 put_oi = (s.put or {}).get("oi", 0)
 
-                # Call intrinsic value at settlement K
                 if k > strike_price:
                     total_payout += call_oi * (k - strike_price)
-                # Put intrinsic value at settlement K
                 if k < strike_price:
                     total_payout += put_oi * (strike_price - k)
 

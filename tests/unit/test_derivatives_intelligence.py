@@ -404,6 +404,8 @@ def test_expiry_isolation_and_stale_data_detection():
 
     p_curr = analyzer.on_option_chain(snap_curr)
     p_next = analyzer.on_option_chain(snap_next)
+    pcr_engine.on_option_chain(snap_curr)
+    pcr_engine.on_option_chain(snap_next)
 
     # Invariant: Both expiries maintained independently
     assert p_curr.expiry == exp_current
@@ -412,10 +414,12 @@ def test_expiry_isolation_and_stale_data_detection():
 
     # Stale data check: evaluating at 10:10 (10 minutes > 300s max age)
     t_stale = t0 + timedelta(minutes=10)
-    p_stale = analyzer.on_option_chain(snap_curr, as_of=t_stale)
+    p_stale = analyzer.get_profile(as_of=t_stale)
+    assert p_stale is not None
     assert p_stale.is_stale is True
 
-    pcr_stale = pcr_engine.on_option_chain(snap_curr, as_of=t_stale)
+    pcr_stale = pcr_engine.get_pcr(as_of=t_stale)
+    assert pcr_stale is not None
     assert pcr_stale.is_stale is True
 
 
@@ -511,13 +515,21 @@ def test_zero_hard_vetoes_candidate_emitted_even_with_conflicting_derivatives():
     base_t = IST.localize(datetime(2026, 11, 23, 10, 5))
 
     # Pre-configure conflicting derivatives state:
-    # Heavy call writing at 25100 (Bearish derivatives flow)
-    snap_oi = create_test_snapshot(
+    # Snapshot 0 at 10:02: Call OI = 120,000, Call LTP = 80.0
+    snap_oi_0 = create_test_snapshot(
+        api_time=base_t - timedelta(minutes=3),
+        spot_price=25100.0,
+        strikes_data=[(25100.0, 120000, 80.0, 10000, 40000, 90.0, 5000)],
+    )
+    engine.on_option_chain(snap_oi_0)
+
+    # Snapshot 1 at 10:05: Heavy Call writing (120k -> 150k (+30k), LTP falls 80 -> 60)
+    snap_oi_1 = create_test_snapshot(
         api_time=base_t,
         spot_price=25100.0,
         strikes_data=[(25100.0, 150000, 60.0, 20000, 40000, 90.0, 5000)],
     )
-    engine.on_option_chain(snap_oi)
+    engine.on_option_chain(snap_oi_1)
 
     # 15m snapshot (Macro Bullish)
     snap_15m = TechnicalSnapshot(
@@ -588,3 +600,180 @@ def test_zero_hard_vetoes_candidate_emitted_even_with_conflicting_derivatives():
     )
     assert "derivatives_assessment" in cand.timeframe_breakdown
     assert cand.derivatives_assessment.decision_at == cand.decision_at
+
+
+
+def test_futures_symbol_and_timeframe_isolation():
+    """Verify P0: Futures OI tracking strictly isolates symbols and timeframes."""
+    analyzer = OpenInterestAnalyzer(
+        min_fut_oi_change_threshold_pct=0.1,
+        min_fut_oi_change_contracts=100,
+        min_fut_price_change_points=2.0,
+    )
+    t0 = IST.localize(datetime(2026, 11, 23, 9, 15))
+
+    # NIFTY 1m
+    c_nifty_1m_0 = Candle(symbol="NSE:NIFTY26NOVFUT", timeframe="1m", timestamp=t0, open=25000.0, high=25010.0, low=24995.0, close=25005.0, volume=1000, oi=100000, is_closed=True)
+    analyzer.on_futures_candle(c_nifty_1m_0)
+
+    # BANKNIFTY 1m arriving at 9:15 should NOT contaminate NIFTY history
+    c_bank_1m_0 = Candle(symbol="NSE:BANKNIFTY26NOVFUT", timeframe="1m", timestamp=t0, open=52000.0, high=52050.0, low=51980.0, close=52020.0, volume=2000, oi=200000, is_closed=True)
+    analyzer.on_futures_candle(c_bank_1m_0)
+
+    # NIFTY 5m candle arriving should NOT compare against 1m candle
+    c_nifty_5m_0 = Candle(symbol="NSE:NIFTY26NOVFUT", timeframe="5m", timestamp=t0, open=25000.0, high=25040.0, low=24990.0, close=25030.0, volume=5000, oi=100000, is_closed=True)
+    analyzer.on_futures_candle(c_nifty_5m_0)
+
+    # NIFTY 1m second candle at 9:16: price rises 25005 -> 25020 (+15 pts), OI rises 100000 -> 101000 (+1000)
+    c_nifty_1m_1 = Candle(symbol="NSE:NIFTY26NOVFUT", timeframe="1m", timestamp=t0 + timedelta(minutes=1), open=25005.0, high=25025.0, low=25000.0, close=25020.0, volume=1200, oi=101000, is_closed=True)
+    res_nifty_1m = analyzer.on_futures_candle(c_nifty_1m_1)
+
+    # Invariant: NIFTY 1m was compared against NIFTY 1m (25005), NOT BANKNIFTY (52020) or NIFTY 5m!
+    assert res_nifty_1m.price_change == 15.0
+    assert res_nifty_1m.oi_change == 1000
+    assert res_nifty_1m.buildup == BuildupType.LONG_BUILDUP
+    assert res_nifty_1m.directional_bias == DirectionalBias.BULLISH
+
+    # Invariant: Distinct histories maintained
+    assert ("NSE:NIFTY26NOVFUT", "1m") in analyzer._futures_history
+    assert ("NSE:BANKNIFTY26NOVFUT", "1m") in analyzer._futures_history
+    assert ("NSE:NIFTY26NOVFUT", "5m") in analyzer._futures_history
+
+
+def test_buildup_requires_both_price_and_oi_significance():
+    """Verify P1: Significant price change with zero/flat OI change classifies as NEUTRAL, not short covering/unwinding."""
+    analyzer = OpenInterestAnalyzer(
+        min_fut_oi_change_threshold_pct=0.5,
+        min_fut_oi_change_contracts=500,
+        min_fut_price_change_points=10.0,
+        min_fut_price_change_pct=0.05,
+    )
+    t0 = IST.localize(datetime(2026, 11, 23, 9, 15))
+
+    c0 = Candle(symbol="NSE:NIFTY26NOVFUT", timeframe="5m", timestamp=t0, open=25000.0, high=25020.0, low=24990.0, close=25000.0, volume=1000, oi=100000, is_closed=True)
+    analyzer.on_futures_candle(c0)
+
+    # Case 1: Price rallies +50 pts (huge movement), but OI change is 0
+    c_flat_oi = Candle(symbol="NSE:NIFTY26NOVFUT", timeframe="5m", timestamp=t0 + timedelta(minutes=5), open=25000.0, high=25060.0, low=25000.0, close=25050.0, volume=2000, oi=100000, is_closed=True)
+    res_flat_oi = analyzer.on_futures_candle(c_flat_oi)
+    # Invariant: Must NOT classify as SHORT_COVERING or LONG_BUILDUP because OI is completely flat!
+    assert res_flat_oi.buildup == BuildupType.NEUTRAL
+    assert res_flat_oi.directional_bias == DirectionalBias.NEUTRAL
+
+    # Case 2: Price is completely flat (0 pts), but OI increases by +5,000 contracts
+    c_flat_price = Candle(symbol="NSE:NIFTY26NOVFUT", timeframe="5m", timestamp=t0 + timedelta(minutes=10), open=25050.0, high=25052.0, low=25048.0, close=25050.0, volume=2000, oi=105000, is_closed=True)
+    res_flat_price = analyzer.on_futures_candle(c_flat_price)
+    # Invariant: Must NOT classify as SHORT_BUILDUP or LONG_BUILDUP because Price is completely flat!
+    assert res_flat_price.buildup == BuildupType.NEUTRAL
+    assert res_flat_price.directional_bias == DirectionalBias.NEUTRAL
+
+
+def test_derivatives_assessment_dynamic_freshness_recalculation():
+    """Verify P0: Derivatives assessment dynamically recomputes freshness relative to decision_at."""
+    oi_analyzer = OpenInterestAnalyzer(max_snapshot_age_seconds=360.0)  # 6 minutes max age
+    pcr_engine = PCREngine(max_snapshot_age_seconds=360.0)
+    engine = DerivativesIntelligenceEngine(oi_analyzer=oi_analyzer, pcr_engine=pcr_engine)
+
+    t_chain = IST.localize(datetime(2026, 11, 23, 10, 0))
+
+    # Option chain arrives at 10:00 (is_stale was False at receipt time)
+    snap = create_test_snapshot(api_time=t_chain)
+    oi_analyzer.on_option_chain(snap)
+    pcr_engine.on_option_chain(snap)
+
+    # 1. Candidate evaluated at 10:03 (3 minutes elapsed <= 6m) -> Valid / Sufficient data
+    t_decision_fresh = t_chain + timedelta(minutes=3)
+    assess_fresh = engine.evaluate_setup(
+        direction=BreakoutDirection.BULLISH,
+        level_price=25100.0,
+        as_of=t_decision_fresh,
+    )
+    assert assess_fresh.is_stale is False
+    assert assess_fresh.assessment_type != DerivativesAssessmentType.INSUFFICIENT_DATA
+
+    # 2. Candidate evaluated at 10:25 (25 minutes elapsed > 6m) -> Must be dynamically marked INSUFFICIENT_DATA!
+    t_decision_stale = t_chain + timedelta(minutes=25)
+    assess_stale = engine.evaluate_setup(
+        direction=BreakoutDirection.BULLISH,
+        level_price=25100.0,
+        as_of=t_decision_stale,
+    )
+    # Invariant: Dynamically evaluated as stale relative to decision timestamp
+    assert assess_stale.is_stale is True
+    assert assess_stale.assessment_type == DerivativesAssessmentType.INSUFFICIENT_DATA
+    assert any("stale" in r.lower() for r in assess_stale.contra_reasons)
+
+
+def test_derivatives_assessment_retrieves_latest_futures_at_decision_at():
+    """Verify P1: Futures positioning is retrieved dynamically as of decision_at, not stuck at last option chain poll."""
+    oi_analyzer = OpenInterestAnalyzer()
+    pcr_engine = PCREngine()
+    fut_sym = "NSE:NIFTY26NOVFUT"
+    engine = DerivativesIntelligenceEngine(oi_analyzer=oi_analyzer, pcr_engine=pcr_engine, primary_futures=fut_sym)
+
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+
+    # Option chain polled at 10:00
+    snap = create_test_snapshot(api_time=t0)
+    oi_analyzer.on_option_chain(snap)
+    pcr_engine.on_option_chain(snap)
+
+    # Initial futures candle at 10:00
+    c0 = Candle(symbol=fut_sym, timeframe="5m", timestamp=t0, open=25000.0, high=25020.0, low=24990.0, close=25000.0, volume=1000, oi=100000, is_closed=True)
+    oi_analyzer.on_futures_candle(c0)
+
+    # At 10:05 (before next option chain poll at 10:06), a new futures candle arrives showing Long Buildup
+    t1 = t0 + timedelta(minutes=5)
+    c1 = Candle(symbol=fut_sym, timeframe="5m", timestamp=t1, open=25000.0, high=25060.0, low=25000.0, close=25050.0, volume=3000, oi=105000, is_closed=True)
+    oi_analyzer.on_futures_candle(c1)
+
+    # Evaluate setup at 10:05
+    assessment = engine.evaluate_setup(
+        direction=BreakoutDirection.BULLISH,
+        level_price=25100.0,
+        as_of=t1,
+    )
+    # Invariant: Retrieved futures positioning from 10:05 candle (Long Buildup), NOT stale 10:00!
+    assert assessment.futures_bias == DirectionalBias.BULLISH
+    assert assessment.futures_analysis is not None
+    assert assessment.futures_analysis.timestamp == t1
+    assert assessment.futures_analysis.buildup == BuildupType.LONG_BUILDUP
+
+
+def test_missing_strike_data_handling_not_treated_as_zero():
+    """Verify P1: Missing strikes or disappeared contracts do not fabricate artificial delta drops to 0."""
+    pcr_engine = PCREngine()
+    oi_analyzer = OpenInterestAnalyzer()
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    t1 = t0 + timedelta(minutes=3)
+
+    # Snapshot 0 has 25000, 25050, 25100
+    snap0 = create_test_snapshot(
+        api_time=t0,
+        strikes_data=[
+            (25000.0, 50000, 150.0, 5000, 20000, 30.0, 2000),
+            (25050.0, 60000, 110.0, 6000, 40000, 50.0, 4000),
+            (25100.0, 80000, 80.0, 10000, 80000, 80.0, 10000),
+        ],
+    )
+    oi_analyzer.on_option_chain(snap0)
+    pcr_engine.on_option_chain(snap0)
+
+    # Snapshot 1: Strike 25000 drops out of broker response (missing), but 25050 and 25100 have identical OI
+    snap1 = create_test_snapshot(
+        api_time=t1,
+        strikes_data=[
+            (25050.0, 60000, 110.0, 6000, 40000, 50.0, 4000),
+            (25100.0, 80000, 80.0, 10000, 80000, 80.0, 10000),
+        ],
+    )
+    prof1 = oi_analyzer.on_option_chain(snap1)
+    pcr1 = pcr_engine.on_option_chain(snap1)
+
+    # Invariant: 25000 is simply absent in prof1, not reported with delta of -50,000!
+    assert 25000.0 not in prof1.strikes
+    assert prof1.strikes[25050.0].call_oi_change == 0
+    assert prof1.strikes[25100.0].call_oi_change == 0
+
+    # Invariant: ΔPCR evaluated only on common strikes (25050, 25100), yielding delta_oi_pcr == 0.0
+    assert pcr1.delta_oi_pcr == 0.0
