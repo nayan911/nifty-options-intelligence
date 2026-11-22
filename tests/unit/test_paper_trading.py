@@ -1171,5 +1171,113 @@ def test_one_lot_target1_and_pending_triggers_survive_restart(tmp_path):
     store.close()
 
 
+def test_recovered_open_positions_included_in_runner_initial_watchlist():
+    """Verify runner _build_watchlist includes symbols for recovered open positions outside current ATM."""
+    from run_market_data import MarketDataEngine
+
+    store = DuckDBStore(db_path=":memory:")
+    # Seed an open position at an older strike (24800) into DuckDB
+    engine_seed = PaperTradingEngine(store=store, default_lots=1)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 9, 30, 0))
+    cand = create_mock_candidate(
+        candidate_id="RECOVERED_STRIKE_TEST",
+        opt_symbol="NSE:NIFTY26NOV24800CE",
+        timestamp=entry_ts,
+        entry_ltp=150.0,
+        ask=150.0,
+    )
+    pos_seed = engine_seed.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos_seed is not None
+
+    # Simulate fresh runner restart
+    runner = MarketDataEngine(store=store)
+    open_pos = runner.paper_engine.get_open_positions()
+    assert len(open_pos) == 1
+    assert open_pos[0].symbol == "NSE:NIFTY26NOV24800CE"
+
+    # Mock spot at 25100 (so 24800 is NOT in ATM strikes [25050, 25100, 25150])
+    runner.current_spot_price = 25100.0
+    runner.master.get_active_expiries = lambda und: [entry_ts.date()]
+    runner.master.resolve_option = lambda und, exp, strk, opt_type: OptionContract(
+        symbol=f"NSE:NIFTY26NOV{int(strk)}{opt_type.value}",
+        fytoken="dummy",
+        underlying="NIFTY",
+        expiry=exp,
+        strike=strk,
+        option_type=opt_type,
+    )
+
+    watchlist = runner._build_watchlist()
+
+    # The recovered position's symbol MUST be in watchlist, subscribed_option_symbols, and active_paper_trade_symbols
+    assert "NSE:NIFTY26NOV24800CE" in watchlist
+    assert "NSE:NIFTY26NOV24800CE" in runner.subscribed_option_symbols
+    assert "NSE:NIFTY26NOV24800CE" in runner.active_paper_trade_symbols
+    store.close()
+
+
+def test_candle_closing_does_not_refresh_quote_timestamp():
+    """Verify on_candle tracks last_candle_time and does not falsely refresh last_quote_time."""
+    engine = PaperTradingEngine(default_lots=1, slippage_points=0.5, max_quote_age_seconds=30.0)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        stop_loss=25070.0,
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+
+    # Authentic broker option tick arrives at 10:00:05
+    opt_tick = Tick(
+        symbol=pos.symbol,
+        ltp=100.5,
+        bid=100.0,
+        ask=101.0,
+        volume=5000,
+        local_timestamp=entry_ts + timedelta(seconds=5),
+    )
+    engine.on_tick(opt_tick)
+    assert pos.last_quote_time == entry_ts + timedelta(seconds=5)
+
+    # 1m option candle closes at 10:01:05 (60 seconds after option tick)
+    candle_time = entry_ts + timedelta(seconds=65)
+    opt_candle = Candle(
+        symbol=pos.symbol,
+        timeframe="1m",
+        timestamp=entry_ts + timedelta(seconds=5),
+        observed_at=candle_time,
+        open=100.5,
+        high=102.0,
+        low=99.0,
+        close=101.0,
+        volume=10000,
+        is_closed=True,
+    )
+    engine.on_candle(opt_candle)
+
+    # pos.last_candle_time should be updated, but last_quote_time MUST NOT be refreshed to candle_time
+    assert pos.last_candle_time == candle_time
+    assert pos.last_quote_time == entry_ts + timedelta(seconds=5)  # Preserved!
+    # Quote age at candle_time is 60 seconds (stale, > 30s max)
+    assert pos.quote_age_seconds(candle_time) == 60.0
+
+    # Spot SL breach arrives at candle_time + 1s. Because quote is 61s old, it must NOT execute against stale bid!
+    spot_tick = Tick(
+        symbol="NSE:NIFTY50-INDEX",
+        ltp=25060.0,  # Below 25070 SL
+        volume=50000,
+        local_timestamp=candle_time + timedelta(seconds=1),
+    )
+    events = engine.on_tick(spot_tick)
+    assert len(events) == 0  # Does not execute stale fill!
+    assert pos.is_exit_triggered is True
+    assert pos.pending_exit_reason == ExitReason.STOP_LOSS
+
+
+
 
 

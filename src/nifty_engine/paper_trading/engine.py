@@ -437,7 +437,7 @@ class PaperTradingEngine:
 
             # Case 1: Option contract candle
             if pos.symbol == sym:
-                pos.last_quote_time = current_time
+                pos.last_candle_time = current_time
                 pos.current_ltp = candle.close
 
                 if candle.high > pos.highest_premium_seen:
@@ -878,6 +878,7 @@ class PaperTradingEngine:
         entry_time = self._parse_dt(row.get("entry_time")) or now_ist()
         exit_time = self._parse_dt(row.get("exit_time"))
         last_quote_time = self._parse_dt(row.get("last_quote_time")) or entry_time
+        last_candle_time = self._parse_dt(row.get("last_candle_time"))
         expiry = self._parse_date(row.get("expiry")) or entry_time.date()
 
         status_str = row.get("status", "OPEN")
@@ -924,6 +925,7 @@ class PaperTradingEngine:
             exit_time=exit_time,
             exit_price=float(row["exit_price"]) if row.get("exit_price") is not None else None,
             last_quote_time=last_quote_time,
+            last_candle_time=last_candle_time,
             status=status,
             exit_reason=exit_reason,
             is_t1_hit=is_t1_hit,

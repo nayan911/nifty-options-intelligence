@@ -409,9 +409,9 @@ class MarketDataEngine:
         atm = round(spot / 50.0) * 50.0
         self.active_atm_strike = atm
 
+        opt_symbols: List[str] = []
         try:
             expiries = self.master.get_active_expiries("NIFTY")
-            opt_symbols: List[str] = []
             if expiries:
                 # 1. Nearest Expiry (e.g. Nov 23)
                 near_exp = expiries[0]
@@ -435,11 +435,21 @@ class MarketDataEngine:
                             opt_symbols.extend([ce.symbol, pe.symbol])
                         except LookupError:
                             pass
-
-            self.subscribed_option_symbols = set(opt_symbols)
-            watchlist.extend(opt_symbols)
         except Exception as e:
             print(f"[WARN] Options resolution: {e}")
+
+        # Protect and subscribe all active open positions recovered from paper execution engine
+        recovered_symbols: Set[str] = set()
+        if hasattr(self, "paper_engine"):
+            recovered_symbols = {p.symbol for p in self.paper_engine.get_open_positions()}
+            self.active_paper_trade_symbols.update(recovered_symbols)
+
+        all_opt_symbols = set(opt_symbols) | recovered_symbols
+        self.subscribed_option_symbols = set(all_opt_symbols)
+
+        for sym in all_opt_symbols:
+            if sym not in watchlist:
+                watchlist.append(sym)
 
         return watchlist
 

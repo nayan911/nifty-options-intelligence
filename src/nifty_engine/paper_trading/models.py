@@ -148,6 +148,7 @@ class PaperPosition:
     notes: Optional[str] = None
     initial_stop_loss_premium: float = 0.0
     last_quote_time: Optional[datetime] = None
+    last_candle_time: Optional[datetime] = None
     is_exit_triggered: bool = False
     pending_exit_reason: Optional[ExitReason] = None
 
@@ -189,6 +190,7 @@ class PaperPosition:
             "entry_time": self.entry_time.isoformat() if self.entry_time else None,
             "exit_time": self.exit_time.isoformat() if self.exit_time else None,
             "last_quote_time": self.last_quote_time.isoformat() if self.last_quote_time else None,
+            "last_candle_time": self.last_candle_time.isoformat() if self.last_candle_time else None,
             "status": self.status.value if isinstance(self.status, PositionStatus) else str(self.status),
             "exit_reason": self.exit_reason.value if isinstance(self.exit_reason, ExitReason) else (str(self.exit_reason) if self.exit_reason else None),
             "is_exit_triggered": self.is_exit_triggered,
