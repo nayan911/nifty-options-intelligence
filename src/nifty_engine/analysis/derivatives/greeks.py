@@ -225,16 +225,43 @@ class GreeksEngine:
         r = float(risk_free_rate if risk_free_rate is not None else self.default_risk_free_rate)
         T = self.compute_time_to_expiry_years(expiry=expiry, current_time=current_time)
 
-        # 1. Primary check: Use broker Greeks if valid, non-zero, and fresh
+        # 1. Primary check: Use broker Greeks if complete, valid, non-zero, and fresh
         if broker_greeks:
             b_iv = broker_greeks.get("iv")
             b_delta = broker_greeks.get("delta")
-            if (
+            b_gamma = broker_greeks.get("gamma")
+            b_theta = broker_greeks.get("theta")
+            b_vega = broker_greeks.get("vega")
+
+            # Validate completeness and mathematical validity:
+            # - IV must be positive (> 0.01)
+            # - Delta must be non-trivial (|delta| > 0.01)
+            # - Gamma must be present and positive (> 0.0)
+            # - Theta must be present and non-zero (!= 0.0)
+            # - Vega must be present and positive (> 0.0)
+            # Missing or zero gamma/theta/vega must NOT be defaulted to 0.0;
+            # instead, fall back to calculating a consistent Black-76 set.
+            is_complete = (
                 b_iv is not None
                 and b_delta is not None
-                and float(b_iv) > 0.01
-                and abs(float(b_delta)) > 0.01
-            ):
+                and b_gamma is not None
+                and b_theta is not None
+                and b_vega is not None
+            )
+            is_valid = False
+            if is_complete:
+                try:
+                    is_valid = (
+                        float(b_iv) > 0.01
+                        and abs(float(b_delta)) > 0.01
+                        and float(b_gamma) > 0.0
+                        and float(b_theta) != 0.0
+                        and float(b_vega) > 0.0
+                    )
+                except (ValueError, TypeError):
+                    is_valid = False
+
+            if is_valid:
                 bg_ts = (
                     broker_greeks_timestamp
                     or broker_greeks.get("timestamp")
@@ -261,9 +288,9 @@ class GreeksEngine:
                     return OptionGreeks(
                         iv=round(float(b_iv) / 100.0 if float(b_iv) > 1.0 else float(b_iv), 4),
                         delta=round(float(b_delta), 4),
-                        gamma=round(float(broker_greeks.get("gamma") or 0.0), 6),
-                        theta=round(float(broker_greeks.get("theta") or 0.0), 3),
-                        vega=round(float(broker_greeks.get("vega") or 0.0), 3),
+                        gamma=round(float(b_gamma), 6),
+                        theta=round(float(b_theta), 3),
+                        vega=round(float(b_vega), 3),
                         rho=round(float(broker_greeks.get("rho") or 0.0), 4),
                         is_calculated=False,
                         model_used="FYERS",
@@ -276,6 +303,16 @@ class GreeksEngine:
                         quote_timestamp,
                         current_time,
                     )
+            else:
+                logger.debug(
+                    "Broker Greeks for strike %.1f incomplete or invalid (iv=%s, delta=%s, gamma=%s, theta=%s, vega=%s). Falling back to Black-76.",
+                    K,
+                    b_iv,
+                    b_delta,
+                    b_gamma,
+                    b_theta,
+                    b_vega,
+                )
 
         # 2. Analytical Black-76 fallback
         if F <= 0.0 or K <= 0.0 or mkt <= 0.0:

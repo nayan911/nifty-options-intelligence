@@ -998,5 +998,107 @@ def test_contract_selector_recalculates_model_greeks_when_broker_greeks_are_stal
     assert res_with_greeks.greeks.is_calculated is False
 
 
+def test_greeks_engine_rejects_incomplete_or_zero_broker_greeks():
+    """Verify GreeksEngine requires complete, valid, non-zero Greeks and falls back to Black-76 when incomplete."""
+    engine = GreeksEngine()
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    expiry = date(2026, 11, 26)
+
+    # 1. Missing gamma -> Black-76
+    payload_no_gamma = {"iv": 15.0, "delta": 0.50, "gamma": None, "theta": -8.0, "vega": 10.0}
+    g1 = engine.calculate_greeks("CE", 25000.0, 25000.0, expiry, t0, 145.0, broker_greeks=payload_no_gamma)
+    assert g1.model_used == "BLACK_76"
+    assert g1.is_calculated is True
+    assert g1.gamma > 0.0
+
+    # 2. Zero gamma (gamma=0.0) -> Black-76 (vanilla options strictly have positive gamma)
+    payload_zero_gamma = {"iv": 15.0, "delta": 0.50, "gamma": 0.0, "theta": -8.0, "vega": 10.0}
+    g2 = engine.calculate_greeks("CE", 25000.0, 25000.0, expiry, t0, 145.0, broker_greeks=payload_zero_gamma)
+    assert g2.model_used == "BLACK_76"
+    assert g2.is_calculated is True
+
+    # 3. Missing theta -> Black-76
+    payload_no_theta = {"iv": 15.0, "delta": 0.50, "gamma": 0.0004, "theta": None, "vega": 10.0}
+    g3 = engine.calculate_greeks("CE", 25000.0, 25000.0, expiry, t0, 145.0, broker_greeks=payload_no_theta)
+    assert g3.model_used == "BLACK_76"
+    assert g3.is_calculated is True
+    assert g3.theta != 0.0
+
+    # 4. Zero theta (theta=0.0) -> Black-76 (options strictly experience time decay)
+    payload_zero_theta = {"iv": 15.0, "delta": 0.50, "gamma": 0.0004, "theta": 0.0, "vega": 10.0}
+    g4 = engine.calculate_greeks("CE", 25000.0, 25000.0, expiry, t0, 145.0, broker_greeks=payload_zero_theta)
+    assert g4.model_used == "BLACK_76"
+    assert g4.is_calculated is True
+
+    # 5. Missing vega -> Black-76
+    payload_no_vega = {"iv": 15.0, "delta": 0.50, "gamma": 0.0004, "theta": -8.0, "vega": None}
+    g5 = engine.calculate_greeks("CE", 25000.0, 25000.0, expiry, t0, 145.0, broker_greeks=payload_no_vega)
+    assert g5.model_used == "BLACK_76"
+    assert g5.is_calculated is True
+    assert g5.vega > 0.0
+
+    # 6. Complete, valid set -> FYERS
+    payload_complete = {"iv": 15.0, "delta": 0.50, "gamma": 0.0004, "theta": -8.0, "vega": 10.0}
+    g6 = engine.calculate_greeks("CE", 25000.0, 25000.0, expiry, t0, 145.0, broker_greeks=payload_complete)
+    assert g6.model_used == "FYERS"
+    assert g6.is_calculated is False
+    assert g6.gamma == 0.0004
+    assert g6.theta == -8.0
+    assert g6.vega == 10.0
+
+
+def test_contract_selector_rejects_incomplete_broker_greeks_and_calculates_black76():
+    """Verify OptionContractSelector calculates Black-76 when broker Greeks on strike are incomplete."""
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    snap = create_phase3b_chain(t0)
+    # Deliberately strip gamma and theta from candidate strike 25100CE
+    for s in snap.strikes:
+        if s.strike == 25100.0:
+            s.call["gamma"] = None
+            s.call["theta"] = 0.0
+
+    oi_analyzer = OpenInterestAnalyzer()
+    profile = oi_analyzer.on_option_chain(snap)
+
+    selector = OptionContractSelector()
+    res = selector.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=t0,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res is not None
+    # Must NOT substitute zero for gamma/theta; must calculate complete Black-76 set
+    assert res.greeks.model_used == "BLACK_76"
+    assert res.greeks.is_calculated is True
+    assert res.greeks.gamma > 0.0
+    assert res.greeks.theta != 0.0
+    assert "Model Greeks calculated with Black-76 (broker Greeks incomplete)" in res.selection_reasons
+
+
+def test_strike_oi_analysis_explicit_greeks_timestamp():
+    """Verify StrikeOIAnalysis records distinct greeks_timestamp when available from broker."""
+    from datetime import timedelta
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    t_quote = t0 - timedelta(seconds=5)
+    t_greeks = t0 - timedelta(seconds=12)
+
+    snap = create_phase3b_chain(t0)
+    for s in snap.strikes:
+        if s.strike == 25100.0:
+            s.call["quote_timestamp"] = t_quote
+            s.call["greeks_timestamp"] = t_greeks
+
+    oi_analyzer = OpenInterestAnalyzer()
+    profile = oi_analyzer.on_option_chain(snap)
+
+    strike_25100 = profile.strikes[25100.0]
+    assert strike_25100.call_quote_timestamp == t_quote
+    assert strike_25100.call_greeks_timestamp == t_greeks
+
+
+
 
 

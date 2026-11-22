@@ -59,6 +59,7 @@ class StrikeOIAnalysis:
     call_bid_size: Optional[int] = None
     call_ask_size: Optional[int] = None
     call_quote_timestamp: Optional[datetime] = None
+    call_greeks_timestamp: Optional[datetime] = None
     call_iv: Optional[float] = None
     call_delta: Optional[float] = None
     call_gamma: Optional[float] = None
@@ -82,6 +83,7 @@ class StrikeOIAnalysis:
     put_bid_size: Optional[int] = None
     put_ask_size: Optional[int] = None
     put_quote_timestamp: Optional[datetime] = None
+    put_greeks_timestamp: Optional[datetime] = None
     put_iv: Optional[float] = None
     put_delta: Optional[float] = None
     put_gamma: Optional[float] = None
@@ -404,6 +406,7 @@ class OpenInterestAnalyzer:
                 c_bid_size = int(c_curr.get("bid_size") or c_curr.get("bid_qty") or 0) if (c_curr.get("bid_size") or c_curr.get("bid_qty")) else None
                 c_ask_size = int(c_curr.get("ask_size") or c_curr.get("ask_qty") or 0) if (c_curr.get("ask_size") or c_curr.get("ask_qty")) else None
                 c_quote_ts = c_curr.get("quote_timestamp") or snapshot.api_timestamp
+                c_greeks_ts = c_curr.get("greeks_timestamp") or c_curr.get("greeks_time") or c_quote_ts
                 c_iv = float(c_curr["iv"]) if c_curr.get("iv") is not None else None
                 c_delta = float(c_curr["delta"]) if c_curr.get("delta") is not None else None
                 c_gamma = float(c_curr["gamma"]) if c_curr.get("gamma") is not None else None
@@ -461,6 +464,7 @@ class OpenInterestAnalyzer:
                 c_bid_size = None
                 c_ask_size = None
                 c_quote_ts = snapshot.api_timestamp
+                c_greeks_ts = snapshot.api_timestamp
                 c_iv = None
                 c_delta = None
                 c_gamma = None
@@ -486,6 +490,7 @@ class OpenInterestAnalyzer:
                 p_bid_size = int(p_curr.get("bid_size") or p_curr.get("bid_qty") or 0) if (p_curr.get("bid_size") or p_curr.get("bid_qty")) else None
                 p_ask_size = int(p_curr.get("ask_size") or p_curr.get("ask_qty") or 0) if (p_curr.get("ask_size") or p_curr.get("ask_qty")) else None
                 p_quote_ts = p_curr.get("quote_timestamp") or snapshot.api_timestamp
+                p_greeks_ts = p_curr.get("greeks_timestamp") or p_curr.get("greeks_time") or p_quote_ts
                 p_iv = float(p_curr["iv"]) if p_curr.get("iv") is not None else None
                 p_delta = float(p_curr["delta"]) if p_curr.get("delta") is not None else None
                 p_gamma = float(p_curr["gamma"]) if p_curr.get("gamma") is not None else None
@@ -543,6 +548,7 @@ class OpenInterestAnalyzer:
                 p_bid_size = None
                 p_ask_size = None
                 p_quote_ts = snapshot.api_timestamp
+                p_greeks_ts = snapshot.api_timestamp
                 p_iv = None
                 p_delta = None
                 p_gamma = None
@@ -577,6 +583,7 @@ class OpenInterestAnalyzer:
                 call_bid_size=c_bid_size,
                 call_ask_size=c_ask_size,
                 call_quote_timestamp=c_quote_ts,
+                call_greeks_timestamp=c_greeks_ts,
                 call_iv=c_iv,
                 call_delta=c_delta,
                 call_gamma=c_gamma,
@@ -597,6 +604,7 @@ class OpenInterestAnalyzer:
                 put_bid_size=p_bid_size,
                 put_ask_size=p_ask_size,
                 put_quote_timestamp=p_quote_ts,
+                put_greeks_timestamp=p_greeks_ts,
                 put_iv=p_iv,
                 put_delta=p_delta,
                 put_gamma=p_gamma,

@@ -255,7 +255,7 @@ class OptionContractSelector:
                 bid_size = strike_data.call_bid_size
                 ask_size = strike_data.call_ask_size
                 quote_ts = strike_data.call_quote_timestamp or chain_profile.timestamp
-                greeks_ts = strike_data.call_quote_timestamp or chain_profile.timestamp
+                greeks_ts = strike_data.call_greeks_timestamp or strike_data.call_quote_timestamp or chain_profile.timestamp
                 broker_greeks = {
                     "iv": strike_data.call_iv,
                     "delta": strike_data.call_delta,
@@ -274,7 +274,7 @@ class OptionContractSelector:
                 bid_size = strike_data.put_bid_size
                 ask_size = strike_data.put_ask_size
                 quote_ts = strike_data.put_quote_timestamp or chain_profile.timestamp
-                greeks_ts = strike_data.put_quote_timestamp or chain_profile.timestamp
+                greeks_ts = strike_data.put_greeks_timestamp or strike_data.put_quote_timestamp or chain_profile.timestamp
                 broker_greeks = {
                     "iv": strike_data.put_iv,
                     "delta": strike_data.put_delta,
@@ -327,8 +327,19 @@ class OptionContractSelector:
                                 ask_size = int(fresh_q["ask_size"])
                             quote_ts = refreshed_ts
 
-                            # Track Greeks freshness independently: update broker Greeks if fresh_q supplies them
-                            if fresh_q.get("iv") is not None and fresh_q.get("delta") is not None:
+                            # Track Greeks freshness independently: update broker Greeks if fresh_q supplies them completely
+                            if (
+                                fresh_q.get("iv") is not None
+                                and fresh_q.get("delta") is not None
+                                and fresh_q.get("gamma") is not None
+                                and fresh_q.get("theta") is not None
+                                and fresh_q.get("vega") is not None
+                            ):
+                                greeks_refreshed_ts = (
+                                    fresh_q.get("greeks_timestamp")
+                                    or fresh_q.get("greeks_time")
+                                    or refreshed_ts
+                                )
                                 broker_greeks = {
                                     "iv": fresh_q.get("iv"),
                                     "delta": fresh_q.get("delta"),
@@ -336,9 +347,9 @@ class OptionContractSelector:
                                     "theta": fresh_q.get("theta"),
                                     "vega": fresh_q.get("vega"),
                                     "rho": fresh_q.get("rho"),
-                                    "timestamp": refreshed_ts,
+                                    "timestamp": greeks_refreshed_ts,
                                 }
-                                greeks_ts = refreshed_ts
+                                greeks_ts = greeks_refreshed_ts
                         else:
                             logger.debug(
                                 "Discarding incomplete or unverified on-demand quote for %s (bid=%s, ask=%s, ts=%s)",
@@ -478,8 +489,11 @@ class OptionContractSelector:
 
             if is_estimated_ltp:
                 reasons.append("Model price derived from fresh bid/ask midpoint (estimated LTP)")
-            if greeks.model_used == "BLACK_76" and is_greeks_stale:
-                reasons.append("Model Greeks calculated with Black-76 (broker Greeks stale or refreshed price)")
+            if greeks.model_used == "BLACK_76":
+                if is_greeks_stale:
+                    reasons.append("Model Greeks calculated with Black-76 (broker Greeks stale or refreshed price)")
+                elif broker_greeks:
+                    reasons.append("Model Greeks calculated with Black-76 (broker Greeks incomplete)")
 
             if score >= self.min_selection_score:
                 contract = SelectedContract(
