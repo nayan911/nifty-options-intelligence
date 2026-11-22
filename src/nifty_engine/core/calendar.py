@@ -127,6 +127,28 @@ class ExchangeCalendar:
             return state in (SessionState.REGULAR_CASH, SessionState.DERIVATIVES_EXT, SessionState.SPECIAL_SESSION)
         return state in (SessionState.REGULAR_CASH, SessionState.SPECIAL_SESSION)
 
+    def get_auto_square_off_time(
+        self,
+        dt: Optional[datetime] = None,
+        default_square_off: time = time(15, 15, 0),
+        offset_minutes: int = 15,
+    ) -> Optional[time]:
+        """Returns the appropriate intraday auto-square-off cutoff time for the session."""
+        dt_ist = to_ist(dt) if dt else now_ist()
+        current_date = dt_ist.date()
+
+        if current_date in self.special_sessions:
+            cfg = self.special_sessions[current_date]
+            end_t = datetime.strptime(cfg["session_end"], "%H:%M:%S").time()
+            end_dt = datetime.combine(current_date, end_t)
+            sq_dt = end_dt - timedelta(minutes=offset_minutes)
+            return sq_dt.time()
+
+        if self.is_trading_day(current_date):
+            return default_square_off
+
+        return None
+
 
 def get_bar_duration(timeframe: str) -> timedelta:
     """Returns exact timedelta for standard timeframe string."""

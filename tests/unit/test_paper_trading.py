@@ -6,7 +6,7 @@ Indian statutory costs (STT 0.15%, Brokerage, GST, Stamp Duty), and DuckDB persi
 """
 
 from datetime import date, datetime, timedelta
-from typing import Dict
+from typing import Any, Dict
 
 import pytz
 
@@ -434,12 +434,12 @@ def test_stale_option_quote_delays_spot_trigger_until_fresh_tick():
 
 def test_on_candle_intrabar_adverse_first_evaluation():
     """Verify on_candle evaluates intrabar high and low with conservative adverse-first logic and fresh bid validation."""
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
     engine = PaperTradingEngine(
         default_lots=1,
         slippage_points=0.5,
-        quote_provider=lambda sym: {"ltp": 83.0, "bid": 83.0, "ask": 83.5},
+        quote_provider=lambda sym: {"ltp": 83.0, "bid": 83.0, "ask": 83.5, "timestamp": entry_ts + timedelta(minutes=15)},
     )
-    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
 
     cand = create_mock_candidate(
         timestamp=entry_ts,
@@ -662,8 +662,10 @@ def test_put_option_spot_sl_and_intrabar_boundaries():
 
 def test_quote_provider_on_demand_refresh():
     """Verify on-demand quote_provider refreshes stale option quote during spot trigger."""
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
     def mock_quote_provider(symbol: str):
-        return {"ltp": 82.0, "bid": 81.8, "ask": 82.2}
+        return {"ltp": 82.0, "bid": 81.8, "ask": 82.2, "timestamp": entry_ts + timedelta(minutes=3)}
 
     engine = PaperTradingEngine(
         default_lots=1,
@@ -671,7 +673,6 @@ def test_quote_provider_on_demand_refresh():
         max_quote_age_seconds=30.0,
         quote_provider=mock_quote_provider,
     )
-    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
 
     cand = create_mock_candidate(
         timestamp=entry_ts,
@@ -909,12 +910,13 @@ def test_duckdb_recovery_restores_pending_triggers_quotes_and_trades(tmp_path):
 
 def test_quote_provider_fallback_in_on_candle():
     """Verify on_candle queries quote_provider when quote is stale during spot breach."""
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
     fetched = False
 
-    def mock_quote_provider(symbol: str) -> Dict[str, float]:
+    def mock_quote_provider(symbol: str) -> Dict[str, Any]:
         nonlocal fetched
         fetched = True
-        return {"ltp": 82.0, "bid": 81.5, "ask": 82.5}
+        return {"ltp": 82.0, "bid": 81.5, "ask": 82.5, "timestamp": entry_ts + timedelta(minutes=15)}
 
     engine = PaperTradingEngine(
         quote_provider=mock_quote_provider,
@@ -922,7 +924,6 @@ def test_quote_provider_fallback_in_on_candle():
         slippage_points=0.5,
         max_quote_age_seconds=10.0,
     )
-    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
 
     cand = create_mock_candidate(
         timestamp=entry_ts,
@@ -987,12 +988,12 @@ def test_market_data_engine_wires_quote_provider_and_candle_pipeline():
 
 def test_candle_timing_prevents_retroactive_trades():
     """Verify on_candle ignores higher timeframes and bars that started before position entry."""
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 10, 0))
     engine = PaperTradingEngine(
         default_lots=1,
         slippage_points=0.5,
-        quote_provider=lambda sym: {"ltp": 80.0, "bid": 80.0, "ask": 80.5},
+        quote_provider=lambda sym: {"ltp": 80.0, "bid": 80.0, "ask": 80.5, "timestamp": entry_ts + timedelta(minutes=5)},
     )
-    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 10, 0))
 
     cand = create_mock_candidate(
         timestamp=entry_ts,
@@ -1523,7 +1524,18 @@ def test_rest_quote_fallback_rejects_missing_or_stale_bid():
     assert len(events) == 0
     assert pos.status == PositionStatus.OPEN
 
-    # 3. Quote provider returns authentic positive bid with fresh timestamp (5s old): ACCEPTED
+    # 3. Quote provider returns positive bid but broker timestamp is missing (None): REJECTED
+    current_mock_quote = {
+        "ltp": 80.0,
+        "bid": 79.5,
+        "ask": 80.5,
+        "timestamp": None,
+    }
+    events = engine.on_tick(spot_tick)
+    assert len(events) == 0
+    assert pos.status == PositionStatus.OPEN
+
+    # 4. Quote provider returns authentic positive bid with fresh timestamp (5s old): ACCEPTED
     current_mock_quote = {
         "ltp": 80.0,
         "bid": 79.5,
@@ -1598,6 +1610,154 @@ def test_checkpoint_does_not_redundantly_write_unchanged_positions():
         )
     assert save_count == 2
     store.close()
+
+
+def test_weekend_and_holiday_guards_prevent_eod_square_off():
+    """Verify recovered/open positions do not square off on weekends, holidays, or after-hours."""
+    engine = PaperTradingEngine(default_lots=1, slippage_points=0.5)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 14, 0, 0))  # Thursday
+
+    cand = create_mock_candidate(timestamp=entry_ts, entry_ltp=100.0, ask=100.0)
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+    assert pos.status == PositionStatus.OPEN
+
+    # 1. After-hours on Thursday (22:00 IST) - Market closed
+    after_hours_ts = IST.localize(datetime(2026, 11, 26, 22, 0, 0))
+    events = engine.check_time_events(after_hours_ts)
+    assert len(events) == 0
+    assert pos.status == PositionStatus.OPEN
+
+    # 2. Gazetted exchange holiday (Tuesday, 2026-11-24 Guru Nanak Jayanti at 15:15:05)
+    holiday_ts = IST.localize(datetime(2026, 11, 24, 15, 15, 5))
+    events = engine.check_time_events(holiday_ts)
+    assert len(events) == 0
+    assert pos.status == PositionStatus.OPEN
+
+    # 3. Saturday (2026-11-28 at 15:15:05)
+    saturday_ts = IST.localize(datetime(2026, 11, 28, 15, 15, 5))
+    events = engine.check_time_events(saturday_ts)
+    assert len(events) == 0
+    assert pos.status == PositionStatus.OPEN
+
+    # 4. Sunday (2026-11-29 at 15:15:05)
+    sunday_ts = IST.localize(datetime(2026, 11, 29, 15, 15, 5))
+    events = engine.check_time_events(sunday_ts)
+    assert len(events) == 0
+    assert pos.status == PositionStatus.OPEN
+
+    # 5. Active trading session at 15:15:05 IST on Thursday
+    eod_ts = IST.localize(datetime(2026, 11, 26, 15, 15, 5))
+    events = engine.check_time_events(eod_ts)
+    assert len(events) == 1
+    assert events[0][1] == ExitReason.EOD_SQUARE_OFF
+    assert pos.status == PositionStatus.CLOSED
+
+
+def test_special_session_uses_custom_square_off_time():
+    """Verify special session (e.g. Muhurat Trading 18:15-19:15) uses its own closing time."""
+    engine = PaperTradingEngine(default_lots=1, slippage_points=0.5)
+    # Muhurat trading date: 2026-11-08, session 18:15 - 19:15
+    entry_ts = IST.localize(datetime(2026, 11, 8, 18, 20, 0))
+
+    cand = create_mock_candidate(timestamp=entry_ts, entry_ltp=100.0, ask=100.0)
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+
+    # During afternoon (15:15 IST) market is closed for Muhurat day
+    afternoon_ts = IST.localize(datetime(2026, 11, 8, 15, 15, 0))
+    events = engine.check_time_events(afternoon_ts)
+    assert len(events) == 0
+    assert pos.status == PositionStatus.OPEN
+
+    # Mid-session (18:30 IST) - 15m before 19:15 close is 19:00, so 18:30 should not square off
+    mid_ts = IST.localize(datetime(2026, 11, 8, 18, 30, 0))
+    events = engine.check_time_events(mid_ts)
+    assert len(events) == 0
+    assert pos.status == PositionStatus.OPEN
+
+    # Cutoff time (19:01 IST) - should square off
+    cutoff_ts = IST.localize(datetime(2026, 11, 8, 19, 1, 0))
+    events = engine.check_time_events(cutoff_ts)
+    assert len(events) == 1
+    p, reason, exit_price = events[0]
+    assert reason == ExitReason.EOD_SQUARE_OFF
+    assert p.status == PositionStatus.CLOSED
+
+
+def test_distinguish_estimated_eod_fill_from_authenticated_fill():
+    """Verify paper engine differentiates authentic broker bid fills from penalty estimated fills."""
+    # 1. Authenticated broker bid fill
+    engine_auth = PaperTradingEngine(
+        default_lots=1,
+        slippage_points=0.5,
+        quote_provider=lambda sym: {
+            "ltp": 95.0,
+            "bid": 94.8,
+            "ask": 95.2,
+            "timestamp": IST.localize(datetime(2026, 11, 26, 15, 15, 0)),
+        },
+    )
+    entry_ts = IST.localize(datetime(2026, 11, 26, 14, 0, 0))
+    cand1 = create_mock_candidate(timestamp=entry_ts, entry_ltp=100.0, ask=100.0)
+    pos1 = engine_auth.process_technical_candidate(cand1, current_time=entry_ts)
+    assert pos1 is not None
+
+    eod_ts = IST.localize(datetime(2026, 11, 26, 15, 15, 2))
+    events1 = engine_auth.check_time_events(eod_ts)
+    assert len(events1) == 1
+    p1, reason1, exit_price1 = events1[0]
+    assert reason1 == ExitReason.EOD_SQUARE_OFF
+    assert p1.is_estimated_exit is False
+    assert p1.trades[-1].is_estimated_fill is False
+    assert exit_price1 == 94.30  # 94.8 bid - 0.5 slippage
+    assert "authenticated broker bid" in p1.notes
+
+    # 2. Estimated penalty fallback fill (quote stale, quote provider None)
+    engine_est = PaperTradingEngine(default_lots=1, slippage_points=0.5)
+    cand2 = create_mock_candidate(timestamp=entry_ts, entry_ltp=100.0, ask=100.0)
+    pos2 = engine_est.process_technical_candidate(cand2, current_time=entry_ts)
+    assert pos2 is not None
+
+    events2 = engine_est.check_time_events(eod_ts)
+    assert len(events2) == 1
+    p2, reason2, exit_price2 = events2[0]
+    assert reason2 == ExitReason.EOD_SQUARE_OFF
+    assert p2.is_estimated_exit is True
+    assert p2.trades[-1].is_estimated_fill is True
+    assert "conservative penalty" in p2.notes
+
+
+def test_duckdb_recovery_restores_estimated_exit_state(tmp_path):
+    """Verify DuckDB correctly persists and recovers is_estimated_exit state."""
+    db_path = tmp_path / "test_estimated.duckdb"
+    store = DuckDBStore(db_path=db_path)
+
+    engine = PaperTradingEngine(
+        store=store,
+        default_lots=1,
+        slippage_points=0.5,
+    )
+    entry_ts = IST.localize(datetime(2026, 11, 26, 14, 0, 0))
+    cand = create_mock_candidate(timestamp=entry_ts, entry_ltp=100.0, ask=100.0)
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+
+    # Trigger estimated EOD exit
+    eod_ts = IST.localize(datetime(2026, 11, 26, 15, 15, 2))
+    events = engine.check_time_events(eod_ts)
+    assert len(events) == 1
+    assert pos.is_estimated_exit is True
+
+    # Restart engine and recover from DuckDB
+    engine_recovered = PaperTradingEngine(store=store)
+    assert len(engine_recovered.closed_positions) == 1
+    rec_pos = engine_recovered.closed_positions[0]
+    assert rec_pos.position_id == pos.position_id
+    assert rec_pos.is_estimated_exit is True
+    assert rec_pos.trades[-1].is_estimated_fill is True
+    store.close()
+
 
 
 

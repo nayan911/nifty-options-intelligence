@@ -91,6 +91,7 @@ class PositionTrade:
     turnover: float
     costs: float
     reason: Optional[ExitReason] = None
+    is_estimated_fill: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -103,6 +104,7 @@ class PositionTrade:
             "turnover": round(self.turnover, 2),
             "costs": round(self.costs, 2),
             "reason": self.reason.value if isinstance(self.reason, ExitReason) else (str(self.reason) if self.reason else None),
+            "is_estimated_fill": self.is_estimated_fill,
         }
 
 
@@ -153,6 +155,7 @@ class PaperPosition:
     last_ask_time: Optional[datetime] = None
     is_exit_triggered: bool = False
     pending_exit_reason: Optional[ExitReason] = None
+    is_estimated_exit: bool = False
 
     def __post_init__(self):
         if self.initial_stop_loss_premium == 0.0 and self.stop_loss_premium > 0.0:
@@ -221,5 +224,6 @@ class PaperPosition:
             "net_pnl": round(self.net_pnl, 2),
             "total_costs": round(self.total_costs, 2),
             "realized_rr": round(self.realized_rr, 2) if self.realized_rr is not None else None,
+            "is_estimated_exit": self.is_estimated_exit,
             "notes": self.notes,
         }

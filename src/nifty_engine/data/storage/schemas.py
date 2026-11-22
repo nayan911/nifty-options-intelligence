@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     net_pnl DOUBLE DEFAULT 0.0,
     total_costs DOUBLE DEFAULT 0.0,
     realized_rr DOUBLE,
+    is_estimated_exit BOOLEAN DEFAULT FALSE,
     notes VARCHAR
 );
 

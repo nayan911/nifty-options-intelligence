@@ -7,13 +7,14 @@ Target 2 runner exit, technical stop-loss, and EOD 15:15 IST auto-square-off).
 
 import logging
 import uuid
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import pytz
 
 from nifty_engine.analysis.derivatives.cost_model import PremiumCostModel
 from nifty_engine.analysis.technical.multi_timeframe import TechnicalCandidate
+from nifty_engine.core.calendar import ExchangeCalendar
 from nifty_engine.core.interfaces import Candle, IStorageEngine, Tick
 from nifty_engine.paper_trading.models import (
     ExitReason,
@@ -25,7 +26,7 @@ from nifty_engine.paper_trading.models import (
     PositionStatus,
     PositionTrade,
 )
-from nifty_engine.utils.timezone import now_ist
+from nifty_engine.utils.timezone import now_ist, to_ist
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ class PaperTradingEngine:
         no_new_entries_time: time = time(15, 0, 0),
         market_open_time: time = time(9, 15, 0),
         checkpoint_interval_seconds: float = 1.0,
+        calendar: Optional[ExchangeCalendar] = None,
         on_trade_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.cost_model = cost_model or PremiumCostModel()
@@ -70,6 +72,7 @@ class PaperTradingEngine:
         self.no_new_entries_time = no_new_entries_time
         self.market_open_time = market_open_time
         self.checkpoint_interval_seconds = checkpoint_interval_seconds
+        self.calendar = calendar or ExchangeCalendar()
         self.on_trade_event = on_trade_event
 
         # In-memory position and order storage
@@ -108,12 +111,35 @@ class PaperTradingEngine:
         t = now.time()
 
         # 1. Trading hours gate
-        if t < self.market_open_time:
-            logger.info("Paper entry rejected: Market not yet open (%s)", t)
-            return None
-        if t >= self.no_new_entries_time:
-            logger.info("Paper entry rejected: After no-new-entries cutoff (%s >= %s)", t, self.no_new_entries_time)
-            return None
+        if self.calendar:
+            if not self.calendar.is_market_open(now, is_derivative=True):
+                logger.info("Paper entry rejected: Market is closed (%s)", now)
+                return None
+
+            now_ist_dt = to_ist(now) if now else now_ist()
+            current_date = now_ist_dt.date()
+            if current_date in self.calendar.special_sessions:
+                cfg = self.calendar.special_sessions[current_date]
+                end_t = datetime.strptime(cfg["session_end"], "%H:%M:%S").time()
+                end_dt = datetime.combine(current_date, end_t)
+                cutoff_t = (end_dt - timedelta(minutes=15)).time()
+                if t >= cutoff_t:
+                    logger.info("Paper entry rejected: After special session cutoff (%s >= %s)", t, cutoff_t)
+                    return None
+            else:
+                if t < self.market_open_time:
+                    logger.info("Paper entry rejected: Market not yet open (%s)", t)
+                    return None
+                if t >= self.no_new_entries_time:
+                    logger.info("Paper entry rejected: After no-new-entries cutoff (%s >= %s)", t, self.no_new_entries_time)
+                    return None
+        else:
+            if t < self.market_open_time:
+                logger.info("Paper entry rejected: Market not yet open (%s)", t)
+                return None
+            if t >= self.no_new_entries_time:
+                logger.info("Paper entry rejected: After no-new-entries cutoff (%s >= %s)", t, self.no_new_entries_time)
+                return None
 
         # 2. Candidate prerequisites
         da = getattr(candidate, "derivatives_assessment", None)
@@ -635,10 +661,21 @@ class PaperTradingEngine:
         return events
 
     def check_time_events(self, current_time: datetime) -> List[Tuple[PaperPosition, ExitReason, float]]:
-        """Evaluates auto square-off at 15:15 IST and max holding timeouts."""
+        """Evaluates auto square-off at 15:15 IST (or session cutoff) and max holding timeouts."""
         events: List[Tuple[PaperPosition, ExitReason, float]] = []
+
+        # Calendar gate: Do not run any auto square-offs or timeouts on non-trading days/sessions
+        if self.calendar and not self.calendar.is_market_open(current_time, is_derivative=True):
+            return events
+
+        sq_off_time = self.eod_square_off_time
+        if self.calendar:
+            cal_sq_off = self.calendar.get_auto_square_off_time(current_time, self.eod_square_off_time)
+            if cal_sq_off is not None:
+                sq_off_time = cal_sq_off
+
         t = current_time.time()
-        is_eod = t >= self.eod_square_off_time
+        is_eod = t >= sq_off_time
 
         for pos_id, pos in list(self.active_positions.items()):
             if pos.status == PositionStatus.CLOSED:
@@ -649,10 +686,11 @@ class PaperTradingEngine:
                 bid_fresh = self._apply_fresh_quote(pos, current_time)
             opt_price = pos.current_bid if (bid_fresh and pos.current_bid is not None and pos.current_bid > 0) else 0.0
 
-            # 1. EOD Auto Square-Off at 15:15 IST
+            # 1. EOD Auto Square-Off at session cutoff
             if is_eod:
-                if bid_fresh and opt_price > 0:
-                    exit_notes = "Intraday auto square-off at 15:15 IST"
+                is_estimated = not (bid_fresh and opt_price > 0)
+                if not is_estimated:
+                    exit_notes = "Intraday auto square-off at session cutoff (authenticated broker bid fill)"
                     fill_ref = opt_price
                 else:
                     # Explicit conservative fallback fill: apply double slippage penalty
@@ -666,6 +704,7 @@ class PaperTradingEngine:
                     ExitReason.EOD_SQUARE_OFF,
                     current_time,
                     notes=exit_notes,
+                    is_estimated_fill=is_estimated,
                 )
                 if ev:
                     events.append(ev)
@@ -783,6 +822,7 @@ class PaperTradingEngine:
         reason: ExitReason,
         current_time: datetime,
         notes: Optional[str] = None,
+        is_estimated_fill: bool = False,
     ) -> Optional[Tuple[PaperPosition, ExitReason, float]]:
         """Closes remaining quantity of an active position with complete Indian statutory charges."""
         if pos.status == PositionStatus.CLOSED or pos.remaining_quantity <= 0:
@@ -820,6 +860,7 @@ class PaperTradingEngine:
             turnover=exit_costs["turnover"],
             costs=exit_costs["total_costs"],
             reason=reason,
+            is_estimated_fill=is_estimated_fill,
         )
         pos.trades.append(trade)
 
@@ -827,6 +868,7 @@ class PaperTradingEngine:
         pos.status = PositionStatus.CLOSED
         pos.exit_reason = reason
         pos.exit_time = current_time
+        pos.is_estimated_exit = is_estimated_fill
         pos.total_costs += exit_costs["total_costs"]
 
         # Calculate finalized gross & net PnL across all execution legs
@@ -962,8 +1004,12 @@ class PaperTradingEngine:
             logger.debug("Rejected on-demand quote for %s: missing or non-positive bid (%.2f)", pos.symbol, bid)
             return False
 
-        # Validate broker quote timestamp freshness if provided
-        quote_ts = fresh_quote.get("timestamp") or current_time
+        # Validate broker quote timestamp freshness
+        quote_ts = fresh_quote.get("timestamp")
+        if quote_ts is None:
+            logger.debug("Rejected on-demand quote for %s: missing broker quote timestamp", pos.symbol)
+            return False
+
         quote_age = max(0.0, (current_time - quote_ts).total_seconds())
         if quote_age > self.max_quote_age_seconds:
             logger.debug(
@@ -1098,6 +1144,7 @@ class PaperTradingEngine:
             net_pnl=float(row.get("net_pnl", 0.0)),
             total_costs=float(row.get("total_costs", 0.0)),
             realized_rr=float(row["realized_rr"]) if row.get("realized_rr") is not None else None,
+            is_estimated_exit=bool(row.get("is_estimated_exit", False)),
             notes=row.get("notes"),
         )
 
@@ -1128,6 +1175,7 @@ class PaperTradingEngine:
                     turnover=round(price * qty, 2),
                     costs=costs,
                     reason=trade_reason,
+                    is_estimated_fill=bool(row.get("is_estimated_exit", False)) if not is_buy else False,
                 )
                 trades.append(trade)
 
