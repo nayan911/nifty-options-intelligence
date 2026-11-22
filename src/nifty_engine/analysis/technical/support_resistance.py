@@ -96,16 +96,18 @@ class SupportResistanceEngine:
         pdh: float,
         pdl: float,
         pdc: float,
-        cdo: float,
-        atr_value: float,
+        cdo: Optional[float] = None,
+        atr_value: float = 0.0,
     ) -> List[PriceZone]:
-        """Builds zones for Prior Day High/Low/Close and Current Day Open."""
-        return [
+        """Builds zones for Prior Day High/Low/Close and optionally Current Day Open."""
+        zones = [
             self.create_zone(LevelType.PDH, pdh, atr_value, "Prior Day High", weight=2.0),
             self.create_zone(LevelType.PDL, pdl, atr_value, "Prior Day Low", weight=2.0),
             self.create_zone(LevelType.PDC, pdc, atr_value, "Prior Day Close", weight=1.5),
-            self.create_zone(LevelType.CDO, cdo, atr_value, "Current Day Open", weight=1.2),
         ]
+        if cdo is not None and cdo > 0:
+            zones.append(self.create_zone(LevelType.CDO, cdo, atr_value, "Current Day Open", weight=1.2))
+        return zones
 
     def compute_opening_range(
         self,

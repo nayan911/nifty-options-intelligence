@@ -201,7 +201,13 @@ class SymbolTechnicalState:
         """Backward-compatible property returning the latest 1m RVOL timestamp."""
         return self.latest_1m_rvol_timestamp
 
-    def set_daily_references(self, pdh: float, pdl: float, pdc: float, cdo: float) -> None:
+    def set_daily_references(
+        self,
+        pdh: float,
+        pdl: float,
+        pdc: float,
+        cdo: Optional[float] = None,
+    ) -> None:
         """Sets daily reference prices for benchmark S/R calculation."""
         self.daily_reference_levels = {
             "PDH": pdh,
@@ -673,7 +679,7 @@ class SymbolTechnicalState:
                     pdh=self.daily_reference_levels["PDH"],
                     pdl=self.daily_reference_levels["PDL"],
                     pdc=self.daily_reference_levels["PDC"],
-                    cdo=self.daily_reference_levels["CDO"],
+                    cdo=self.daily_reference_levels.get("CDO"),
                     atr_value=effective_atr,
                 )
             )
@@ -890,7 +896,7 @@ class SymbolTechnicalState:
                     pdh=self.daily_reference_levels["PDH"],
                     pdl=self.daily_reference_levels["PDL"],
                     pdc=self.daily_reference_levels["PDC"],
-                    cdo=self.daily_reference_levels["CDO"],
+                    cdo=self.daily_reference_levels.get("CDO"),
                     atr_value=effective_atr,
                 )
             )
@@ -1063,7 +1069,7 @@ class SymbolTechnicalState:
                     pdh=self.daily_reference_levels["PDH"],
                     pdl=self.daily_reference_levels["PDL"],
                     pdc=self.daily_reference_levels["PDC"],
-                    cdo=self.daily_reference_levels["CDO"],
+                    cdo=self.daily_reference_levels.get("CDO"),
                     atr_value=effective_atr,
                 )
             )
@@ -1275,7 +1281,7 @@ class TechnicalAnalysisEngine:
         pdh: float,
         pdl: float,
         pdc: float,
-        cdo: float,
+        cdo: Optional[float] = None,
     ) -> None:
         """Sets daily reference levels (PDH/PDL/PDC/CDO) for a symbol."""
         with self._lock:

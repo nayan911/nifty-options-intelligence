@@ -9,7 +9,7 @@ Manages incremental caching of multi-timeframe completed candles from FYERS into
 """
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Optional
 
 import pytz
@@ -61,12 +61,37 @@ class HistoricalCandleManager:
         # Check existing latest stored candle in DuckDB
         latest_stored = self.store.get_latest_candle_timestamp(symbol, timeframe)
         if latest_stored is not None:
-            latest_d = latest_stored.date()
-            if latest_d >= to_d:
-                # Up to date
-                return 0
-            # Only fetch starting from the day of latest stored candle
-            from_d = max(from_d, latest_d)
+            now = now_ist()
+            if timeframe == "D":
+                if latest_stored.date() >= to_d:
+                    # Daily candle for to_d already stored
+                    return 0
+            else:
+                # Intraday intervals (1m, 5m, 15m)
+                bar_min = 15 if timeframe == "15m" else (5 if timeframe == "5m" else 1)
+                bar_delta = timedelta(minutes=bar_min)
+
+                if to_d < now.date():
+                    # Historical completed trading day: session closes at 15:30 IST
+                    session_end_bar = IST.localize(datetime.combine(to_d, time(15, 30))) - bar_delta
+                    if latest_stored >= session_end_bar:
+                        return 0
+                elif to_d == now.date():
+                    if now.time() < time(9, 15):
+                        # Pre-market: no candles exist for today yet
+                        if latest_stored.date() >= to_d:
+                            return 0
+                    elif now.time() >= time(15, 30):
+                        session_end_bar = IST.localize(datetime.combine(to_d, time(15, 30))) - bar_delta
+                        if latest_stored >= session_end_bar:
+                            return 0
+                    else:
+                        # Intraday during live market: up to date if latest stored is the last closed bar
+                        if latest_stored >= now - bar_delta:
+                            return 0
+
+            # Overlapping fetch starting from the day of latest stored candle to fill any missing bars
+            from_d = max(from_d, latest_stored.date())
 
         date_from_str = from_d.strftime("%Y-%m-%d")
         date_to_str = to_d.strftime("%Y-%m-%d")
@@ -138,7 +163,7 @@ class HistoricalCandleManager:
                 "PDH": round(daily_candle.high, 2),
                 "PDL": round(daily_candle.low, 2),
                 "PDC": round(daily_candle.close, 2),
-                "CDO": round(daily_candle.close, 2),
+                "CDO": None,
             }
 
         return None
@@ -153,22 +178,25 @@ class HistoricalCandleManager:
     ) -> Dict[str, Any]:
         """Pre-seeds daily references and bootstraps recent 15m & 5m historical candles into TechnicalAnalysisEngine."""
         target_date = as_of_date or now_ist().date()
+        as_of_cutoff = IST.localize(datetime.combine(target_date, datetime.min.time()))
         warmup_summary: Dict[str, Any] = {}
 
+        # Stage 1: Bootstrap historical candles for ALL symbols first
+        # Doing this before session preparation prevents multi-symbol session rollover leaks
         for sym in symbols:
-            # 1. Query recent 15m and 5m candles up to start of target_date
-            as_of_cutoff = IST.localize(datetime.combine(target_date, datetime.min.time()))
             recent_15m = self.store.get_recent_candles(sym, "15m", limit=candle_limit_15m, as_of=as_of_cutoff)
             recent_5m = self.store.get_recent_candles(sym, "5m", limit=candle_limit_5m, as_of=as_of_cutoff)
-
-            # Interleave and bootstrap chronologically
             combined_history = recent_15m + recent_5m
             bootstrapped_count = engine.bootstrap_candles(combined_history)
+            warmup_summary[sym] = {
+                "bootstrapped_candles": bootstrapped_count,
+            }
 
-            # 2. Advance session to target_date (resets intraday-specific state while preserving warmed indicators)
-            engine.prepare_session(target_date)
+        # Stage 2: Advance engine session to target_date once across all symbols
+        engine.prepare_session(target_date)
 
-            # 3. Seed Prior Day Levels (PDH, PDL, PDC, CDO) on the prepared target session
+        # Stage 3: Seed Prior Day Levels (PDH, PDL, PDC, CDO=None) for all symbols on the prepared session
+        for sym in symbols:
             levels = self.get_daily_reference_levels(sym, as_of_date=target_date)
             if levels:
                 engine.set_daily_references(
@@ -176,7 +204,7 @@ class HistoricalCandleManager:
                     pdh=levels["PDH"],
                     pdl=levels["PDL"],
                     pdc=levels["PDC"],
-                    cdo=levels["CDO"],
+                    cdo=levels.get("CDO"),
                 )
                 logger.info(
                     "Seeded daily references for %s: PDH=%.2f, PDL=%.2f, PDC=%.2f",
@@ -191,10 +219,7 @@ class HistoricalCandleManager:
             snap_5m = state.latest_snapshots.get("5m") if state else None
             is_warmed = snap_5m.is_warmed_up if snap_5m else False
 
-            warmup_summary[sym] = {
-                "daily_levels": levels,
-                "bootstrapped_candles": bootstrapped_count,
-                "is_5m_warmed_up": is_warmed,
-            }
+            warmup_summary[sym]["daily_levels"] = levels
+            warmup_summary[sym]["is_5m_warmed_up"] = is_warmed
 
         return warmup_summary

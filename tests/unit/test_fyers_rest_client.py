@@ -1,7 +1,14 @@
 """Unit tests for FyersRestClient option chain parsing."""
 
 
+import asyncio
+from datetime import timedelta
+from unittest.mock import MagicMock
+
+import pytest
+
 from nifty_engine.data.fyers.rest_client import FyersRestClient
+from nifty_engine.utils.timezone import now_ist
 
 
 def test_parse_option_chain_flat_contract_records():
@@ -182,7 +189,6 @@ def test_underlying_identification_banknifty_vs_nifty():
 
 def test_missing_expiry_raises_error():
     """Verify that an option chain payload with no detectable expiry raises ValueError."""
-    import pytest
     payload = {
         "underlyingValue": 25000.0,
         "optionsChain": [
@@ -416,5 +422,43 @@ def test_timestampless_option_chain_rejected_unless_quote_refreshed():
     assert res3 is not None, "Expected contract selection when verifiably fresh quote is provided"
     assert res3.symbol == "NSE:NIFTY26NOV25100CE"
     assert res3.quote_timestamp == now
+
+
+def test_get_historical_candles_candle_completeness():
+    """Verify that forming candles have is_closed=False while past completed candles have is_closed=True."""
+    mock_auth = MagicMock()
+    mock_client = MagicMock()
+    mock_auth.get_client.return_value = mock_client
+
+    rest_client = FyersRestClient(auth_provider=mock_auth)
+
+    now = now_ist()
+    # Candle 1: started 15 minutes ago (5m bar ended 10 minutes ago -> closed)
+    ts_past = int((now - timedelta(minutes=15)).timestamp())
+    # Candle 2: started 1 minute ago (5m bar ends in 4 minutes -> still forming)
+    ts_forming = int((now - timedelta(minutes=1)).timestamp())
+
+    mock_client.history.return_value = {
+        "s": "ok",
+        "candles": [
+            [ts_past, 25000.0, 25050.0, 24980.0, 25020.0, 5000],
+            [ts_forming, 25020.0, 25030.0, 25010.0, 25025.0, 1000],
+        ],
+    }
+
+    # 1. Sync fetch
+    candles_sync = rest_client.get_historical_candles_sync("NSE:NIFTY50-INDEX", resolution="5")
+    assert len(candles_sync) == 2
+    assert candles_sync[0].is_closed is True
+    assert candles_sync[1].is_closed is False
+
+    # 2. Async fetch
+    async def _test_async():
+        return await rest_client.get_historical_candles("NSE:NIFTY50-INDEX", resolution="5")
+
+    candles_async = asyncio.run(_test_async())
+    assert len(candles_async) == 2
+    assert candles_async[0].is_closed is True
+    assert candles_async[1].is_closed is False
 
 

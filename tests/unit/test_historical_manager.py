@@ -139,7 +139,7 @@ def test_historical_manager_get_daily_reference_levels(store):
     assert levels["PDH"] == 25180.5
     assert levels["PDL"] == 24950.25
     assert levels["PDC"] == 25120.0
-    assert levels["CDO"] == 25120.0
+    assert levels["CDO"] is None
 
 
 def test_pre_market_warmup_bootstraps_technical_engine_with_zero_trade_signals(store):
@@ -222,3 +222,97 @@ def test_pre_market_warmup_bootstraps_technical_engine_with_zero_trade_signals(s
     assert state.daily_reference_levels["PDH"] == 25200.0
     # Prior 5m indicators remain warmed up
     assert state.latest_snapshots["5m"].is_warmed_up is True
+
+
+def test_multi_symbol_warmup_prevents_session_date_leak(store):
+    """Verify that multi-symbol pre-market warmup bootstraps all symbols before session advance.
+
+    Ensures that symbol 2 can bootstrap Friday candles without session date leakage from symbol 1,
+    and both symbols have intact daily reference levels.
+    """
+    sym1 = "NSE:NIFTY50-INDEX"
+    sym2 = "NSE:NIFTYBANK-INDEX"
+
+    # Seed daily candle for Friday Nov 20 for both symbols
+    store.insert_candle(make_candle(sym1, "D", IST.localize(datetime(2026, 11, 20, 15, 30)), 25000.0, 25200.0, 24950.0, 25100.0))
+    store.insert_candle(make_candle(sym2, "D", IST.localize(datetime(2026, 11, 20, 15, 30)), 52000.0, 52500.0, 51900.0, 52300.0))
+
+    # Seed 30 5m candles for each
+    t_start = IST.localize(datetime(2026, 11, 20, 9, 15))
+    candles_s1 = [make_candle(sym1, "5m", t_start + timedelta(minutes=5 * i), 25000.0 + i, 25010.0 + i, 24995.0 + i, 25005.0 + i) for i in range(30)]
+    candles_s2 = [make_candle(sym2, "5m", t_start + timedelta(minutes=5 * i), 52000.0 + i, 52020.0 + i, 51980.0 + i, 52010.0 + i) for i in range(30)]
+    store.insert_candles_batch(candles_s1)
+    store.insert_candles_batch(candles_s2)
+
+    mock_setup_cb = MagicMock()
+    mock_candidate_cb = MagicMock()
+    engine = TechnicalAnalysisEngine(
+        primary_index=sym1,
+        primary_futures="NSE:NIFTY26NOVFUT",
+        on_setup_candidate=mock_setup_cb,
+        on_technical_candidate=mock_candidate_cb,
+    )
+
+    mock_rest = MagicMock()
+    manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
+
+    # Warmup both symbols for Monday Nov 23
+    summary = manager.warm_up_technical_engine(
+        engine=engine,
+        symbols=[sym1, sym2],
+        as_of_date=date(2026, 11, 23),
+        candle_limit_5m=30,
+        candle_limit_15m=0,
+    )
+
+    # Both symbols must be warmed up
+    assert summary[sym1]["is_5m_warmed_up"] is True
+    assert summary[sym2]["is_5m_warmed_up"] is True
+
+    # Check state 1
+    state1 = engine.states[sym1]
+    assert state1.current_session_date == date(2026, 11, 23)
+    assert state1.daily_reference_levels["PDH"] == 25200.0
+    assert state1.daily_reference_levels["CDO"] is None
+
+    # Check state 2 (was not corrupted or cleared by state 1's preparation)
+    state2 = engine.states[sym2]
+    assert state2.current_session_date == date(2026, 11, 23)
+    assert state2.daily_reference_levels["PDH"] == 52500.0
+    assert state2.daily_reference_levels["CDO"] is None
+
+    # Zero trades generated
+    mock_setup_cb.assert_not_called()
+    mock_candidate_cb.assert_not_called()
+
+
+def test_historical_manager_incremental_sync_fetches_intraday_afternoon_bars(store):
+    """Verify that incremental sync does not skip afternoon bars when morning bars exist."""
+    sym = "NSE:NIFTY50-INDEX"
+    # Store only morning bar up to 10:00 AM on Friday Nov 20
+    t_morning = IST.localize(datetime(2026, 11, 20, 10, 0))
+    c_morning = make_candle(sym, "5m", t_morning, 25100.0, 25120.0, 25090.0, 25110.0)
+    store.insert_candle(c_morning)
+
+    mock_rest = MagicMock()
+    manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
+
+    # Nov 20 is a completed historical day, but stored latest is 10:00 AM (earlier than 15:25 end of session)
+    # The broker returns the full day including afternoon bars
+    t_afternoon = IST.localize(datetime(2026, 11, 20, 15, 25))
+    c_afternoon = make_candle(sym, "5m", t_afternoon, 25150.0, 25160.0, 25140.0, 25155.0)
+    mock_rest.get_historical_candles_sync.return_value = [c_morning, c_afternoon]
+
+    # Sync for Nov 20
+    count = manager.sync_candles(sym, "5m", days_back=1, end_date=date(2026, 11, 20))
+
+    # Must NOT skip! It must call broker and insert the afternoon bar
+    mock_rest.get_historical_candles_sync.assert_called_once()
+    assert count == 2
+    assert store.get_latest_candle_timestamp(sym, "5m") == t_afternoon
+
+    # Running sync a second time now that 15:25 is stored should return 0 without broker call
+    mock_rest.reset_mock()
+    count_again = manager.sync_candles(sym, "5m", days_back=1, end_date=date(2026, 11, 20))
+    assert count_again == 0
+    mock_rest.get_historical_candles_sync.assert_not_called()

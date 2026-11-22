@@ -1,7 +1,7 @@
 """Rate-limited, asynchronous REST Client for FYERS Data API v3."""
 
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Optional
 
 import pytz
@@ -16,6 +16,7 @@ from nifty_engine.core.interfaces import (
 )
 from nifty_engine.core.rate_limiter import AsyncTokenBucketRateLimiter
 from nifty_engine.data.fyers.auth import FyersAuthProvider
+from nifty_engine.utils.timezone import now_ist
 
 
 class FyersRestClient:
@@ -68,19 +69,29 @@ class FyersRestClient:
 
         raw_candles = response.get("candles", [])
         candles = []
+        now = now_ist()
         for c in raw_candles:
             # c = [epoch_timestamp, open, high, low, close, volume]
+            ts = datetime.fromtimestamp(c[0], tz=IST)
+            if resolution in ("D", "1D", "day"):
+                close_dt = IST.localize(datetime.combine(ts.date(), time(15, 30)))
+            elif resolution.isdigit():
+                close_dt = ts + timedelta(minutes=int(resolution))
+            else:
+                close_dt = ts + timedelta(minutes=1)
+            is_closed = close_dt <= now
+
             candles.append(
                 Candle(
                     symbol=symbol,
                     timeframe=f"{resolution}m" if resolution.isdigit() else resolution,
-                    timestamp=datetime.fromtimestamp(c[0], tz=IST),
+                    timestamp=ts,
                     open=float(c[1]),
                     high=float(c[2]),
                     low=float(c[3]),
                     close=float(c[4]),
                     volume=int(c[5]),
-                    is_closed=True,
+                    is_closed=is_closed,
                 )
             )
         return candles
@@ -113,18 +124,28 @@ class FyersRestClient:
 
         raw_candles = response.get("candles", [])
         candles = []
+        now = now_ist()
         for c in raw_candles:
+            ts = datetime.fromtimestamp(c[0], tz=IST)
+            if resolution in ("D", "1D", "day"):
+                close_dt = IST.localize(datetime.combine(ts.date(), time(15, 30)))
+            elif resolution.isdigit():
+                close_dt = ts + timedelta(minutes=int(resolution))
+            else:
+                close_dt = ts + timedelta(minutes=1)
+            is_closed = close_dt <= now
+
             candles.append(
                 Candle(
                     symbol=symbol,
                     timeframe=f"{resolution}m" if resolution.isdigit() else resolution,
-                    timestamp=datetime.fromtimestamp(c[0], tz=IST),
+                    timestamp=ts,
                     open=float(c[1]),
                     high=float(c[2]),
                     low=float(c[3]),
                     close=float(c[4]),
                     volume=int(c[5]),
-                    is_closed=True,
+                    is_closed=is_closed,
                 )
             )
         return candles

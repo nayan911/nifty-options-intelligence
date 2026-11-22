@@ -46,6 +46,16 @@ def test_daily_levels_and_buffering():
     assert pdh_zone.contains(24202.0)
     assert not pdh_zone.contains(24210.0)
 
+    # When CDO is None or omitted, only PDH, PDL, PDC are built (3 zones)
+    zones_no_cdo = engine.compute_daily_levels(
+        pdh=24200.0,
+        pdl=23950.0,
+        pdc=24150.0,
+        atr_value=25.0,
+    )
+    assert len(zones_no_cdo) == 3
+    assert not any(z.level_type == LevelType.CDO for z in zones_no_cdo)
+
 
 def test_opening_range_calculation():
     engine = SupportResistanceEngine(zone_atr_multiple=0.1, min_zone_width_points=2.0)
