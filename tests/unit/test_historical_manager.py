@@ -8,6 +8,7 @@ import pytest
 import pytz
 
 from nifty_engine.analysis.technical.engine import TechnicalAnalysisEngine
+from nifty_engine.analysis.technical.support_resistance import LevelType
 from nifty_engine.core.interfaces import Candle
 from nifty_engine.core.rate_limiter import AsyncTokenBucketRateLimiter
 from nifty_engine.data.historical_manager import HistoricalCandleManager
@@ -218,8 +219,15 @@ def test_pre_market_warmup_bootstraps_technical_engine_with_zero_trade_signals(s
     snap_live = engine.on_candle(mon_1m_candle)
     assert snap_live is not None
 
-    # Daily references for Monday must still be intact
+    # Daily references for Monday must still be intact and CDO must now be populated with actual live open
     assert state.daily_reference_levels["PDH"] == 25200.0
+    assert state.daily_reference_levels["CDO"] == 25110.0
+
+    # Dedicated CDO Support & Resistance zone must now be present with nominal price matching live opening price!
+    cdo_zone = next((z for z in snap_live.sr_zones if z.level_type == LevelType.CDO), None)
+    assert cdo_zone is not None
+    assert cdo_zone.nominal_price == 25110.0
+
     # Prior 5m indicators remain warmed up
     assert state.latest_snapshots["5m"].is_warmed_up is True
 
@@ -316,3 +324,65 @@ def test_historical_manager_incremental_sync_fetches_intraday_afternoon_bars(sto
     count_again = manager.sync_candles(sym, "5m", days_back=1, end_date=date(2026, 11, 20))
     assert count_again == 0
     mock_rest.get_historical_candles_sync.assert_not_called()
+
+
+def test_first_live_opening_candle_populates_cdo_sr_zones_across_timeframes():
+    """Regression Test: Verify that first live opening candle populates CDO S/R zones across 1m, 5m, and 15m."""
+    sym = "NSE:NIFTY50-INDEX"
+    engine = TechnicalAnalysisEngine(
+        primary_index=sym,
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+
+    # Pre-market warmup seeds session with CDO=None
+    session_d = date(2026, 11, 23)
+    engine.prepare_session(session_d)
+    engine.set_daily_references(sym, pdh=25200.0, pdl=24950.0, pdc=25100.0, cdo=None)
+
+    state = engine.states[sym]
+    assert state.daily_reference_levels["CDO"] is None
+
+    # First 1m live candle at 09:15 arrives with open = 25115.0
+    c_1m_0915 = make_candle(sym, "1m", IST.localize(datetime(2026, 11, 23, 9, 15)), 25115.0, 25130.0, 25110.0, 25125.0)
+    snap_1m = engine.on_candle(c_1m_0915)
+    assert snap_1m is not None
+
+    # 1. State CDO must now be recorded as 25115.0
+    assert state.daily_reference_levels["CDO"] == 25115.0
+    assert state.session_open_price == 25115.0
+
+    # 2. 1m S/R zones must include CDO at 25115.0
+    cdo_1m = next((z for z in snap_1m.sr_zones if z.level_type == LevelType.CDO), None)
+    assert cdo_1m is not None
+    assert cdo_1m.nominal_price == 25115.0
+
+    # First 5m live candle arrives with open = 25115.0
+    c_5m_0915 = make_candle(sym, "5m", IST.localize(datetime(2026, 11, 23, 9, 15)), 25115.0, 25140.0, 25105.0, 25135.0)
+    snap_5m = engine.on_candle(c_5m_0915)
+    assert snap_5m is not None
+
+    # 3. 5m S/R zones must include CDO at 25115.0
+    cdo_5m = next((z for z in snap_5m.sr_zones if z.level_type == LevelType.CDO), None)
+    assert cdo_5m is not None
+    assert cdo_5m.nominal_price == 25115.0
+
+    # First 15m live candle arrives with open = 25115.0
+    c_15m_0915 = make_candle(sym, "15m", IST.localize(datetime(2026, 11, 23, 9, 15)), 25115.0, 25150.0, 25100.0, 25140.0)
+    snap_15m = engine.on_candle(c_15m_0915)
+    assert snap_15m is not None
+
+    # 4. 15m S/R zones must include CDO at 25115.0
+    cdo_15m = next((z for z in snap_15m.sr_zones if z.level_type == LevelType.CDO), None)
+    assert cdo_15m is not None
+    assert cdo_15m.nominal_price == 25115.0
+
+    # Second 1m live candle at 09:16 arrives with open = 25125.0
+    c_1m_0916 = make_candle(sym, "1m", IST.localize(datetime(2026, 11, 23, 9, 16)), 25125.0, 25135.0, 25120.0, 25130.0)
+    snap_1m_2 = engine.on_candle(c_1m_0916)
+    assert snap_1m_2 is not None
+
+    # 5. CDO must remain locked to the first opening price (25115.0), not second candle open
+    assert state.daily_reference_levels["CDO"] == 25115.0
+    cdo_1m_2 = next((z for z in snap_1m_2.sr_zones if z.level_type == LevelType.CDO), None)
+    assert cdo_1m_2 is not None
+    assert cdo_1m_2.nominal_price == 25115.0

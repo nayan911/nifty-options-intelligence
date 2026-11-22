@@ -71,6 +71,7 @@ class TechnicalSnapshot:
     nearest_resistance: Optional[PriceZone] = None
     active_setups: List[BreakoutContext] = field(default_factory=list)
     available_at: Optional[datetime] = None
+    sr_zones: List[PriceZone] = field(default_factory=list)
 
     @property
     def bar_close_time(self) -> datetime:
@@ -293,6 +294,8 @@ class SymbolTechnicalState:
 
         if self.session_open_price is None:
             self.session_open_price = candle.open
+            if self.daily_reference_levels is not None and self.daily_reference_levels.get("CDO") is None:
+                self.daily_reference_levels["CDO"] = candle.open
 
         if candle.timeframe == "1m":
             return self._process_1m_candle(
@@ -679,7 +682,7 @@ class SymbolTechnicalState:
                     pdh=self.daily_reference_levels["PDH"],
                     pdl=self.daily_reference_levels["PDL"],
                     pdc=self.daily_reference_levels["PDC"],
-                    cdo=self.daily_reference_levels.get("CDO"),
+                    cdo=self.daily_reference_levels.get("CDO") or self.session_open_price,
                     atr_value=effective_atr,
                 )
             )
@@ -804,6 +807,7 @@ class SymbolTechnicalState:
             nearest_resistance=nearest_res,
             active_setups=active_setups,
             available_at=avail_at_1m,
+            sr_zones=zones,
         )
 
         self.latest_snapshots["1m"] = snapshot
@@ -896,7 +900,7 @@ class SymbolTechnicalState:
                     pdh=self.daily_reference_levels["PDH"],
                     pdl=self.daily_reference_levels["PDL"],
                     pdc=self.daily_reference_levels["PDC"],
-                    cdo=self.daily_reference_levels.get("CDO"),
+                    cdo=self.daily_reference_levels.get("CDO") or self.session_open_price,
                     atr_value=effective_atr,
                 )
             )
@@ -1022,6 +1026,7 @@ class SymbolTechnicalState:
             nearest_resistance=nearest_res_5m,
             active_setups=active_setups_5m,
             available_at=avail_at_5m,
+            sr_zones=zones_5m,
         )
         self.latest_snapshots["5m"] = snap
         self.snapshot_history["5m"].append(snap)
@@ -1069,7 +1074,7 @@ class SymbolTechnicalState:
                     pdh=self.daily_reference_levels["PDH"],
                     pdl=self.daily_reference_levels["PDL"],
                     pdc=self.daily_reference_levels["PDC"],
-                    cdo=self.daily_reference_levels.get("CDO"),
+                    cdo=self.daily_reference_levels.get("CDO") or self.session_open_price,
                     atr_value=effective_atr,
                 )
             )
@@ -1152,6 +1157,7 @@ class SymbolTechnicalState:
             nearest_support=nearest_sup_15m,
             nearest_resistance=nearest_res_15m,
             available_at=avail_at_15m,
+            sr_zones=zones_15m,
         )
         self.latest_snapshots["15m"] = snap
         self.snapshot_history["15m"].append(snap)
