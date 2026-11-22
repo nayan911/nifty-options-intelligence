@@ -288,13 +288,18 @@ class OptionContractSelector:
                     fresh_q = self.quote_provider(symbol)
                     if fresh_q:
                         refreshed_ts = fresh_q.get("timestamp") or fresh_q.get("quote_time")
-                        if refreshed_ts is not None:
-                            if fresh_q.get("ltp") is not None:
+                        raw_bid = fresh_q.get("bid")
+                        raw_ask = fresh_q.get("ask")
+                        q_bid = float(raw_bid) if (raw_bid is not None and float(raw_bid) > 0) else None
+                        q_ask = float(raw_ask) if (raw_ask is not None and float(raw_ask) > 0) else None
+
+                        # Require both valid bid and ask from the same timestamped snapshot
+                        # to prevent mixing prices from different points in time
+                        if refreshed_ts is not None and q_bid is not None and q_ask is not None and q_ask >= q_bid:
+                            bid = q_bid
+                            ask = q_ask
+                            if fresh_q.get("ltp") is not None and float(fresh_q["ltp"]) > 0:
                                 ltp = float(fresh_q["ltp"])
-                            if fresh_q.get("bid") is not None:
-                                bid = float(fresh_q["bid"])
-                            if fresh_q.get("ask") is not None:
-                                ask = float(fresh_q["ask"])
                             if fresh_q.get("bid_size") is not None:
                                 bid_size = int(fresh_q["bid_size"])
                             if fresh_q.get("ask_size") is not None:
@@ -302,8 +307,11 @@ class OptionContractSelector:
                             quote_ts = refreshed_ts
                         else:
                             logger.debug(
-                                "Discarding on-demand quote for %s: missing broker quote timestamp",
+                                "Discarding incomplete or unverified on-demand quote for %s (bid=%s, ask=%s, ts=%s)",
                                 symbol,
+                                raw_bid,
+                                raw_ask,
+                                refreshed_ts,
                             )
                 except Exception as e:
                     logger.debug("Quote provider lookup failed for %s: %s", symbol, e)

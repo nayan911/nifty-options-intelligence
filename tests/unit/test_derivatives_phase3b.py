@@ -710,3 +710,91 @@ def test_contract_selector_rejects_timestamp_less_rest_quotes():
     assert res_valid.ask == 95.5
     assert res_valid.quote_age_seconds == 5.0
 
+
+def test_contract_selector_rejects_partially_populated_rest_quotes():
+    """Verify OptionContractSelector rejects partially populated REST quotes (e.g. bid without ask)."""
+    from datetime import timedelta
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    # Stale chain snapshot (100 seconds old > 30s max age)
+    stale_chain_time = t0 - timedelta(seconds=100)
+    snap = create_phase3b_chain(stale_chain_time)
+    oi_analyzer = OpenInterestAnalyzer()
+    profile = oi_analyzer.on_option_chain(snap)
+
+    # 1. Fresh timestamp and valid bid, but MISSING ask (ask=None)
+    def mock_quote_provider_missing_ask(symbol: str):
+        if "25100CE" in symbol:
+            return {
+                "ltp": 95.0,
+                "bid": 94.5,
+                "ask": None,  # Incomplete!
+                "timestamp": t0 - timedelta(seconds=5),
+            }
+        return None
+
+    selector1 = OptionContractSelector(
+        quote_provider=mock_quote_provider_missing_ask,
+        max_quote_age_seconds=30.0,
+    )
+    res1 = selector1.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=t0,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    # Must reject incomplete quote rather than combining fresh bid with stale ask from snapshot
+    assert res1 is None
+
+    # 2. Fresh timestamp and valid ask, but MISSING bid (bid=None)
+    def mock_quote_provider_missing_bid(symbol: str):
+        if "25100CE" in symbol:
+            return {
+                "ltp": 95.0,
+                "bid": None,  # Incomplete!
+                "ask": 95.5,
+                "timestamp": t0 - timedelta(seconds=5),
+            }
+        return None
+
+    selector2 = OptionContractSelector(
+        quote_provider=mock_quote_provider_missing_bid,
+        max_quote_age_seconds=30.0,
+    )
+    res2 = selector2.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=t0,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res2 is None
+
+    # 3. Fresh timestamp, but INVERTED bid/ask (ask < bid)
+    def mock_quote_provider_inverted(symbol: str):
+        if "25100CE" in symbol:
+            return {
+                "ltp": 95.0,
+                "bid": 95.5,
+                "ask": 94.5,  # Inverted!
+                "timestamp": t0 - timedelta(seconds=5),
+            }
+        return None
+
+    selector3 = OptionContractSelector(
+        quote_provider=mock_quote_provider_inverted,
+        max_quote_age_seconds=30.0,
+    )
+    res3 = selector3.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=t0,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res3 is None
+
+
