@@ -232,6 +232,19 @@ class MarketDataEngine:
                 f"(Alignment: {da.alignment_score:.2f}, Quality: {da.data_quality_score:.2f}) | "
                 f"Reasons: {reasons_summary} | Contra: {contra_summary}\n"
             )
+            if getattr(da, "selected_contract", None) is not None:
+                sc = da.selected_contract
+                traj = sc.premium_trajectory
+                costs = sc.execution_costs
+                viable_str = "VIABLE" if costs.is_cost_viable else "UNVIABLE"
+                deriv_str += (
+                    f"  Selected Contract: {sc.symbol} (Score: {sc.selection_score:.1f}/100) | "
+                    f"Δ: {sc.greeks.delta:+.2f}, IV: {sc.greeks.iv*100:.1f}%, Θ: {sc.greeks.theta:.1f}/day, Spread: {sc.spread_pct*100:.2f}%\n"
+                    f"  Option Trajectory: LTP ₹{sc.ltp:.2f} -> T1: ₹{traj.target_premium_t1:.2f} (+{traj.target_premium_t1 - sc.ltp:.1f}pts) | "
+                    f"SL: ₹{traj.stop_loss_premium:.2f} (-{sc.ltp - traj.stop_loss_premium:.1f}pts)\n"
+                    f"  Execution Cost Model: Statutory ₹{costs.total_statutory_rupees:.2f}/lot | Friction: {costs.total_friction_points:.2f}pts | "
+                    f"Gross R:R: 1:{costs.gross_rr_t1} -> Net R:R: 1:{costs.net_rr_t1} [{viable_str}]\n"
+                )
 
         print(
             f"\n{'*'*78}\n"
