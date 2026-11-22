@@ -4,12 +4,15 @@ Provides Black-76 / Black-Scholes analytical Greeks computation using futures pr
 as underlying, dynamic Newton-Raphson IV solver, and transparent fallback from broker-reported Greeks.
 """
 
+import logging
 import math
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from typing import Any, Dict, Optional
 
 import pytz
+
+logger = logging.getLogger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -204,8 +207,17 @@ class GreeksEngine:
         market_price: float,
         risk_free_rate: Optional[float] = None,
         broker_greeks: Optional[Dict[str, Any]] = None,
+        broker_greeks_timestamp: Optional[datetime] = None,
+        quote_timestamp: Optional[datetime] = None,
+        max_greeks_age_seconds: Optional[float] = 30.0,
     ) -> OptionGreeks:
-        """Generates complete OptionGreeks, preferring valid broker Greeks and falling back to Black-76."""
+        """Generates complete OptionGreeks, preferring valid, fresh broker Greeks and falling back to Black-76.
+
+        Validates freshness and correspondence of broker Greeks:
+        - If broker Greeks are older than max_greeks_age_seconds, or future-dated beyond clock skew,
+          or if refreshed quote timestamp indicates the broker Greeks are from a stale snapshot,
+          the engine calculates fresh analytical Black-76 Greeks using the current market price.
+        """
         opt_type = option_type.upper().strip()
         F = float(underlying_futures)
         K = float(strike)
@@ -213,7 +225,7 @@ class GreeksEngine:
         r = float(risk_free_rate if risk_free_rate is not None else self.default_risk_free_rate)
         T = self.compute_time_to_expiry_years(expiry=expiry, current_time=current_time)
 
-        # 1. Primary check: Use broker Greeks if valid and non-zero
+        # 1. Primary check: Use broker Greeks if valid, non-zero, and fresh
         if broker_greeks:
             b_iv = broker_greeks.get("iv")
             b_delta = broker_greeks.get("delta")
@@ -223,16 +235,47 @@ class GreeksEngine:
                 and float(b_iv) > 0.01
                 and abs(float(b_delta)) > 0.01
             ):
-                return OptionGreeks(
-                    iv=round(float(b_iv) / 100.0 if float(b_iv) > 1.0 else float(b_iv), 4),
-                    delta=round(float(b_delta), 4),
-                    gamma=round(float(broker_greeks.get("gamma") or 0.0), 6),
-                    theta=round(float(broker_greeks.get("theta") or 0.0), 3),
-                    vega=round(float(broker_greeks.get("vega") or 0.0), 3),
-                    rho=round(float(broker_greeks.get("rho") or 0.0), 4),
-                    is_calculated=False,
-                    model_used="FYERS",
+                bg_ts = (
+                    broker_greeks_timestamp
+                    or broker_greeks.get("timestamp")
+                    or broker_greeks.get("quote_time")
                 )
+                max_age = (
+                    max_greeks_age_seconds
+                    if max_greeks_age_seconds is not None
+                    else 30.0
+                )
+                is_fresh = True
+                if bg_ts is not None:
+                    greeks_age = (current_time - bg_ts).total_seconds()
+                    # Reject stale or materially future-dated broker Greeks
+                    if greeks_age > max_age or greeks_age < -2.0:
+                        is_fresh = False
+                    # When quote timestamp is refreshed, ensure broker Greeks correspond to that quote
+                    elif quote_timestamp is not None:
+                        drift = (quote_timestamp - bg_ts).total_seconds()
+                        if drift > max_age:
+                            is_fresh = False
+
+                if is_fresh:
+                    return OptionGreeks(
+                        iv=round(float(b_iv) / 100.0 if float(b_iv) > 1.0 else float(b_iv), 4),
+                        delta=round(float(b_delta), 4),
+                        gamma=round(float(broker_greeks.get("gamma") or 0.0), 6),
+                        theta=round(float(broker_greeks.get("theta") or 0.0), 3),
+                        vega=round(float(broker_greeks.get("vega") or 0.0), 3),
+                        rho=round(float(broker_greeks.get("rho") or 0.0), 4),
+                        is_calculated=False,
+                        model_used="FYERS",
+                    )
+                else:
+                    logger.debug(
+                        "Broker Greeks for strike %.1f rejected (stale/unmatched: bg_ts=%s, quote_ts=%s, as_of=%s). Falling back to Black-76.",
+                        K,
+                        bg_ts,
+                        quote_timestamp,
+                        current_time,
+                    )
 
         # 2. Analytical Black-76 fallback
         if F <= 0.0 or K <= 0.0 or mkt <= 0.0:

@@ -840,4 +840,163 @@ def test_contract_selector_derives_midpoint_ltp_when_rest_quote_omits_ltp():
     assert res.to_dict()["is_estimated_ltp"] is True
 
 
+def test_greeks_engine_rejects_stale_or_skewed_broker_greeks():
+    """Verify GreeksEngine calculates analytical Black-76 Greeks when broker Greeks are stale or skewed."""
+    from datetime import timedelta
+    engine = GreeksEngine()
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    expiry = date(2026, 11, 26)
+
+    broker_payload = {
+        "iv": 15.2,
+        "delta": 0.52,
+        "gamma": 0.00045,
+        "theta": -9.1,
+        "vega": 11.8,
+        "rho": 0.02,
+    }
+
+    # 1. Fresh broker Greeks (10s old <= 30s max age) -> uses FYERS
+    g_fresh = engine.calculate_greeks(
+        option_type="CE",
+        strike=25000.0,
+        underlying_futures=25000.0,
+        expiry=expiry,
+        current_time=t0,
+        market_price=145.0,
+        broker_greeks=broker_payload,
+        broker_greeks_timestamp=t0 - timedelta(seconds=10),
+        quote_timestamp=t0 - timedelta(seconds=10),
+        max_greeks_age_seconds=30.0,
+    )
+    assert g_fresh.model_used == "FYERS"
+    assert g_fresh.is_calculated is False
+    assert g_fresh.delta == 0.52
+
+    # 2. Stale broker Greeks (60s old > 30s max age) -> falls back to BLACK_76
+    g_stale = engine.calculate_greeks(
+        option_type="CE",
+        strike=25000.0,
+        underlying_futures=25000.0,
+        expiry=expiry,
+        current_time=t0,
+        market_price=145.0,
+        broker_greeks=broker_payload,
+        broker_greeks_timestamp=t0 - timedelta(seconds=60),
+        quote_timestamp=t0 - timedelta(seconds=5),
+        max_greeks_age_seconds=30.0,
+    )
+    assert g_stale.model_used == "BLACK_76"
+    assert g_stale.is_calculated is True
+    assert g_stale.iv > 0.01
+
+    # 3. Future-dated broker Greeks (skewed by 10s in future) -> falls back to BLACK_76
+    g_future = engine.calculate_greeks(
+        option_type="CE",
+        strike=25000.0,
+        underlying_futures=25000.0,
+        expiry=expiry,
+        current_time=t0,
+        market_price=145.0,
+        broker_greeks=broker_payload,
+        broker_greeks_timestamp=t0 + timedelta(seconds=10),
+        max_greeks_age_seconds=30.0,
+    )
+    assert g_future.model_used == "BLACK_76"
+    assert g_future.is_calculated is True
+
+    # 4. Refreshed quote timestamp where broker Greeks lag quote by > 30s -> falls back to BLACK_76
+    g_lag = engine.calculate_greeks(
+        option_type="CE",
+        strike=25000.0,
+        underlying_futures=25000.0,
+        expiry=expiry,
+        current_time=t0,
+        market_price=145.0,
+        broker_greeks=broker_payload,
+        broker_greeks_timestamp=t0 - timedelta(seconds=50),
+        quote_timestamp=t0 - timedelta(seconds=5),
+        max_greeks_age_seconds=30.0,
+    )
+    assert g_lag.model_used == "BLACK_76"
+    assert g_lag.is_calculated is True
+
+
+def test_contract_selector_recalculates_model_greeks_when_broker_greeks_are_stale():
+    """Verify OptionContractSelector recalculates model Greeks when on-demand quote refreshes price but Greeks are stale."""
+    from datetime import timedelta
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    # Stale chain snapshot (80 seconds old > 30s max age)
+    stale_chain_time = t0 - timedelta(seconds=80)
+    snap = create_phase3b_chain(stale_chain_time)
+    oi_analyzer = OpenInterestAnalyzer()
+    profile = oi_analyzer.on_option_chain(snap)
+
+    # 1. On-demand quote refreshes prices at t0 - 5s, but omits Greeks
+    def mock_quote_provider_price_only(symbol: str):
+        if "25100CE" in symbol:
+            return {
+                "ltp": 95.0,
+                "bid": 94.5,
+                "ask": 95.5,
+                "timestamp": t0 - timedelta(seconds=5),
+            }
+        return None
+
+    selector = OptionContractSelector(
+        quote_provider=mock_quote_provider_price_only,
+        max_quote_age_seconds=30.0,
+    )
+    res = selector.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=t0,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res is not None
+    # Price was refreshed from mock quote
+    assert res.bid == 94.5
+    assert res.ask == 95.5
+    # Stale broker Greeks (80s old) must be rejected and replaced with fresh Black-76 model Greeks
+    assert res.greeks.model_used == "BLACK_76"
+    assert res.greeks.is_calculated is True
+    assert "Model Greeks calculated with Black-76 (broker Greeks stale or refreshed price)" in res.selection_reasons
+
+    # 2. When on-demand quote ALSO supplies fresh Greeks, FYERS model Greeks are preserved
+    def mock_quote_provider_with_greeks(symbol: str):
+        if "25100CE" in symbol:
+            return {
+                "ltp": 95.0,
+                "bid": 94.5,
+                "ask": 95.5,
+                "iv": 14.5,
+                "delta": 0.49,
+                "gamma": 0.0004,
+                "theta": -8.0,
+                "vega": 10.0,
+                "timestamp": t0 - timedelta(seconds=5),
+            }
+        return None
+
+    selector_with_greeks = OptionContractSelector(
+        quote_provider=mock_quote_provider_with_greeks,
+        max_quote_age_seconds=30.0,
+    )
+    res_with_greeks = selector_with_greeks.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=t0,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res_with_greeks is not None
+    assert res_with_greeks.greeks.model_used == "FYERS"
+    assert res_with_greeks.greeks.delta == 0.49
+    assert res_with_greeks.greeks.is_calculated is False
+
+
+
 

@@ -255,12 +255,14 @@ class OptionContractSelector:
                 bid_size = strike_data.call_bid_size
                 ask_size = strike_data.call_ask_size
                 quote_ts = strike_data.call_quote_timestamp or chain_profile.timestamp
+                greeks_ts = strike_data.call_quote_timestamp or chain_profile.timestamp
                 broker_greeks = {
                     "iv": strike_data.call_iv,
                     "delta": strike_data.call_delta,
                     "gamma": strike_data.call_gamma,
                     "theta": strike_data.call_theta,
                     "vega": strike_data.call_vega,
+                    "timestamp": greeks_ts,
                 }
             else:
                 symbol = strike_data.put_symbol
@@ -272,12 +274,14 @@ class OptionContractSelector:
                 bid_size = strike_data.put_bid_size
                 ask_size = strike_data.put_ask_size
                 quote_ts = strike_data.put_quote_timestamp or chain_profile.timestamp
+                greeks_ts = strike_data.put_quote_timestamp or chain_profile.timestamp
                 broker_greeks = {
                     "iv": strike_data.put_iv,
                     "delta": strike_data.put_delta,
                     "gamma": strike_data.put_gamma,
                     "theta": strike_data.put_theta,
                     "vega": strike_data.put_vega,
+                    "timestamp": greeks_ts,
                 }
 
             # HARD ELIGIBILITY GATE 1: Real exchange symbol required
@@ -322,6 +326,19 @@ class OptionContractSelector:
                             if fresh_q.get("ask_size") is not None:
                                 ask_size = int(fresh_q["ask_size"])
                             quote_ts = refreshed_ts
+
+                            # Track Greeks freshness independently: update broker Greeks if fresh_q supplies them
+                            if fresh_q.get("iv") is not None and fresh_q.get("delta") is not None:
+                                broker_greeks = {
+                                    "iv": fresh_q.get("iv"),
+                                    "delta": fresh_q.get("delta"),
+                                    "gamma": fresh_q.get("gamma"),
+                                    "theta": fresh_q.get("theta"),
+                                    "vega": fresh_q.get("vega"),
+                                    "rho": fresh_q.get("rho"),
+                                    "timestamp": refreshed_ts,
+                                }
+                                greeks_ts = refreshed_ts
                         else:
                             logger.debug(
                                 "Discarding incomplete or unverified on-demand quote for %s (bid=%s, ask=%s, ts=%s)",
@@ -376,6 +393,22 @@ class OptionContractSelector:
             # Effective market price for Greeks solver
             mkt_price = ltp if ltp > 0.05 else ask
 
+            # Track freshness independently for broker Greeks
+            is_greeks_stale = False
+            if greeks_ts is not None:
+                greeks_age = (current_time - greeks_ts).total_seconds()
+                if (
+                    greeks_age > self.max_quote_age_seconds
+                    or greeks_age < -self.clock_skew_tolerance_seconds
+                ):
+                    is_greeks_stale = True
+                elif quote_ts is not None and (quote_ts - greeks_ts).total_seconds() > self.max_quote_age_seconds:
+                    is_greeks_stale = True
+            else:
+                is_greeks_stale = True
+
+            effective_broker_greeks = None if is_greeks_stale else broker_greeks
+
             # Calculate Greeks with authentic broker fallback and contract-matched forward
             greeks = self.greeks_engine.calculate_greeks(
                 option_type=opt_type,
@@ -384,7 +417,10 @@ class OptionContractSelector:
                 expiry=chain_profile.expiry,
                 current_time=current_time,
                 market_price=mkt_price,
-                broker_greeks=broker_greeks,
+                broker_greeks=effective_broker_greeks,
+                broker_greeks_timestamp=greeks_ts if not is_greeks_stale else None,
+                quote_timestamp=quote_ts,
+                max_greeks_age_seconds=self.max_quote_age_seconds,
             )
 
             # HARD ELIGIBILITY GATE 6: Valid Greeks and Delta limits
@@ -442,6 +478,8 @@ class OptionContractSelector:
 
             if is_estimated_ltp:
                 reasons.append("Model price derived from fresh bid/ask midpoint (estimated LTP)")
+            if greeks.model_used == "BLACK_76" and is_greeks_stale:
+                reasons.append("Model Greeks calculated with Black-76 (broker Greeks stale or refreshed price)")
 
             if score >= self.min_selection_score:
                 contract = SelectedContract(
