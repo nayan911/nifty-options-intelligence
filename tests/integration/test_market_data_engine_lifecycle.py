@@ -13,7 +13,7 @@ sys.path.insert(0, str(scripts_dir))
 
 from run_market_data import MarketDataEngine
 
-from nifty_engine.core.interfaces import Candle, Tick
+from nifty_engine.core.interfaces import Candle, SessionState, SystemReadiness, Tick
 from nifty_engine.data.fyers.instrument_master import NSE_FO_COLUMNS
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 
@@ -241,3 +241,92 @@ def test_market_data_engine_derivatives_integration():
     assert pcr.aggregate_oi_pcr == 0.8
 
     store.close()
+
+
+def test_market_data_engine_two_way_readiness_monitoring(monkeypatch):
+    """Verify continuous two-way readiness re-evaluation:
+    - Safe fail-closed default (NOT_READY)
+    - Automatic upgrade on indicator warm-up (NOT_READY -> DEGRADED -> READY)
+    - Safety downgrade during live trading when feed becomes stale or WS drops
+    - Recovery upgrade when fresh tick arrives
+    """
+    from unittest.mock import MagicMock
+
+    store = DuckDBStore(db_path=":memory:")
+    engine = MarketDataEngine(store=store)
+
+    # 1. Initial State: Paper engine starts in fail-closed NOT_READY
+    assert engine.paper_engine.system_readiness == SystemReadiness.NOT_READY
+
+    # 2. Mock calendar to indicate regular trading session
+    t_now = IST.localize(datetime(2026, 11, 23, 10, 0, 0))
+    monkeypatch.setattr(engine.calendar, "get_session_state", lambda is_derivative=True: SessionState.REGULAR_CASH)
+    monkeypatch.setattr("run_market_data.now_ist", lambda: t_now)
+
+    # 3. Initially, indicators are cold -> evaluate_and_update_readiness returns NOT_READY
+    r1 = engine.evaluate_and_update_readiness()
+    assert r1 == SystemReadiness.NOT_READY
+    assert engine.paper_engine.system_readiness == SystemReadiness.NOT_READY
+
+    # 4. Seed daily levels and simulate 5m indicators warmed up, 1m cold -> DEGRADED
+    from nifty_engine.core.config import settings
+    sym_idx = settings.PRIMARY_INDEX
+    sym_fut = engine.technical_engine.primary_futures
+
+    engine.technical_engine.prepare_session(date(2026, 11, 23))
+    engine.technical_engine.set_daily_references(sym_idx, pdh=25200.0, pdl=24900.0, pdc=25100.0)
+    engine.technical_engine.set_daily_references(sym_fut, pdh=25250.0, pdl=24950.0, pdc=25150.0)
+
+    snap_5m_mock = MagicMock()
+    snap_5m_mock.is_warmed_up = True
+    snap_5m_mock.trend_bias = "BULLISH"
+    engine.technical_engine.states[sym_idx].latest_snapshots["5m"] = snap_5m_mock
+    engine.technical_engine.states[sym_fut].latest_snapshots["5m"] = snap_5m_mock
+
+    # WebSocket connected and feed fresh, but 1m indicators still cold -> DEGRADED
+    engine.ws_client._is_connected = True
+    engine.last_primary_tick_time = t_now
+
+    r2 = engine.evaluate_and_update_readiness()
+    assert r2 == SystemReadiness.DEGRADED
+    assert engine.paper_engine.system_readiness == SystemReadiness.DEGRADED
+
+    # 5. Simulate 1m indicators warming up -> UPGRADE to READY
+    snap_1m_mock = MagicMock()
+    snap_1m_mock.is_warmed_up = True
+    snap_1m_mock.trend_bias = "BULLISH"
+    engine.technical_engine.states[sym_idx].latest_snapshots["1m"] = snap_1m_mock
+    engine.technical_engine.states[sym_fut].latest_snapshots["1m"] = snap_1m_mock
+
+    r3 = engine.evaluate_and_update_readiness()
+    assert r3 == SystemReadiness.READY
+    assert engine.paper_engine.system_readiness == SystemReadiness.READY
+
+    # 6. Safety Downgrade: Time advances by 70s without tick -> DOWNGRADE to DEGRADED
+    monkeypatch.setattr("run_market_data.now_ist", lambda: t_now + timedelta(seconds=70))
+    r4 = engine.evaluate_and_update_readiness()
+    assert r4 == SystemReadiness.DEGRADED
+    assert engine.paper_engine.system_readiness == SystemReadiness.DEGRADED
+
+    # 7. Safety Downgrade: Time advances by 130s without tick -> DOWNGRADE to NOT_READY
+    monkeypatch.setattr("run_market_data.now_ist", lambda: t_now + timedelta(seconds=130))
+    r5 = engine.evaluate_and_update_readiness()
+    assert r5 == SystemReadiness.NOT_READY
+    assert engine.paper_engine.system_readiness == SystemReadiness.NOT_READY
+
+    # 8. Recovery: Fresh tick arrives! -> UPGRADE back to READY
+    t_recovered = t_now + timedelta(seconds=135)
+    monkeypatch.setattr("run_market_data.now_ist", lambda: t_recovered)
+    engine.last_primary_tick_time = t_recovered
+    r6 = engine.evaluate_and_update_readiness()
+    assert r6 == SystemReadiness.READY
+    assert engine.paper_engine.system_readiness == SystemReadiness.READY
+
+    # 9. Safety Downgrade: WebSocket disconnection -> DOWNGRADE to NOT_READY
+    engine.ws_client._is_connected = False
+    r7 = engine.evaluate_and_update_readiness()
+    assert r7 == SystemReadiness.NOT_READY
+    assert engine.paper_engine.system_readiness == SystemReadiness.NOT_READY
+
+    store.close()
+

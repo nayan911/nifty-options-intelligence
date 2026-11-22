@@ -58,6 +58,7 @@ class PaperTradingEngine:
         clock_skew_tolerance_seconds: float = 2.0,
         calendar: Optional[ExchangeCalendar] = None,
         on_trade_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+        system_readiness: SystemReadiness = SystemReadiness.NOT_READY,
     ) -> None:
         self.cost_model = cost_model or PremiumCostModel()
         self.store = store
@@ -90,7 +91,7 @@ class PaperTradingEngine:
         self.total_realized_gross_pnl: float = 0.0
         self.total_realized_net_pnl: float = 0.0
         self.total_costs_paid: float = 0.0
-        self.system_readiness: SystemReadiness = SystemReadiness.READY
+        self.system_readiness: SystemReadiness = system_readiness
 
         # Automatic recovery from persistent DuckDB store upon process startup
         self._recover_from_store()
@@ -115,10 +116,11 @@ class PaperTradingEngine:
 
         and executes a simulated market BUY order if all risk gates pass.
         """
-        # 0. System Readiness Gate
-        if self.system_readiness == SystemReadiness.NOT_READY:
+        # 0. System Readiness Gate: Fail-closed, entries strictly require READY
+        if self.system_readiness != SystemReadiness.READY:
             logger.warning(
-                "Paper entry rejected: System readiness is NOT_READY (historical data / indicators incomplete)",
+                "Paper entry rejected: System readiness is %s (entries strictly require READY)",
+                self.system_readiness.value,
             )
             return None
 

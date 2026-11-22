@@ -8,6 +8,7 @@ Indian statutory costs (STT 0.15%, Brokerage, GST, Stamp Duty), and DuckDB persi
 from datetime import date, datetime, timedelta
 from typing import Any, Dict
 
+import pytest
 import pytz
 
 from nifty_engine.analysis.derivatives.contract_selector import SelectedContract
@@ -23,6 +24,25 @@ from nifty_engine.paper_trading.engine import PaperTradingEngine
 from nifty_engine.paper_trading.models import ExitReason, OrderSide, PositionStatus
 
 IST = pytz.timezone("Asia/Kolkata")
+
+
+@pytest.fixture(autouse=True)
+def default_paper_engine_ready(monkeypatch, request):
+    """In unit tests focusing on execution/fills/P&L, default engine to READY,
+
+    unless the test is specifically testing system readiness gating.
+    """
+    if "system_readiness" in request.node.name:
+        return
+
+    orig_init = PaperTradingEngine.__init__
+
+    def ready_init(self, *args, **kwargs):
+        if "system_readiness" not in kwargs:
+            kwargs["system_readiness"] = SystemReadiness.READY
+        orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(PaperTradingEngine, "__init__", ready_init)
 
 
 def create_mock_candidate(
@@ -2000,12 +2020,12 @@ def test_duckdb_recovery_restores_exact_exit_reason_not_target1(tmp_path):
 
 
 def test_paper_trading_system_readiness_gate():
-    """Verify that PaperTradingEngine rejects candidates when system_readiness is NOT_READY."""
+    """Verify that PaperTradingEngine defaults to NOT_READY and strictly gates entries until READY."""
     engine = PaperTradingEngine(default_lots=1)
     entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
 
-    # Default readiness is READY
-    assert engine.system_readiness == SystemReadiness.READY
+    # 1. Fail-closed: Default readiness MUST be NOT_READY upon initialization
+    assert engine.system_readiness == SystemReadiness.NOT_READY
 
     cand = create_mock_candidate(
         timestamp=entry_ts,
@@ -2015,22 +2035,24 @@ def test_paper_trading_system_readiness_gate():
         ask=100.0,
     )
 
-    # 1. Reject entry when NOT_READY
-    engine.set_system_readiness(SystemReadiness.NOT_READY)
-    pos_rejected = engine.process_technical_candidate(cand, current_time=entry_ts)
-    assert pos_rejected is None
+    # 2. Reject entry when in initial NOT_READY state
+    pos_rejected_initial = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos_rejected_initial is None
     assert len(engine.get_open_positions()) == 0
 
-    # 2. String conversion support
+    # 3. String conversion support
     engine.set_system_readiness("not_ready")
     assert engine.system_readiness == SystemReadiness.NOT_READY
     assert engine.process_technical_candidate(cand, current_time=entry_ts) is None
 
-    # 3. Allow entry when DEGRADED
+    # 4. Strictly reject entry when DEGRADED (1m indicators unwarmed)
     engine.set_system_readiness(SystemReadiness.DEGRADED)
     assert engine.system_readiness == SystemReadiness.DEGRADED
+    pos_rejected_degraded = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos_rejected_degraded is None
+    assert len(engine.get_open_positions()) == 0
 
-    # 4. Allow entry when READY
+    # 5. Allow entry strictly when READY
     engine.set_system_readiness(SystemReadiness.READY)
     pos_accepted = engine.process_technical_candidate(cand, current_time=entry_ts)
     assert pos_accepted is not None

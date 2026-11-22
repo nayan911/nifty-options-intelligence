@@ -75,3 +75,28 @@ def test_muhurat_trading_session(calendar):
 
     assert calendar.get_session_state(dt_before) == SessionState.CLOSED
     assert calendar.is_market_open(dt_before) is False
+
+
+def test_get_prior_trading_date(calendar):
+    """Verify get_prior_trading_date skips weekends and declared exchange holidays."""
+    # Monday Nov 23, 2026:
+    # 1 trading day prior must be Friday Nov 20, 2026 (skipping Sat 21 and Sun 22)
+    monday = date(2026, 11, 23)
+    fri_20 = calendar.get_prior_trading_date(monday, trading_days_back=1)
+    assert fri_20 == date(2026, 11, 20)
+
+    # 3 trading days prior: Wed Nov 18, 2026
+    wed_18 = calendar.get_prior_trading_date(monday, trading_days_back=3)
+    assert wed_18 == date(2026, 11, 18)
+
+    # Tuesday Nov 24, 2026: 1 trading day prior is Monday Nov 23
+    tue = date(2026, 11, 24)
+    mon_23 = calendar.get_prior_trading_date(tue, trading_days_back=1)
+    assert mon_23 == date(2026, 11, 23)
+
+    # Tuesday Jan 27, 2026: Monday Jan 26 is Republic Day holiday
+    # Prior trading day must skip Jan 26, Jan 25 (Sun), Jan 24 (Sat) -> Friday Jan 23, 2026
+    tue_jan27 = date(2026, 1, 27)
+    fri_jan23 = calendar.get_prior_trading_date(tue_jan27, trading_days_back=1)
+    assert fri_jan23 == date(2026, 1, 23)
+

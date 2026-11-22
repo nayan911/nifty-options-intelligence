@@ -597,12 +597,13 @@ def test_late_startup_at_10am_session_catchup_reconstructs_vwap_and_opening_rang
 
 
 def test_sync_pre_market_data_includes_1m(store):
-    """Verify sync_pre_market_data includes 1m bars alongside Daily, 15m, and 5m."""
+    """Verify sync_pre_market_data includes 1m bars with trading day lookback covering Friday on Mondays."""
     mock_rest = MagicMock()
     mock_rest.get_historical_candles_sync.return_value = []
     manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
 
     sym = "NSE:NIFTY50-INDEX"
+    # Target date is Monday Nov 23, 2026
     res = manager.sync_pre_market_data([sym], as_of_date=date(2026, 11, 23))
 
     assert sym in res
@@ -610,6 +611,14 @@ def test_sync_pre_market_data_includes_1m(store):
     assert "15m" in res[sym]
     assert "5m" in res[sym]
     assert "1m" in res[sym]
+
+    # Verify that the 1m call to get_historical_candles_sync had date_from='2026-11-18' (Wednesday),
+    # completely capturing Friday Nov 20 and skipping weekend Nov 21-22
+    calls = mock_rest.get_historical_candles_sync.call_args_list
+    call_1m = next((c for c in calls if c.kwargs.get("resolution") == "1"), None)
+    assert call_1m is not None
+    assert call_1m.kwargs["date_from"] == "2026-11-18"
+    assert call_1m.kwargs["date_to"] == "2026-11-23"
 
 
 def test_assess_readiness_states():

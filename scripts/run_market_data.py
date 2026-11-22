@@ -267,18 +267,63 @@ class MarketDataEngine:
         except Exception as e:
             print(f"[WARN] Technical analysis error for {candle.symbol}: {e}")
 
-        # Check for system readiness upgrade if running in DEGRADED mode
-        if hasattr(self, "paper_engine") and self.paper_engine.system_readiness == SystemReadiness.DEGRADED:
-            core_tracked = [settings.PRIMARY_INDEX, self.technical_engine.primary_futures]
-            readiness, _ = self.historical_manager.assess_readiness(self.technical_engine, core_tracked)
-            if readiness == SystemReadiness.READY:
-                self.paper_engine.set_system_readiness(SystemReadiness.READY)
+        # Continuous two-way operational readiness assessment
+        self.evaluate_and_update_readiness()
+
+    def evaluate_and_update_readiness(self) -> SystemReadiness:
+        """Continuously re-evaluates operational readiness across data feed, indicators, and market state,
+
+        handling both automatic upgrades (NOT_READY -> DEGRADED -> READY) and safety downgrades.
+        """
+        if not hasattr(self, "paper_engine"):
+            return SystemReadiness.NOT_READY
+
+        prev_readiness = self.paper_engine.system_readiness
+        curr_state = self.calendar.get_session_state(is_derivative=True)
+        is_live = curr_state in (SessionState.REGULAR_CASH, SessionState.DERIVATIVES_EXT, SessionState.SPECIAL_SESSION)
+
+        # 1. Technical indicator and reference level assessment
+        core_tracked = [settings.PRIMARY_INDEX, self.technical_engine.primary_futures]
+        assessed_readiness, details = self.historical_manager.assess_readiness(self.technical_engine, core_tracked)
+        effective_readiness = assessed_readiness
+
+        # 2. Live feed health & connection gating during active market hours
+        if is_live:
+            if not getattr(self.ws_client, "is_connected", False):
+                effective_readiness = SystemReadiness.NOT_READY
+                logger.warning("Readiness override: WebSocket disconnected during live market -> NOT_READY")
+            elif self.last_primary_tick_time is not None:
+                feed_age = (now_ist() - self.last_primary_tick_time).total_seconds()
+                if feed_age > 120.0:
+                    effective_readiness = SystemReadiness.NOT_READY
+                    logger.warning("Readiness override: Primary feed age %.1fs > 120s -> NOT_READY", feed_age)
+                elif feed_age > 60.0:
+                    if effective_readiness == SystemReadiness.READY:
+                        effective_readiness = SystemReadiness.DEGRADED
+                        logger.warning("Readiness override: Primary feed age %.1fs > 60s -> DEGRADED", feed_age)
+
+        # 3. Two-way state transitions (Upgrade or Downgrade)
+        if effective_readiness != prev_readiness:
+            self.paper_engine.set_system_readiness(effective_readiness)
+            if effective_readiness == SystemReadiness.READY:
                 print(
                     f"\n{'*'*78}\n"
-                    f"  [SYSTEM READINESS UPGRADE] 1-minute indicators fully warmed up (>= 21 bars).\n"
-                    f"  System readiness transitioned: DEGRADED -> READY. Paper trading entries enabled.\n"
+                    f"  [SYSTEM READINESS UPGRADE: READY]\n"
+                    f"  All indicators verified (1m, 5m, daily levels) and data feed fresh.\n"
+                    f"  Paper trading entries ENABLED.\n"
                     f"{'*'*78}\n"
                 )
+            else:
+                action = "DOWNGRADED" if prev_readiness == SystemReadiness.READY else "TRANSITIONED"
+                print(
+                    f"\n{'!'*78}\n"
+                    f"  [SYSTEM READINESS {action}: {effective_readiness.value}]\n"
+                    f"  State: {prev_readiness.value} -> {effective_readiness.value} (feed freshness or indicator state).\n"
+                    f"  Paper trading entries DISABLED.\n"
+                    f"{'!'*78}\n"
+                )
+
+        return effective_readiness
 
     def _log_technical_status(self, snap: TechnicalSnapshot) -> None:
         """Outputs concise quantitative technical telemetry for primary tracked assets."""
@@ -649,6 +694,8 @@ class MarketDataEngine:
             )
         except Exception as e:
             print(f"[WARN] Pre-market warmup encountered exception: {e}")
+            if hasattr(self, "paper_engine"):
+                self.paper_engine.set_system_readiness(SystemReadiness.NOT_READY)
 
         watchlist = self._build_watchlist()
         print(f"\nSubscribing to dynamic watchlist ({len(watchlist)} symbols within 100 quota):")
@@ -724,16 +771,19 @@ class MarketDataEngine:
                         f"Statutory Costs: ₹{summary['total_costs_paid']:.2f}"
                     )
 
+                # 6. Continuous Operational Readiness Evaluation
+                readiness = self.evaluate_and_update_readiness()
+
                 if not is_open:
                     print(
-                        f"[HOLIDAY / OFFLINE STATUS] Session: {curr_state.value.upper()} | "
+                        f"[HOLIDAY / OFFLINE STATUS] Session: {curr_state.value.upper()} | Readiness: {readiness.value} | "
                         f"WS: {ws_status} | Subscribed: {sub_count} | Broker Acks: {self.ws_client.subscription_acks} | "
                         f"Quotes Seen: {quote_count}/{sub_count} | Snapshots: {self.snapshots_accepted} | "
                         f"Duplicates: {self.duplicates_dropped} | Trading Signals: DISABLED{pcr_str}"
                     )
                 else:
                     print(
-                        f"[LIVE STATUS] Session: {curr_state.value.upper()} | "
+                        f"[LIVE STATUS] Session: {curr_state.value.upper()} | Readiness: {readiness.value} | "
                         f"WS: {ws_status} | Live Ticks: {self.live_ticks_accepted} | Candles: {self.candle_count} | "
                         f"NIFTY Feed Age: {feed_age_str} | Network Latency: {net_lat_str} | Quotes Seen: {quote_count}/{sub_count}{pcr_str}"
                     )

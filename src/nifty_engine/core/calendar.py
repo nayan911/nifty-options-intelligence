@@ -74,6 +74,23 @@ class ExchangeCalendar:
             return True
         return not self.is_holiday(target_date)
 
+    def get_prior_trading_date(self, target_date: date, trading_days_back: int = 1) -> date:
+        """Steps backwards from target_date to return the date of the Nth prior completed trading day.
+
+        Skips weekends and exchange holidays.
+        """
+        if trading_days_back <= 0:
+            return target_date
+        cur = target_date - timedelta(days=1)
+        found = 0
+        while found < trading_days_back:
+            if self.is_trading_day(cur):
+                found += 1
+                if found == trading_days_back:
+                    return cur
+            cur -= timedelta(days=1)
+        return cur
+
     def get_session_state(
         self,
         dt: Optional[datetime] = None,

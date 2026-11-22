@@ -52,10 +52,14 @@ class HistoricalCandleManager:
         timeframe: str,
         days_back: int = 5,
         end_date: Optional[date] = None,
+        trading_days_back: Optional[int] = None,
     ) -> int:
         """Incrementally syncs completed candles from FYERS to DuckDB."""
         to_d = end_date or now_ist().date()
-        from_d = to_d - timedelta(days=days_back)
+        if trading_days_back is not None:
+            from_d = self.calendar.get_prior_trading_date(to_d, trading_days_back=trading_days_back)
+        else:
+            from_d = to_d - timedelta(days=days_back)
 
         resolution = self.TIMEFRAME_TO_RESOLUTION.get(timeframe, timeframe)
 
@@ -133,14 +137,14 @@ class HistoricalCandleManager:
 
         for sym in symbols:
             results[sym] = {}
-            # 1. Daily candles (last 30 calendar days)
-            results[sym]["D"] = self.sync_candles(sym, "D", days_back=30, end_date=target_date)
-            # 2. 15m candles (last 10 calendar days)
-            results[sym]["15m"] = self.sync_candles(sym, "15m", days_back=10, end_date=target_date)
-            # 3. 5m candles (last 5 calendar days)
-            results[sym]["5m"] = self.sync_candles(sym, "5m", days_back=5, end_date=target_date)
-            # 4. 1m candles (last 2 calendar days for fine-grained execution warmup & catch-up)
-            results[sym]["1m"] = self.sync_candles(sym, "1m", days_back=2, end_date=target_date)
+            # 1. Daily candles (last 20 completed trading sessions ~ 30 calendar days)
+            results[sym]["D"] = self.sync_candles(sym, "D", trading_days_back=20, end_date=target_date)
+            # 2. 15m candles (last 7 completed trading sessions ~ 10 calendar days)
+            results[sym]["15m"] = self.sync_candles(sym, "15m", trading_days_back=7, end_date=target_date)
+            # 3. 5m candles (last 4 completed trading sessions ~ 5 calendar days)
+            results[sym]["5m"] = self.sync_candles(sym, "5m", trading_days_back=4, end_date=target_date)
+            # 4. 1m candles (last 3 completed trading sessions to ensure prior full sessions are captured even on Mondays)
+            results[sym]["1m"] = self.sync_candles(sym, "1m", trading_days_back=3, end_date=target_date)
 
         return results
 
@@ -241,10 +245,14 @@ class HistoricalCandleManager:
             snap_1m = state.latest_snapshots.get("1m") if state else None
             is_1m = snap_1m.is_warmed_up if snap_1m else False
 
+            snap_15m = state.latest_snapshots.get("15m") if state else None
+            has_15m = bool(snap_15m and snap_15m.trend_bias is not None)
+
             details[sym] = {
                 "has_daily_levels": has_daily,
                 "is_5m_warmed": is_5m,
                 "is_1m_warmed": is_1m,
+                "has_15m_context": has_15m,
             }
 
             if not has_daily:
