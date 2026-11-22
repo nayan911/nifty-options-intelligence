@@ -260,4 +260,35 @@ class HistoricalCandleManager:
             warmup_summary[sym]["daily_levels"] = levels
             warmup_summary[sym]["is_5m_warmed_up"] = is_warmed
 
+        # Stage 4: Current-Session Catch-Up Replay (Late Startup Recovery)
+        # If target_date has already commenced (past date or wall clock > 09:15 IST),
+        # replay all completed candles of the current session up to the cutoff without generating trades.
+        now = now_ist()
+        if target_date < now.date() or (target_date == now.date() and now.time() > time(9, 15)):
+            session_start = IST.localize(datetime.combine(target_date, time(9, 15)))
+            session_end = now if target_date == now.date() else IST.localize(datetime.combine(target_date, time(15, 30)))
+
+            for sym in symbols:
+                # Query completed intraday candles on target_date from 09:15 onwards
+                session_15m = self.store.get_candles(sym, "15m", start_time=session_start, end_time=session_end)
+                session_5m = self.store.get_candles(sym, "5m", start_time=session_start, end_time=session_end)
+                session_1m = self.store.get_candles(sym, "1m", start_time=session_start, end_time=session_end)
+
+                session_candles = [c for c in (session_15m + session_5m + session_1m) if c.is_closed]
+                if session_candles:
+                    catchup_count = engine.bootstrap_candles(session_candles)
+                    warmup_summary[sym]["session_catchup_candles"] = catchup_count
+                    logger.info(
+                        "Replayed %d session catch-up candles for %s on %s",
+                        catchup_count,
+                        sym,
+                        target_date,
+                    )
+
+                # Re-verify warmup state after session catch-up
+                state = engine.states.get(sym)
+                snap_5m = state.latest_snapshots.get("5m") if state else None
+                if snap_5m:
+                    warmup_summary[sym]["is_5m_warmed_up"] = snap_5m.is_warmed_up
+
         return warmup_summary

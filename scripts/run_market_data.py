@@ -609,8 +609,10 @@ class MarketDataEngine:
             for sym, info in warmup_res.items():
                 levels = info.get("daily_levels")
                 lvl_str = f"PDH: {levels['PDH']}, PDL: {levels['PDL']}, PDC: {levels['PDC']}" if levels else "None"
+                catchup_bars = info.get("session_catchup_candles", 0)
                 print(
-                    f"  - {sym}: Seeded {lvl_str} | Bootstrapped {info.get('bootstrapped_candles', 0)} bars | "
+                    f"  - {sym}: Seeded {lvl_str} | History: {info.get('bootstrapped_candles', 0)} bars | "
+                    f"Catch-up: {catchup_bars} bars | "
                     f"5m Status: {'READY' if info.get('is_5m_warmed_up') else 'WARMING_UP'}"
                 )
         except Exception as e:

@@ -506,3 +506,91 @@ def test_late_startup_recovers_missing_915_opening_candle_even_when_later_bars_e
     mock_rest.get_historical_candles_sync.assert_called_once()
     assert levels is not None
     assert levels["CDO"] == 25115.0
+
+
+def test_late_startup_at_10am_session_catchup_reconstructs_vwap_and_opening_range(store, monkeypatch):
+    """Regression Test: Late startup at 10:00 AM replays all completed session bars from 09:15 to 10:00 AM.
+
+    Reconstructs VWAP, Opening Range (ORH/ORL), and intraday indicators with ZERO trade signals.
+    """
+    sym = "NSE:NIFTY26NOVFUT"
+
+    # 1. Seed Friday Nov 20 daily candle & history
+    store.insert_candle(make_candle(sym, "D", IST.localize(datetime(2026, 11, 20, 15, 30)), 25000.0, 25200.0, 24950.0, 25100.0))
+    t_fri = IST.localize(datetime(2026, 11, 20, 9, 15))
+    fri_bars = [make_candle(sym, "5m", t_fri + timedelta(minutes=5 * i), 25000.0 + i, 25010.0 + i, 24995.0 + i, 25005.0 + i) for i in range(30)]
+    store.insert_candles_batch(fri_bars)
+
+    # 2. Seed Monday Nov 23 completed morning candles (09:15 to 09:55 AM = 9 candles)
+    t_mon_start = IST.localize(datetime(2026, 11, 23, 9, 15))
+    mon_bars = []
+    for i in range(9):
+        t = t_mon_start + timedelta(minutes=5 * i)
+        # 09:15 open = 25115.0. 09:20 high = 25160.0. 09:25 low = 25100.0
+        mon_bars.append(make_candle(sym, "5m", t, 25115.0 + 5 * i, 25130.0 + 5 * i, 25100.0 + 5 * i, 25120.0 + 5 * i, v=5000))
+    store.insert_candles_batch(mon_bars)
+
+    # Mock wall-clock time to 10:00 AM
+    mock_10am = IST.localize(datetime(2026, 11, 23, 10, 0))
+    monkeypatch.setattr("nifty_engine.data.historical_manager.now_ist", lambda: mock_10am)
+
+    mock_setup_cb = MagicMock()
+    mock_candidate_cb = MagicMock()
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures=sym,
+        on_setup_candidate=mock_setup_cb,
+        on_technical_candidate=mock_candidate_cb,
+    )
+
+    mock_rest = MagicMock()
+    manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
+
+    # Run pre-market & session catchup warmup at 10:00 AM
+    summary = manager.warm_up_technical_engine(
+        engine=engine,
+        symbols=[sym],
+        as_of_date=date(2026, 11, 23),
+        candle_limit_5m=30,
+        candle_limit_15m=0,
+    )
+
+    # 3. Verify session catch-up replayed all 9 candles
+    assert summary[sym]["session_catchup_candles"] == 9
+    assert summary[sym]["is_5m_warmed_up"] is True
+
+    # 4. CRITICAL SAFETY GUARD: Zero mock trade signals were generated during catch-up replay
+    mock_setup_cb.assert_not_called()
+    mock_candidate_cb.assert_not_called()
+
+    # 5. Check reconstructed technical snapshot at 09:55 AM
+    state = engine.states[sym]
+    snap_5m = state.latest_snapshots.get("5m")
+    assert snap_5m is not None
+    assert snap_5m.is_warmed_up is True
+
+    # VWAP must be successfully reconstructed and accumulating today's intraday volume!
+    assert snap_5m.vwap is not None
+    assert 25100.0 <= snap_5m.vwap <= 25200.0
+
+    # Opening Range High and Low must be established from 09:15-09:30 candles!
+    orh_zone = next((z for z in snap_5m.sr_zones if z.level_type == LevelType.ORH), None)
+    orl_zone = next((z for z in snap_5m.sr_zones if z.level_type == LevelType.ORL), None)
+    assert orh_zone is not None
+    assert orl_zone is not None
+
+    # CDO must be the 09:15 open (25115.0)
+    assert state.daily_reference_levels["CDO"] == 25115.0
+    cdo_zone = next((z for z in snap_5m.sr_zones if z.level_type == LevelType.CDO), None)
+    assert cdo_zone is not None
+    assert cdo_zone.nominal_price == 25115.0
+
+    # 6. First LIVE candle arrives from WebSocket at 10:00 AM
+    c_live_1000 = make_candle(sym, "5m", IST.localize(datetime(2026, 11, 23, 10, 0)), 25160.0, 25175.0, 25155.0, 25170.0, v=6000)
+    snap_live = engine.on_candle(c_live_1000)
+    assert snap_live is not None
+
+    # Live candle benefits from full morning VWAP & Opening Range context!
+    assert snap_live.vwap is not None
+    assert any(z.level_type == LevelType.ORH for z in snap_live.sr_zones)
+    assert any(z.level_type == LevelType.CDO for z in snap_live.sr_zones)
