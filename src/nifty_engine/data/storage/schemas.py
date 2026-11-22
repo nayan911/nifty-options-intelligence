@@ -78,7 +78,59 @@ CREATE TABLE IF NOT EXISTS option_chain_strikes (
     FOREIGN KEY (snapshot_id) REFERENCES option_chain_snapshots(snapshot_id)
 );
 
+-- Paper Trading Orders
+CREATE TABLE IF NOT EXISTS paper_orders (
+    order_id VARCHAR PRIMARY KEY,
+    position_id VARCHAR,
+    signal_id VARCHAR,
+    symbol VARCHAR NOT NULL,
+    side VARCHAR NOT NULL,
+    order_type VARCHAR NOT NULL,
+    status VARCHAR NOT NULL,
+    quantity INTEGER NOT NULL,
+    requested_price DOUBLE,
+    filled_price DOUBLE,
+    slippage DOUBLE DEFAULT 0.0,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    filled_at TIMESTAMP WITH TIME ZONE,
+    rejection_reason VARCHAR
+);
+
+-- Paper Trading Positions & Trade Journal
+CREATE TABLE IF NOT EXISTS paper_positions (
+    position_id VARCHAR PRIMARY KEY,
+    signal_id VARCHAR,
+    symbol VARCHAR NOT NULL,
+    underlying VARCHAR NOT NULL,
+    option_type VARCHAR NOT NULL,
+    strike DOUBLE NOT NULL,
+    expiry DATE NOT NULL,
+    lot_size INTEGER NOT NULL,
+    initial_quantity INTEGER NOT NULL,
+    remaining_quantity INTEGER NOT NULL,
+    entry_price DOUBLE NOT NULL,
+    exit_price DOUBLE,
+    target_premium_t1 DOUBLE,
+    target_premium_t2 DOUBLE,
+    stop_loss_premium DOUBLE,
+    spot_entry DOUBLE,
+    spot_target_t1 DOUBLE,
+    spot_target_t2 DOUBLE,
+    spot_sl DOUBLE,
+    entry_time TIMESTAMP WITH TIME ZONE NOT NULL,
+    exit_time TIMESTAMP WITH TIME ZONE,
+    status VARCHAR NOT NULL,
+    exit_reason VARCHAR,
+    gross_pnl DOUBLE DEFAULT 0.0,
+    net_pnl DOUBLE DEFAULT 0.0,
+    total_costs DOUBLE DEFAULT 0.0,
+    realized_rr DOUBLE,
+    notes VARCHAR
+);
+
 -- Indexing for fast time-series queries
 CREATE INDEX IF NOT EXISTS idx_candles_lookup ON candles(symbol, timeframe, timestamp);
 CREATE INDEX IF NOT EXISTS idx_ticks_lookup ON ticks(symbol, local_timestamp);
+CREATE INDEX IF NOT EXISTS idx_paper_orders_pos ON paper_orders(position_id);
+CREATE INDEX IF NOT EXISTS idx_paper_positions_status ON paper_positions(status, entry_time);
 """

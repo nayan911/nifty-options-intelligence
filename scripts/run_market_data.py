@@ -9,7 +9,7 @@ import asyncio
 import sys
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import pytz
 
@@ -31,6 +31,7 @@ from nifty_engine.data.fyers.rest_client import FyersRestClient
 from nifty_engine.data.fyers.websocket_client import FyersWebSocketClient
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.data.tick_normalizer import TickNormalizer, TickStatus
+from nifty_engine.paper_trading.engine import PaperTradingEngine
 from nifty_engine.utils.timezone import now_ist
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -57,6 +58,11 @@ class MarketDataEngine:
             on_setup_candidate=self._on_setup_candidate,
             on_technical_candidate=self._on_technical_candidate,
             derivatives_engine=self.derivatives_engine,
+        )
+        self.paper_engine = PaperTradingEngine(
+            store=self.store,
+            instrument_master=self.master,
+            on_trade_event=self._on_paper_trade_event,
         )
         self.ws_client = FyersWebSocketClient(
             auth_provider=self.auth,
@@ -96,6 +102,30 @@ class MarketDataEngine:
     def _on_ws_ack(self, ack_msg: dict):
         """Callback on WebSocket subscription and status acknowledgements."""
         print(f"[WS ACK] {ack_msg.get('type')}: {ack_msg.get('message', 'OK')}")
+
+    def _on_paper_trade_event(self, ev: Dict[str, Any]) -> None:
+        """Callback on simulated paper execution fills and position closures."""
+        if ev.get("event") == "ORDER_FILLED":
+            print(
+                f"\n{'#'*78}\n"
+                f"  [PAPER EXECUTION: BUY ORDER FILLED]\n"
+                f"  Position ID: {ev.get('position_id')}\n"
+                f"  Contract: {ev.get('symbol')} | Quantity: {ev.get('quantity')} | Fill Price: ₹{ev.get('price', 0.0):.2f}\n"
+                f"  Statutory Friction: ₹{ev.get('costs', 0.0):.2f} (Brokerage, STT, Exchange, GST)\n"
+                f"{'#'*78}\n"
+            )
+        elif ev.get("event") == "POSITION_CLOSED":
+            gross = ev.get("gross_pnl", 0.0)
+            net = ev.get("net_pnl", 0.0)
+            status_tag = "WIN" if net > 0 else "LOSS"
+            print(
+                f"\n{'#'*78}\n"
+                f"  [PAPER EXECUTION: POSITION CLOSED ({status_tag})]\n"
+                f"  Position ID: {ev.get('position_id')} | Reason: {ev.get('reason')}\n"
+                f"  Exit Price: ₹{ev.get('exit_price', 0.0):.2f} | Gross P&L: ₹{gross:+.2f} | Net P&L: ₹{net:+.2f}\n"
+                f"  Total Statutory Taxes & Brokerage: ₹{ev.get('total_costs', 0.0):.2f}\n"
+                f"{'#'*78}\n"
+            )
 
     def _on_tick_received(self, raw_tick: Tick, current_time: Optional[datetime] = None):
         """Processes raw tick through normalizer, sanitizes volume, persists, and builds bars."""
@@ -144,6 +174,10 @@ class MarketDataEngine:
             self.last_primary_tick_time = now_ist()
             if tick.exchange_timestamp:
                 self.last_primary_network_latency = (tick.local_timestamp - tick.exchange_timestamp).total_seconds()
+
+        # Forward tick to PaperTradingEngine for live M2M position tracking and automated exits
+        if hasattr(self, "paper_engine"):
+            self.paper_engine.on_tick(tick)
 
         # 3. Only pass verified live trading ticks to CandleBuilder
         if res.status == TickStatus.VALID_LIVE:
@@ -258,6 +292,18 @@ class MarketDataEngine:
             f"T1: {candidate.target_1:.2f} ({t1_rr_str}) | T2: {candidate.target_2:.2f} ({t2_rr_str}) | R:R: 1:{candidate.risk_reward_ratio}\n"
             f"{'*'*78}\n"
         )
+
+        # Forward confirmed technical candidate to paper trading execution engine
+        if hasattr(self, "paper_engine"):
+            paper_pos = self.paper_engine.process_technical_candidate(candidate)
+            if paper_pos:
+                if paper_pos.symbol not in self.subscribed_option_symbols:
+                    try:
+                        self.ws_client.subscribe([paper_pos.symbol])
+                        self.subscribed_option_symbols.add(paper_pos.symbol)
+                        print(f"  [PAPER ENGINE] Subscribed to live WebSocket feed for {paper_pos.symbol}")
+                    except Exception as e:
+                        print(f"  [PAPER ENGINE] Failed to subscribe to {paper_pos.symbol}: {e}")
 
     def _get_initial_spot(self) -> float:
         """Determines reference NIFTY spot price from fresh DB records, live REST quotes, or master."""
@@ -503,6 +549,7 @@ class MarketDataEngine:
                 current_ist = now_ist()
                 self.builder.flush_closed_bars(current_ist)
                 self.technical_engine.expire_pending_evaluations(current_ist)
+                self.paper_engine.check_time_events(current_ist)
 
                 # Periodic 10-second maintenance operations
                 if loop_ticks % 10 != 0:
@@ -534,6 +581,22 @@ class MarketDataEngine:
                 net_lat_str = f"{net_latency:.3f}s" if net_latency is not None else "N/A"
 
                 pcr_str = f" | PCR: {self.latest_option_chain_pcr:.3f}" if self.latest_option_chain_pcr is not None else ""
+
+                # Paper Trading active telemetry
+                open_pos = self.paper_engine.get_open_positions()
+                if open_pos:
+                    for p in open_pos:
+                        print(
+                            f"  [ACTIVE PAPER POSITION: {p.symbol}] Entry: ₹{p.entry_price:.2f} | LTP: ₹{p.current_ltp:.2f} | "
+                            f"Target: ₹{p.target_premium_t1:.2f} | SL: ₹{p.stop_loss_premium:.2f} | M2M Gross: ₹{p.gross_pnl:+.2f} | Net: ₹{p.net_pnl:+.2f}"
+                        )
+                summary = self.paper_engine.get_account_summary()
+                if summary["total_trades"] > 0:
+                    print(
+                        f"  [PAPER JOURNAL] Closed: {summary['total_trades']} (Win: {summary['win_rate_pct']}%) | "
+                        f"Realized Gross: ₹{summary['total_realized_gross_pnl']:+.2f} | Realized Net: ₹{summary['total_realized_net_pnl']:+.2f} | "
+                        f"Statutory Costs: ₹{summary['total_costs_paid']:.2f}"
+                    )
 
                 if not is_open:
                     print(

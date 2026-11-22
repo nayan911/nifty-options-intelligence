@@ -377,6 +377,27 @@ class PremiumCostModel:
             lot_size=lot,
         )
 
+    def compute_fill_costs(self, side: str, price: float, quantity: int) -> Dict[str, float]:
+        """Calculates exact statutory charges and broker fees for an individual execution leg."""
+        turnover = price * quantity
+        brokerage = self.flat_brokerage_per_order  # ₹20 per executed order
+        stt = round(self.stt_sell_rate * turnover, 2) if side.upper() == "SELL" else 0.0
+        stamp_duty = round(self.stamp_duty_buy_rate * turnover, 2) if side.upper() == "BUY" else 0.0
+        exchange_fee = round(self.exchange_fee_rate * turnover, 2)
+        sebi_charges = round(self.sebi_rate * turnover, 2)
+        gst = round(self.gst_rate * (brokerage + exchange_fee + sebi_charges), 2)
+        total = round(brokerage + stt + stamp_duty + exchange_fee + sebi_charges + gst, 2)
+        return {
+            "brokerage": brokerage,
+            "stt": stt,
+            "stamp_duty": stamp_duty,
+            "exchange_fee": exchange_fee,
+            "sebi_charges": sebi_charges,
+            "gst": gst,
+            "total_costs": total,
+            "turnover": round(turnover, 2),
+        }
+
     def calculate_required_spot_move_for_premium_target(
         self,
         greeks: OptionGreeks,

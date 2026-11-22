@@ -5,7 +5,7 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import duckdb
 import pandas as pd
@@ -409,6 +409,115 @@ class DuckDBStore(IStorageEngine):
             except Exception:
                 cur.execute("ROLLBACK")
                 raise
+
+    def save_paper_order(self, order: Dict[str, Any]) -> None:
+        """Inserts or updates a paper trading order."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO paper_orders (
+                    order_id, position_id, signal_id, symbol, side, order_type,
+                    status, quantity, requested_price, filled_price, slippage,
+                    created_at, filled_at, rejection_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    order.get("order_id"),
+                    order.get("position_id"),
+                    order.get("signal_id"),
+                    order.get("symbol"),
+                    order.get("side"),
+                    order.get("order_type"),
+                    order.get("status"),
+                    order.get("quantity"),
+                    order.get("requested_price"),
+                    order.get("filled_price"),
+                    order.get("slippage", 0.0),
+                    order.get("created_at"),
+                    order.get("filled_at"),
+                    order.get("rejection_reason"),
+                ],
+            )
+
+    def save_paper_position(self, pos: Dict[str, Any]) -> None:
+        """Inserts or updates a paper trading position record in the trade journal."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO paper_positions (
+                    position_id, signal_id, symbol, underlying, option_type,
+                    strike, expiry, lot_size, initial_quantity, remaining_quantity,
+                    entry_price, exit_price, target_premium_t1, target_premium_t2,
+                    stop_loss_premium, spot_entry, spot_target_t1, spot_target_t2,
+                    spot_sl, entry_time, exit_time, status, exit_reason,
+                    gross_pnl, net_pnl, total_costs, realized_rr, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    pos.get("position_id"),
+                    pos.get("signal_id"),
+                    pos.get("symbol"),
+                    pos.get("underlying"),
+                    pos.get("option_type"),
+                    pos.get("strike"),
+                    pos.get("expiry"),
+                    pos.get("lot_size"),
+                    pos.get("initial_quantity"),
+                    pos.get("remaining_quantity"),
+                    pos.get("entry_price"),
+                    pos.get("exit_price"),
+                    pos.get("target_premium_t1"),
+                    pos.get("target_premium_t2"),
+                    pos.get("stop_loss_premium"),
+                    pos.get("spot_entry"),
+                    pos.get("spot_target_t1"),
+                    pos.get("spot_target_t2"),
+                    pos.get("spot_sl"),
+                    pos.get("entry_time"),
+                    pos.get("exit_time"),
+                    pos.get("status"),
+                    pos.get("exit_reason"),
+                    pos.get("gross_pnl", 0.0),
+                    pos.get("net_pnl", 0.0),
+                    pos.get("total_costs", 0.0),
+                    pos.get("realized_rr"),
+                    pos.get("notes"),
+                ],
+            )
+
+    def get_paper_positions(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Queries paper positions from DuckDB, optionally filtered by status."""
+        with self._lock:
+            cur = self._conn.cursor()
+            if status:
+                res = cur.execute(
+                    "SELECT * FROM paper_positions WHERE status = ? ORDER BY entry_time DESC",
+                    [status],
+                ).fetchall()
+            else:
+                res = cur.execute(
+                    "SELECT * FROM paper_positions ORDER BY entry_time DESC"
+                ).fetchall()
+            cols = [desc[0] for desc in cur.description]
+            return [dict(zip(cols, row)) for row in res]
+
+    def get_paper_orders(self, position_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Queries paper orders, optionally filtered by position_id."""
+        with self._lock:
+            cur = self._conn.cursor()
+            if position_id:
+                res = cur.execute(
+                    "SELECT * FROM paper_orders WHERE position_id = ? ORDER BY created_at ASC",
+                    [position_id],
+                ).fetchall()
+            else:
+                res = cur.execute(
+                    "SELECT * FROM paper_orders ORDER BY created_at ASC"
+                ).fetchall()
+            cols = [desc[0] for desc in cur.description]
+            return [dict(zip(cols, row)) for row in res]
 
     def close(self) -> None:
         """Flush any pending buffered ticks and close connection."""
