@@ -98,6 +98,16 @@ class DuckDBStore(IStorageEngine):
             except Exception:
                 pass
 
+            # Idempotently migrate columns for paper_positions if table exists from prior runs
+            for col, dtype in [
+                ("initial_stop_loss_premium", "DOUBLE"),
+                ("last_quote_time", "TIMESTAMP WITH TIME ZONE"),
+            ]:
+                try:
+                    cur.execute(f"ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS {col} {dtype}")
+                except Exception:
+                    pass
+
     def insert_tick(self, tick: Tick) -> None:
         """Buffer a single tick for high-throughput single-writer batch insert."""
         with self._lock:
@@ -450,10 +460,11 @@ class DuckDBStore(IStorageEngine):
                     position_id, signal_id, symbol, underlying, option_type,
                     strike, expiry, lot_size, initial_quantity, remaining_quantity,
                     entry_price, exit_price, target_premium_t1, target_premium_t2,
-                    stop_loss_premium, spot_entry, spot_target_t1, spot_target_t2,
-                    spot_sl, entry_time, exit_time, status, exit_reason,
+                    stop_loss_premium, initial_stop_loss_premium, spot_entry,
+                    spot_target_t1, spot_target_t2, spot_sl, entry_time,
+                    exit_time, last_quote_time, status, exit_reason,
                     gross_pnl, net_pnl, total_costs, realized_rr, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     pos.get("position_id"),
@@ -471,12 +482,14 @@ class DuckDBStore(IStorageEngine):
                     pos.get("target_premium_t1"),
                     pos.get("target_premium_t2"),
                     pos.get("stop_loss_premium"),
+                    pos.get("initial_stop_loss_premium", pos.get("stop_loss_premium")),
                     pos.get("spot_entry"),
                     pos.get("spot_target_t1"),
                     pos.get("spot_target_t2"),
                     pos.get("spot_sl"),
                     pos.get("entry_time"),
                     pos.get("exit_time"),
+                    pos.get("last_quote_time"),
                     pos.get("status"),
                     pos.get("exit_reason"),
                     pos.get("gross_pnl", 0.0),

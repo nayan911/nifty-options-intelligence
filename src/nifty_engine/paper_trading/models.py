@@ -146,12 +146,23 @@ class PaperPosition:
     realized_rr: Optional[float] = None
     trades: List[PositionTrade] = field(default_factory=list)
     notes: Optional[str] = None
+    initial_stop_loss_premium: float = 0.0
+    last_quote_time: Optional[datetime] = None
+    is_exit_triggered: bool = False
+    pending_exit_reason: Optional[ExitReason] = None
 
     def __post_init__(self):
+        if self.initial_stop_loss_premium == 0.0 and self.stop_loss_premium > 0.0:
+            self.initial_stop_loss_premium = self.stop_loss_premium
         if self.highest_premium_seen == 0.0 and self.entry_price > 0.0:
             self.highest_premium_seen = self.entry_price
         if self.lowest_premium_seen == 0.0 and self.entry_price > 0.0:
             self.lowest_premium_seen = self.entry_price
+
+    def quote_age_seconds(self, current_time: datetime) -> float:
+        """Returns elapsed seconds since last authentic option quote update."""
+        ref_time = self.last_quote_time or self.entry_time
+        return max(0.0, (current_time - ref_time).total_seconds())
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -170,14 +181,18 @@ class PaperPosition:
             "target_premium_t1": round(self.target_premium_t1, 2),
             "target_premium_t2": round(self.target_premium_t2, 2),
             "stop_loss_premium": round(self.stop_loss_premium, 2),
+            "initial_stop_loss_premium": round(self.initial_stop_loss_premium, 2),
             "spot_entry": round(self.spot_entry, 2),
             "spot_target_t1": round(self.spot_target_t1, 2),
             "spot_target_t2": round(self.spot_target_t2, 2),
             "spot_sl": round(self.spot_sl, 2),
             "entry_time": self.entry_time.isoformat() if self.entry_time else None,
             "exit_time": self.exit_time.isoformat() if self.exit_time else None,
+            "last_quote_time": self.last_quote_time.isoformat() if self.last_quote_time else None,
             "status": self.status.value if isinstance(self.status, PositionStatus) else str(self.status),
             "exit_reason": self.exit_reason.value if isinstance(self.exit_reason, ExitReason) else (str(self.exit_reason) if self.exit_reason else None),
+            "is_exit_triggered": self.is_exit_triggered,
+            "pending_exit_reason": self.pending_exit_reason.value if isinstance(self.pending_exit_reason, ExitReason) else (str(self.pending_exit_reason) if self.pending_exit_reason else None),
             "is_t1_hit": self.is_t1_hit,
             "is_breakeven_sl_active": self.is_breakeven_sl_active,
             "current_ltp": round(self.current_ltp, 2),

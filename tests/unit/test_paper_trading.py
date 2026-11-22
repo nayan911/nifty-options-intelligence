@@ -5,7 +5,7 @@ Stop Loss, Trailing Breakeven, Spot Invalidation, EOD 15:15 IST Square-Off),
 Indian statutory costs (STT 0.15%, Brokerage, GST, Stamp Duty), and DuckDB persistence.
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytz
 
@@ -16,7 +16,7 @@ from nifty_engine.analysis.derivatives.greeks import OptionGreeks
 from nifty_engine.analysis.derivatives.oi_analysis import DirectionalBias
 from nifty_engine.analysis.technical.breakouts import BreakoutDirection
 from nifty_engine.analysis.technical.multi_timeframe import TechnicalCandidate
-from nifty_engine.core.interfaces import Tick
+from nifty_engine.core.interfaces import Candle, Tick
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.paper_trading.engine import PaperTradingEngine
 from nifty_engine.paper_trading.models import ExitReason, PositionStatus
@@ -190,7 +190,7 @@ def test_paper_entry_gating_and_realistic_fill():
     assert pos.status == PositionStatus.OPEN
     assert pos.entry_price == 100.70
     assert pos.remaining_quantity == 65
-    assert pos.total_costs > 20.0  # Entry statutory charges deducted
+    assert pos.total_costs > 20.0
     assert len(engine.get_open_positions()) == 1
 
 
@@ -209,10 +209,9 @@ def test_multi_lot_target1_partial_booking_and_target2_full_exit():
     )
     pos = engine.process_technical_candidate(cand, current_time=entry_ts)
     assert pos is not None
-    assert pos is not None
     assert pos.initial_quantity == 130
     assert pos.remaining_quantity == 130
-    assert pos.entry_price == 100.50  # 100.0 ask + 0.5 slippage
+    assert pos.entry_price == 100.50
 
     # Tick 1: Price rallies to 110.0 (Unrealized gain)
     tick1 = Tick(
@@ -244,10 +243,10 @@ def test_multi_lot_target1_partial_booking_and_target2_full_exit():
     assert reason == ExitReason.TARGET_1
     assert exit_price == 120.0  # 120.5 bid - 0.5 slippage
     assert p.status == PositionStatus.PARTIALLY_CLOSED
-    assert p.remaining_quantity == 65  # 50% booked!
+    assert p.remaining_quantity == 65
     assert p.is_t1_hit is True
     assert p.is_breakeven_sl_active is True
-    assert p.stop_loss_premium == p.entry_price + 1.0  # Breakeven SL locked in
+    assert p.stop_loss_premium == p.entry_price + 1.0
 
     # Tick 3: Target 2 Hit (Bid reaches 140.0 >= 140.0)
     t2_ts = IST.localize(datetime(2026, 11, 26, 10, 25, 0))
@@ -273,7 +272,7 @@ def test_multi_lot_target1_partial_booking_and_target2_full_exit():
     # 65 sold at 120.0, 65 sold at 139.50, 130 bought at 100.50
     # Gross = (65 * 19.50) + (65 * 39.00) = 1267.5 + 2535.0 = 3802.50
     assert abs(p2.gross_pnl - 3802.50) < 1.0
-    assert p2.net_pnl > 3500.0  # Subtracted STT 0.15% on sells + brokerage ₹60 + GST
+    assert p2.net_pnl > 3500.0
 
 
 def test_one_lot_target1_breakeven_trailing_stop():
@@ -290,7 +289,6 @@ def test_one_lot_target1_breakeven_trailing_stop():
         sl_premium=85.0,
     )
     pos = engine.process_technical_candidate(cand, current_time=entry_ts)
-    assert pos is not None
     assert pos.remaining_quantity == 65
     assert pos.entry_price == 100.50
 
@@ -306,9 +304,9 @@ def test_one_lot_target1_breakeven_trailing_stop():
     events_t1 = engine.on_tick(tick_t1)
     assert len(events_t1) == 1
     assert events_t1[0][1] == ExitReason.TARGET_1
-    assert pos.remaining_quantity == 65  # Intact
+    assert pos.remaining_quantity == 65
     assert pos.is_breakeven_sl_active is True
-    assert pos.stop_loss_premium == 101.50  # 100.50 + 1.0 buffer
+    assert pos.stop_loss_premium == 101.50
 
     # Market retraces sharply below entry: drops to 98.0
     retrace_tick = Tick(
@@ -324,7 +322,6 @@ def test_one_lot_target1_breakeven_trailing_stop():
     p, reason, exit_price = events_retrace[0]
     assert reason == ExitReason.TRAILING_STOP
     assert p.status == PositionStatus.CLOSED
-    # Protected from original 85.0 SL loss!
 
 
 def test_stop_loss_exit_on_option_drop():
@@ -339,9 +336,7 @@ def test_stop_loss_exit_on_option_drop():
         sl_premium=85.0,
     )
     pos = engine.process_technical_candidate(cand, current_time=entry_ts)
-    assert pos is not None
 
-    # Option collapses to 84.5
     sl_tick = Tick(
         symbol=pos.symbol,
         ltp=84.5,
@@ -359,12 +354,11 @@ def test_stop_loss_exit_on_option_drop():
     assert p.net_pnl < 0.0
 
 
-def test_emergency_exit_on_underlying_spot_sl_breach():
-    """Verify underlying spot price breach forces immediate option position liquidation."""
+def test_emergency_exit_on_underlying_spot_sl_breach_with_fresh_quote():
+    """Verify underlying spot price breach forces immediate option position liquidation when quote is fresh."""
     engine = PaperTradingEngine(default_lots=1, slippage_points=0.5)
     entry_ts = IST.localize(datetime(2026, 11, 26, 12, 0, 0))
 
-    # Spot entry = 25100.0, Spot SL = 25070.0 (Bullish Call)
     cand = create_mock_candidate(
         timestamp=entry_ts,
         trigger_price=25100.0,
@@ -375,12 +369,12 @@ def test_emergency_exit_on_underlying_spot_sl_breach():
     pos = engine.process_technical_candidate(cand, current_time=entry_ts)
     assert pos is not None
 
-    # Underlying index cracks down to 25068.0 (< 25070.0)
+    # Underlying index cracks down to 25068.0 (< 25070.0) within fresh window
     index_tick = Tick(
         symbol="NSE:NIFTY50-INDEX",
         ltp=25068.0,
         volume=100000,
-        local_timestamp=entry_ts,
+        local_timestamp=entry_ts + timedelta(seconds=10),
     )
     events = engine.on_tick(index_tick)
     assert len(events) == 1
@@ -388,6 +382,214 @@ def test_emergency_exit_on_underlying_spot_sl_breach():
     assert reason == ExitReason.STOP_LOSS
     assert p.status == PositionStatus.CLOSED
     assert "Spot SL breached" in p.notes
+
+
+def test_stale_option_quote_delays_spot_trigger_until_fresh_tick():
+    """Verify stale option quote prevents erroneous execution; awaits fresh option tick."""
+    engine = PaperTradingEngine(default_lots=1, slippage_points=0.5, max_quote_age_seconds=30.0)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 12, 0, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        stop_loss=25070.0,
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+
+    # Spot breach arrives 5 minutes later without intermediate option quotes!
+    stale_ts = entry_ts + timedelta(minutes=5)
+    index_tick = Tick(
+        symbol="NSE:NIFTY50-INDEX",
+        ltp=25068.0,
+        volume=100000,
+        local_timestamp=stale_ts,
+    )
+    events = engine.on_tick(index_tick)
+    # MUST NOT execute against the 5-minute-old entry price!
+    assert len(events) == 0
+    assert pos.status == PositionStatus.OPEN
+    assert pos.is_exit_triggered is True
+    assert pos.pending_exit_reason == ExitReason.STOP_LOSS
+
+    # Now fresh option tick arrives at actual current market (e.g. ₹75.0)
+    fresh_opt_tick = Tick(
+        symbol=pos.symbol,
+        ltp=75.0,
+        bid=74.8,
+        ask=75.2,
+        volume=1000,
+        local_timestamp=stale_ts + timedelta(seconds=2),
+    )
+    fresh_events = engine.on_tick(fresh_opt_tick)
+    assert len(fresh_events) == 1
+    p, reason, exit_price = fresh_events[0]
+    assert reason == ExitReason.STOP_LOSS
+    assert exit_price == 74.30  # 74.8 bid - 0.5 slippage (NOT the stale 100.0 quote!)
+    assert p.status == PositionStatus.CLOSED
+
+
+def test_on_candle_intrabar_adverse_first_evaluation():
+    """Verify on_candle evaluates intrabar high and low with conservative adverse-first logic."""
+    engine = PaperTradingEngine(default_lots=1, slippage_points=0.5)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        entry_ltp=100.0,
+        ask=100.0,
+        t1_premium=120.0,
+        sl_premium=85.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+
+    # Candle that spiked to 83.0 (SL breached) but closed at 95.0
+    bar = Candle(
+        symbol=pos.symbol,
+        timeframe="1m",
+        timestamp=entry_ts + timedelta(minutes=1),
+        open=98.0,
+        high=102.0,
+        low=83.0,  # Breached 85.0 SL!
+        close=95.0,
+        volume=10000,
+        is_closed=True,
+    )
+    events = engine.on_candle(bar)
+    assert len(events) == 1
+    p, reason, exit_price = events[0]
+    assert reason == ExitReason.STOP_LOSS
+    assert exit_price == 82.50  # 83.0 low - 0.5 slippage
+    assert p.status == PositionStatus.CLOSED
+
+
+def test_no_duplicate_target1_events():
+    """Verify spot target 1 branch returns exactly one event without duplicates."""
+    engine = PaperTradingEngine(default_lots=1, slippage_points=0.5)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        target_1=25140.0,
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+
+    # Spot tick reaching Target 1
+    spot_tick = Tick(
+        symbol="NSE:NIFTY50-INDEX",
+        ltp=25145.0,
+        volume=50000,
+        local_timestamp=entry_ts + timedelta(seconds=15),
+    )
+    events = engine.on_tick(spot_tick)
+    assert len(events) == 1  # Exactly 1 event, not duplicated!
+    assert events[0][1] == ExitReason.TARGET_1
+
+
+def test_realized_risk_to_reward_preserves_initial_stop_and_averages_all_legs():
+    """Verify realized R:R preserves the initial stop loss and computes quantity-weighted average exit price."""
+    engine = PaperTradingEngine(default_lots=2, slippage_points=0.5)  # 2 lots = 130 qty
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        entry_ltp=100.0,
+        ask=100.0,
+        t1_premium=120.0,
+        t2_premium=140.0,
+        sl_premium=85.0,  # Initial risk = 100.50 - 85.0 = 15.50 pts
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+    assert pos.initial_stop_loss_premium == 85.0
+
+    # 1. Hit Target 1: books 65 at 120.0
+    tick_t1 = Tick(
+        symbol=pos.symbol,
+        ltp=120.5,
+        bid=120.5,
+        ask=121.0,
+        volume=2000,
+        local_timestamp=entry_ts + timedelta(minutes=5),
+    )
+    engine.on_tick(tick_t1)
+    assert pos.is_t1_hit is True
+    # Stop loss is moved to breakeven (101.50), but initial_stop_loss_premium MUST remain 85.0!
+    assert pos.stop_loss_premium == 101.50
+    assert pos.initial_stop_loss_premium == 85.0
+
+    # 2. Hit Target 2: books remaining 65 at 139.50
+    tick_t2 = Tick(
+        symbol=pos.symbol,
+        ltp=140.5,
+        bid=140.0,
+        ask=140.5,
+        volume=5000,
+        local_timestamp=entry_ts + timedelta(minutes=15),
+    )
+    engine.on_tick(tick_t2)
+    assert pos.status == PositionStatus.CLOSED
+
+    # Average exit price = (65 * 120.0 + 65 * 139.50) / 130 = 129.75
+    assert pos.exit_price == 129.75
+    # Initial risk = 100.50 - 85.0 = 15.50 pts
+    # Average gain = 129.75 - 100.50 = 29.25 pts
+    # Realized R:R = 29.25 / 15.50 = 1.89R
+    expected_rr = round(29.25 / 15.50, 2)
+    assert pos.realized_rr == expected_rr
+
+
+def test_duckdb_recovery_on_engine_restart():
+    """Verify a newly initialized engine recovers active positions, closed positions, and cumulative P&L."""
+    store = DuckDBStore(db_path=":memory:")
+    engine1 = PaperTradingEngine(store=store, default_lots=1, slippage_points=0.5)
+
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+    cand = create_mock_candidate(
+        candidate_id="RECOVERY_TEST_1",
+        timestamp=entry_ts,
+        entry_ltp=100.0,
+        ask=100.0,
+        t1_premium=120.0,
+        t2_premium=140.0,
+    )
+    pos1 = engine1.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos1 is not None
+
+    # Execute full exit on engine1
+    tick_t2 = Tick(
+        symbol=pos1.symbol,
+        ltp=140.5,
+        bid=140.0,
+        ask=140.5,
+        volume=5000,
+        local_timestamp=entry_ts + timedelta(minutes=10),
+    )
+    engine1.on_tick(tick_t2)
+    assert pos1.status == PositionStatus.CLOSED
+    pnl1 = engine1.total_realized_net_pnl
+    assert pnl1 > 0.0
+
+    # Simulate restart: create brand-new engine2 connected to the same DuckDB store!
+    engine2 = PaperTradingEngine(store=store, default_lots=1, slippage_points=0.5)
+
+    # Verify state was restored
+    assert len(engine2.get_closed_positions()) == 1
+    recovered_pos = engine2.get_closed_positions()[0]
+    assert recovered_pos.signal_id == "RECOVERY_TEST_1"
+    assert recovered_pos.exit_reason == ExitReason.TARGET_2
+    assert engine2.total_realized_net_pnl == pnl1
+    assert engine2.get_account_summary()["total_trades"] == 1
+    assert engine2.get_account_summary()["winning_trades"] == 1
+
+    store.close()
 
 
 def test_eod_square_off_at_1515_ist():
@@ -410,53 +612,203 @@ def test_eod_square_off_at_1515_ist():
     assert len(engine.get_open_positions()) == 0
 
 
-def test_duckdb_store_journal_integration():
-    """Verify DuckDBStore saves and retrieves paper orders, positions, and summary metrics."""
-    store = DuckDBStore(db_path=":memory:")
-    engine = PaperTradingEngine(store=store, default_lots=1, slippage_points=0.5)
-
+def test_put_option_spot_sl_and_intrabar_boundaries():
+    """Verify Put option triggers spot SL when underlying index surges upward."""
+    engine = PaperTradingEngine(default_lots=1, slippage_points=0.5)
     entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    # Bearish Put: Spot Entry = 25100, Spot SL = 25130 (higher than entry), Spot Targets = 25060, 25020
     cand = create_mock_candidate(
-        candidate_id="JOURNAL_TEST_1",
         timestamp=entry_ts,
+        trigger_price=25100.0,
+        stop_loss=25130.0,  # Index surge stops Put
+        target_1=25060.0,
+        target_2=25020.0,
+        opt_symbol="NSE:NIFTY26NOV25100PE",
         entry_ltp=100.0,
         ask=100.0,
-        t1_premium=120.0,
-        t2_premium=140.0,
+    )
+    # Modify candidate direction & contract option_type to Put
+    cand.direction = BreakoutDirection.BEARISH
+    cand.derivatives_assessment.selected_contract.option_type = "PE"
+
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+    assert pos.option_type == "PE"
+
+    # Index surges to 25135 (> 25130 spot SL for Put) within a fresh 1m bar
+    candle = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="1m",
+        timestamp=entry_ts + timedelta(seconds=15),
+        open=25110.0,
+        high=25135.0,  # Surged above spot SL!
+        low=25095.0,
+        close=25120.0,
+        volume=50000,
+        is_closed=True,
+    )
+    events = engine.on_candle(candle)
+    assert len(events) == 1
+    p, reason, exit_price = events[0]
+    assert reason == ExitReason.STOP_LOSS
+    assert p.status == PositionStatus.CLOSED
+
+
+def test_quote_provider_on_demand_refresh():
+    """Verify on-demand quote_provider refreshes stale option quote during spot trigger."""
+    def mock_quote_provider(symbol: str):
+        return {"ltp": 82.0, "bid": 81.8, "ask": 82.2}
+
+    engine = PaperTradingEngine(
+        default_lots=1,
+        slippage_points=0.5,
+        max_quote_age_seconds=30.0,
+        quote_provider=mock_quote_provider,
+    )
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        stop_loss=25070.0,
+        entry_ltp=100.0,
+        ask=100.0,
     )
     pos = engine.process_technical_candidate(cand, current_time=entry_ts)
     assert pos is not None
+
+    # Spot breach 3 minutes later (option quote in memory is stale)
+    spot_tick = Tick(
+        symbol="NSE:NIFTY50-INDEX",
+        ltp=25065.0,
+        volume=10000,
+        local_timestamp=entry_ts + timedelta(minutes=3),
+    )
+    events = engine.on_tick(spot_tick)
+    # quote_provider was queried on-demand and returned fresh quote (bid=81.8)
+    assert len(events) == 1
+    p, reason, exit_price = events[0]
+    assert reason == ExitReason.STOP_LOSS
+    assert exit_price == 81.30  # 81.8 bid - 0.5 slippage
+    assert p.status == PositionStatus.CLOSED
+
+
+def test_holding_timeout_and_eod_stale_conservative_penalty():
+    """Verify holding timeout triggers when max duration exceeded, and stale EOD receives penalty."""
+    engine = PaperTradingEngine(
+        default_lots=1,
+        slippage_points=0.5,
+        max_holding_minutes=45.0,
+        max_quote_age_seconds=30.0,
+    )
+    entry_ts = IST.localize(datetime(2026, 11, 26, 14, 0, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
     assert pos is not None
 
-    # Check order persisted
-    orders = store.get_paper_orders(position_id=pos.position_id)
-    assert len(orders) == 1
-    assert orders[0]["side"] == "BUY"
-    assert orders[0]["filled_price"] == 100.50
+    # Stale EOD event at 15:15:00 IST (quote is 1h15m old)
+    eod_ts = IST.localize(datetime(2026, 11, 26, 15, 15, 0))
+    events = engine.check_time_events(eod_ts)
+    assert len(events) == 1
+    p, reason, exit_price = events[0]
+    assert reason == ExitReason.EOD_SQUARE_OFF
+    # Received conservative penalty (bid 99.8 - 2 * slippage 0.5 = 98.80)
+    assert exit_price == 98.80
+    assert "conservative penalty" in p.notes
 
-    # Execute T2 exit
-    tick_t2 = Tick(
-        symbol=pos.symbol,
-        ltp=140.5,
-        bid=140.0,
-        ask=140.5,
-        volume=5000,
-        local_timestamp=entry_ts,
+
+def test_on_candle_spot_targets_call_and_put():
+    """Verify on_candle handles spot Target 1 and Target 2 for both Call and Put positions."""
+    engine = PaperTradingEngine(default_lots=2, slippage_points=0.5)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    # 1. Bullish Call setup
+    cand_call = create_mock_candidate(
+        candidate_id="CAND_CALL_BAR",
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        stop_loss=25070.0,
+        target_1=25140.0,
+        target_2=25180.0,
+        entry_ltp=100.0,
+        ask=100.0,
     )
-    engine.on_tick(tick_t2)
+    pos_call = engine.process_technical_candidate(cand_call, current_time=entry_ts)
+    assert pos_call is not None
 
-    # Check position in DuckDB
-    positions_db = store.get_paper_positions(status="CLOSED")
-    assert len(positions_db) == 1
-    assert positions_db[0]["signal_id"] == "JOURNAL_TEST_1"
-    assert positions_db[0]["exit_reason"] == "TARGET_2"
-    assert positions_db[0]["gross_pnl"] > 2000.0
+    # Spot candle hits Target 1 (high = 25145 >= 25140)
+    c1 = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="1m",
+        timestamp=entry_ts + timedelta(seconds=10),
+        open=25105.0,
+        high=25145.0,
+        low=25100.0,
+        close=25130.0,
+        volume=20000,
+        is_closed=True,
+    )
+    ev_c1 = engine.on_candle(c1)
+    assert len(ev_c1) == 1
+    assert ev_c1[0][1] == ExitReason.TARGET_1
+    assert pos_call.remaining_quantity == 65
 
-    summary = engine.get_account_summary()
-    assert summary["total_trades"] == 1
-    assert summary["winning_trades"] == 1
-    assert summary["win_rate_pct"] == 100.0
-    assert summary["total_realized_net_pnl"] > 0.0
-    assert summary["total_costs_paid"] > 40.0
+    # Spot candle hits Target 2 (high = 25185 >= 25180)
+    c2 = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="1m",
+        timestamp=entry_ts + timedelta(seconds=20),
+        open=25135.0,
+        high=25185.0,
+        low=25130.0,
+        close=25175.0,
+        volume=30000,
+        is_closed=True,
+    )
+    ev_c2 = engine.on_candle(c2)
+    assert len(ev_c2) == 1
+    assert ev_c2[0][1] == ExitReason.TARGET_2
+    assert pos_call.status == PositionStatus.CLOSED
 
-    store.close()
+    # 2. Bearish Put setup
+    cand_put = create_mock_candidate(
+        candidate_id="CAND_PUT_BAR",
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        stop_loss=25130.0,
+        target_1=25060.0,
+        target_2=25020.0,
+        opt_symbol="NSE:NIFTY26NOV25100PE",
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+    cand_put.direction = BreakoutDirection.BEARISH
+    cand_put.derivatives_assessment.selected_contract.option_type = "PE"
+
+    pos_put = engine.process_technical_candidate(cand_put, current_time=entry_ts)
+    assert pos_put is not None
+
+    # Put spot hits Target 2 directly (low = 25015 <= 25020)
+    c_put = Candle(
+        symbol="NSE:NIFTY50-INDEX",
+        timeframe="1m",
+        timestamp=entry_ts + timedelta(seconds=15),
+        open=25090.0,
+        high=25100.0,
+        low=25015.0,
+        close=25030.0,
+        volume=40000,
+        is_closed=True,
+    )
+    ev_put = engine.on_candle(c_put)
+    assert len(ev_put) == 1
+    assert ev_put[0][1] == ExitReason.TARGET_2
+    assert pos_put.status == PositionStatus.CLOSED
+
+

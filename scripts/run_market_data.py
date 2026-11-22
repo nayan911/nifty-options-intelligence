@@ -175,15 +175,13 @@ class MarketDataEngine:
             if tick.exchange_timestamp:
                 self.last_primary_network_latency = (tick.local_timestamp - tick.exchange_timestamp).total_seconds()
 
-        # Forward tick to PaperTradingEngine for live M2M position tracking and automated exits
-        if hasattr(self, "paper_engine"):
-            self.paper_engine.on_tick(tick)
-
-        # 3. Only pass verified live trading ticks to CandleBuilder
+        # 3. Only pass verified live trading ticks to CandleBuilder and PaperTradingEngine
         if res.status == TickStatus.VALID_LIVE:
             self.live_ticks_accepted += 1
             self.symbol_stats[sym]["live"] += 1
             self.builder.process_tick(tick)
+            if hasattr(self, "paper_engine"):
+                self.paper_engine.on_tick(tick)
         elif res.status == TickStatus.UNVERIFIED:
             self.unverified_ticks_accepted += 1
             self.symbol_stats[sym].setdefault("unverified", 0)
