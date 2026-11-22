@@ -122,6 +122,8 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     exit_time TIMESTAMP WITH TIME ZONE,
     last_quote_time TIMESTAMP WITH TIME ZONE,
     last_candle_time TIMESTAMP WITH TIME ZONE,
+    last_bid_time TIMESTAMP WITH TIME ZONE,
+    last_ask_time TIMESTAMP WITH TIME ZONE,
     current_ltp DOUBLE,
     current_bid DOUBLE,
     current_ask DOUBLE,

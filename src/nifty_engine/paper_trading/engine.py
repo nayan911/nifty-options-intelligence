@@ -218,6 +218,8 @@ class PaperTradingEngine:
             spot_sl=candidate.stop_loss,
             entry_time=now,
             last_quote_time=now,
+            last_bid_time=now if (contract.bid is not None and contract.bid > 0) else None,
+            last_ask_time=now if (contract.ask is not None and contract.ask > 0) else None,
             status=PositionStatus.OPEN,
             current_ltp=contract.ltp,
             current_bid=contract.bid,
@@ -284,8 +286,10 @@ class PaperTradingEngine:
                 pos.current_ltp = tick.ltp
                 if tick.bid is not None and tick.bid > 0:
                     pos.current_bid = tick.bid
+                    pos.last_bid_time = current_time
                 if tick.ask is not None and tick.ask > 0:
                     pos.current_ask = tick.ask
+                    pos.last_ask_time = current_time
                 pos.last_quote_time = current_time
 
                 if tick.ltp > pos.highest_premium_seen:
@@ -293,43 +297,88 @@ class PaperTradingEngine:
                 if tick.ltp < pos.lowest_premium_seen:
                     pos.lowest_premium_seen = tick.ltp
 
+                # Check bid freshness
+                bid_fresh = pos.has_fresh_bid(current_time, self.max_quote_age_seconds)
+
                 # Update live M2M unrealized PnL
-                effective_price = pos.current_bid if pos.current_bid is not None else pos.current_ltp
+                effective_price = pos.current_bid if (bid_fresh and pos.current_bid is not None and pos.current_bid > 0) else pos.current_ltp
                 unrealized_gross = (effective_price - pos.entry_price) * pos.remaining_quantity
                 pos.gross_pnl = unrealized_gross
                 pos.net_pnl = unrealized_gross - pos.total_costs
 
                 # Handle pending triggered exits awaiting fresh quote
                 if pos.is_exit_triggered and pos.pending_exit_reason:
-                    reason = pos.pending_exit_reason
-                    pos.is_exit_triggered = False
-                    pos.pending_exit_reason = None
-                    if reason == ExitReason.TARGET_1:
-                        ev = self._execute_partial_exit_t1(pos, effective_price, current_time, notes="Triggered T1 filled on fresh quote")
-                    else:
-                        ev = self._execute_full_exit(pos, effective_price, reason, current_time, notes=f"Triggered {reason.value} filled on fresh quote")
-                    if ev:
-                        events.append(ev)
+                    # Require fresh bid before executing pending sell exits
+                    if not bid_fresh and self.quote_provider is not None:
+                        fresh_quote = self._fetch_fresh_quote(pos.symbol)
+                        if fresh_quote and fresh_quote.get("bid", 0) > 0:
+                            pos.current_bid = fresh_quote["bid"]
+                            pos.last_bid_time = current_time
+                            pos.last_quote_time = current_time
+                            bid_fresh = True
+
+                    if bid_fresh and pos.current_bid and pos.current_bid > 0:
+                        reason = pos.pending_exit_reason
+                        pos.is_exit_triggered = False
+                        pos.pending_exit_reason = None
+                        fill_price = pos.current_bid
+                        if reason == ExitReason.TARGET_1:
+                            ev = self._execute_partial_exit_t1(pos, fill_price, current_time, notes="Triggered T1 filled on fresh quote")
+                        else:
+                            ev = self._execute_full_exit(pos, fill_price, reason, current_time, notes=f"Triggered {reason.value} filled on fresh quote")
+                        if ev:
+                            events.append(ev)
                     continue
 
-                # A. Target 2 Check (Full runner exit)
-                if effective_price >= pos.target_premium_t2:
-                    ev = self._execute_full_exit(pos, effective_price, ExitReason.TARGET_2, current_time)
-                    if ev:
-                        events.append(ev)
+                # Evaluate option-level triggers (Target 2, Target 1, Stop Loss)
+                # Triggers evaluate against current trade LTP or verified bid
+                t2_hit = effective_price >= pos.target_premium_t2 or tick.ltp >= pos.target_premium_t2
+                t1_hit = not pos.is_t1_hit and (effective_price >= pos.target_premium_t1 or tick.ltp >= pos.target_premium_t1)
+                sl_hit = effective_price <= pos.stop_loss_premium or tick.ltp <= pos.stop_loss_premium
 
-                # B. Target 1 Check (50% partial exit / trailing stop activation)
-                elif not pos.is_t1_hit and effective_price >= pos.target_premium_t1:
-                    ev = self._execute_partial_exit_t1(pos, effective_price, current_time)
-                    if ev:
-                        events.append(ev)
+                if t2_hit or t1_hit or sl_hit:
+                    # Require fresh bid before simulating sell fill
+                    if not bid_fresh and self.quote_provider is not None:
+                        fresh_quote = self._fetch_fresh_quote(pos.symbol)
+                        if fresh_quote and fresh_quote.get("bid", 0) > 0:
+                            pos.current_bid = fresh_quote["bid"]
+                            pos.last_bid_time = current_time
+                            pos.last_quote_time = current_time
+                            bid_fresh = True
 
-                # C. Stop Loss Check (Active SL or Trailing Breakeven)
-                elif effective_price <= pos.stop_loss_premium:
-                    reason = ExitReason.TRAILING_STOP if pos.is_breakeven_sl_active else ExitReason.STOP_LOSS
-                    ev = self._execute_full_exit(pos, effective_price, reason, current_time)
-                    if ev:
-                        events.append(ev)
+                    if t2_hit:
+                        if bid_fresh and pos.current_bid and pos.current_bid > 0:
+                            ev = self._execute_full_exit(pos, pos.current_bid, ExitReason.TARGET_2, current_time)
+                            if ev:
+                                events.append(ev)
+                        else:
+                            pos.is_exit_triggered = True
+                            pos.pending_exit_reason = ExitReason.TARGET_2
+                            self._save_position(pos)
+                            logger.info("Option T2 reached for %s. Option bid stale (age %.1fs). Awaiting fresh bid.", pos.symbol, pos.bid_age_seconds(current_time))
+
+                    elif t1_hit:
+                        if bid_fresh and pos.current_bid and pos.current_bid > 0:
+                            ev = self._execute_partial_exit_t1(pos, pos.current_bid, current_time)
+                            if ev:
+                                events.append(ev)
+                        else:
+                            pos.is_exit_triggered = True
+                            pos.pending_exit_reason = ExitReason.TARGET_1
+                            self._save_position(pos)
+                            logger.info("Option T1 reached for %s. Option bid stale (age %.1fs). Awaiting fresh bid.", pos.symbol, pos.bid_age_seconds(current_time))
+
+                    elif sl_hit:
+                        reason = ExitReason.TRAILING_STOP if pos.is_breakeven_sl_active else ExitReason.STOP_LOSS
+                        if bid_fresh and pos.current_bid and pos.current_bid > 0:
+                            ev = self._execute_full_exit(pos, pos.current_bid, reason, current_time)
+                            if ev:
+                                events.append(ev)
+                        else:
+                            pos.is_exit_triggered = True
+                            pos.pending_exit_reason = reason
+                            self._save_position(pos)
+                            logger.info("Option SL hit for %s. Option bid stale (age %.1fs). Awaiting fresh bid.", pos.symbol, pos.bid_age_seconds(current_time))
 
             # 2. Underlying Spot Tick: Evaluate spot-level technical stop & target invalidation
             elif "INDEX" in sym and pos.underlying in sym:
@@ -344,24 +393,24 @@ class PaperTradingEngine:
                 if not (spot_sl_hit or spot_t2_hit or (not pos.is_t1_hit and spot_t1_hit)):
                     continue
 
-                # Validate option quote freshness before executing fill
-                quote_age = pos.quote_age_seconds(current_time)
-                is_fresh = quote_age <= self.max_quote_age_seconds
-                opt_price = pos.current_bid if (pos.current_bid is not None and pos.current_bid > 0) else pos.current_ltp
+                # Validate option bid freshness before executing sell fill
+                bid_fresh = pos.has_fresh_bid(current_time, self.max_quote_age_seconds)
+                opt_price = pos.current_bid if (bid_fresh and pos.current_bid is not None and pos.current_bid > 0) else 0.0
 
-                # Try on-demand quote provider if quote is stale
-                if not is_fresh and self.quote_provider is not None:
+                # Try on-demand quote provider if bid is stale or missing
+                if not bid_fresh and self.quote_provider is not None:
                     fresh_quote = self._fetch_fresh_quote(pos.symbol)
                     if fresh_quote and fresh_quote.get("bid", 0) > 0:
                         opt_price = fresh_quote["bid"]
                         pos.current_bid = opt_price
+                        pos.last_bid_time = current_time
                         pos.last_quote_time = current_time
-                        is_fresh = True
+                        bid_fresh = True
 
                 # Spot Stop Loss Breach
                 if spot_sl_hit:
                     reason = ExitReason.TRAILING_STOP if pos.is_breakeven_sl_active else ExitReason.STOP_LOSS
-                    if is_fresh and opt_price > 0:
+                    if bid_fresh and opt_price > 0:
                         ev = self._execute_full_exit(pos, opt_price, reason, current_time, notes="Spot SL breached")
                         if ev:
                             events.append(ev)
@@ -369,12 +418,12 @@ class PaperTradingEngine:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = reason
                         self._save_position(pos)
-                        logger.info("Spot SL breached for %s. Option quote stale (age %.1fs). Awaiting fresh quote.", pos.symbol, quote_age)
+                        logger.info("Spot SL breached for %s. Option bid stale (age %.1fs). Awaiting fresh bid.", pos.symbol, pos.bid_age_seconds(current_time))
                     continue
 
                 # Spot Target 2 Reached
                 if spot_t2_hit:
-                    if is_fresh and opt_price > 0:
+                    if bid_fresh and opt_price > 0:
                         ev = self._execute_full_exit(pos, opt_price, ExitReason.TARGET_2, current_time, notes="Spot T2 reached")
                         if ev:
                             events.append(ev)
@@ -382,12 +431,12 @@ class PaperTradingEngine:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = ExitReason.TARGET_2
                         self._save_position(pos)
-                        logger.info("Spot T2 reached for %s. Option quote stale (age %.1fs). Awaiting fresh quote.", pos.symbol, quote_age)
+                        logger.info("Spot T2 reached for %s. Option bid stale (age %.1fs). Awaiting fresh bid.", pos.symbol, pos.bid_age_seconds(current_time))
                     continue
 
                 # Spot Target 1 Reached
                 if not pos.is_t1_hit and spot_t1_hit:
-                    if is_fresh and opt_price > 0:
+                    if bid_fresh and opt_price > 0:
                         ev = self._execute_partial_exit_t1(pos, opt_price, current_time, notes="Spot T1 reached")
                         if ev:
                             events.append(ev)
@@ -395,7 +444,7 @@ class PaperTradingEngine:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = ExitReason.TARGET_1
                         self._save_position(pos)
-                        logger.info("Spot T1 reached for %s. Option quote stale (age %.1fs). Awaiting fresh quote.", pos.symbol, quote_age)
+                        logger.info("Spot T1 reached for %s. Option bid stale (age %.1fs). Awaiting fresh bid.", pos.symbol, pos.bid_age_seconds(current_time))
 
         return events
 
@@ -488,22 +537,22 @@ class PaperTradingEngine:
             # Case 2: Underlying index candle (e.g. NIFTY 1m bar)
             elif "INDEX" in sym and pos.underlying in sym:
                 is_call = pos.option_type == "CE"
-                quote_age = pos.quote_age_seconds(current_time)
-                is_fresh = quote_age <= self.max_quote_age_seconds
-                opt_price = pos.current_bid if (pos.current_bid is not None and pos.current_bid > 0) else pos.current_ltp
+                bid_fresh = pos.has_fresh_bid(current_time, self.max_quote_age_seconds)
+                opt_price = pos.current_bid if (bid_fresh and pos.current_bid is not None and pos.current_bid > 0) else 0.0
 
                 # Adverse-first check: spot SL breach
                 spot_sl_hit = (candle.low <= pos.spot_sl) if is_call else (candle.high >= pos.spot_sl)
                 if spot_sl_hit:
                     reason = ExitReason.TRAILING_STOP if pos.is_breakeven_sl_active else ExitReason.STOP_LOSS
-                    if not is_fresh and self.quote_provider is not None:
+                    if not bid_fresh and self.quote_provider is not None:
                         fresh_quote = self._fetch_fresh_quote(pos.symbol)
                         if fresh_quote and fresh_quote.get("bid", 0) > 0:
                             opt_price = fresh_quote["bid"]
                             pos.current_bid = opt_price
+                            pos.last_bid_time = current_time
                             pos.last_quote_time = current_time
-                            is_fresh = True
-                    if is_fresh and opt_price > 0:
+                            bid_fresh = True
+                    if bid_fresh and opt_price > 0:
                         ev = self._execute_full_exit(pos, opt_price, reason, current_time, notes="Intrabar spot SL breach")
                         if ev:
                             events.append(ev)
@@ -516,14 +565,15 @@ class PaperTradingEngine:
                 # Favorable check: Target 2
                 spot_t2_hit = (candle.high >= pos.spot_target_t2) if is_call else (candle.low <= pos.spot_target_t2)
                 if spot_t2_hit:
-                    if not is_fresh and self.quote_provider is not None:
+                    if not bid_fresh and self.quote_provider is not None:
                         fresh_quote = self._fetch_fresh_quote(pos.symbol)
                         if fresh_quote and fresh_quote.get("bid", 0) > 0:
                             opt_price = fresh_quote["bid"]
                             pos.current_bid = opt_price
+                            pos.last_bid_time = current_time
                             pos.last_quote_time = current_time
-                            is_fresh = True
-                    if is_fresh and opt_price > 0:
+                            bid_fresh = True
+                    if bid_fresh and opt_price > 0:
                         ev = self._execute_full_exit(pos, opt_price, ExitReason.TARGET_2, current_time, notes="Intrabar spot T2 reached")
                         if ev:
                             events.append(ev)
@@ -536,14 +586,15 @@ class PaperTradingEngine:
                 # Favorable check: Target 1
                 spot_t1_hit = (candle.high >= pos.spot_target_t1) if is_call else (candle.low <= pos.spot_target_t1)
                 if not pos.is_t1_hit and spot_t1_hit:
-                    if not is_fresh and self.quote_provider is not None:
+                    if not bid_fresh and self.quote_provider is not None:
                         fresh_quote = self._fetch_fresh_quote(pos.symbol)
                         if fresh_quote and fresh_quote.get("bid", 0) > 0:
                             opt_price = fresh_quote["bid"]
                             pos.current_bid = opt_price
+                            pos.last_bid_time = current_time
                             pos.last_quote_time = current_time
-                            is_fresh = True
-                    if is_fresh and opt_price > 0:
+                            bid_fresh = True
+                    if bid_fresh and opt_price > 0:
                         ev = self._execute_partial_exit_t1(pos, opt_price, current_time, notes="Intrabar spot T1 reached")
                         if ev:
                             events.append(ev)
@@ -564,28 +615,29 @@ class PaperTradingEngine:
             if pos.status == PositionStatus.CLOSED:
                 continue
 
-            quote_age = pos.quote_age_seconds(current_time)
-            is_fresh = quote_age <= self.max_quote_age_seconds
-            opt_price = pos.current_bid if (pos.current_bid is not None and pos.current_bid > 0) else pos.current_ltp
+            bid_fresh = pos.has_fresh_bid(current_time, self.max_quote_age_seconds)
+            opt_price = pos.current_bid if (bid_fresh and pos.current_bid is not None and pos.current_bid > 0) else 0.0
 
             # Try quote provider if stale
-            if not is_fresh and self.quote_provider is not None:
+            if not bid_fresh and self.quote_provider is not None:
                 fresh_quote = self._fetch_fresh_quote(pos.symbol)
                 if fresh_quote and fresh_quote.get("bid", 0) > 0:
                     opt_price = fresh_quote["bid"]
                     pos.current_bid = opt_price
+                    pos.last_bid_time = current_time
                     pos.last_quote_time = current_time
-                    is_fresh = True
+                    bid_fresh = True
 
             # 1. EOD Auto Square-Off at 15:15 IST
             if is_eod:
-                if is_fresh:
+                if bid_fresh and opt_price > 0:
                     exit_notes = "Intraday auto square-off at 15:15 IST"
                     fill_ref = opt_price
                 else:
                     # Explicit conservative fallback fill: apply double slippage penalty
-                    fill_ref = max(0.05, opt_price - self.slippage_points)
-                    exit_notes = f"EOD square-off filled with conservative penalty (quote age: {quote_age:.1f}s)"
+                    fallback_base = pos.current_bid if (pos.current_bid is not None and pos.current_bid > 0) else pos.current_ltp
+                    fill_ref = max(0.05, fallback_base - self.slippage_points)
+                    exit_notes = f"EOD square-off filled with conservative penalty (bid age: {pos.bid_age_seconds(current_time):.1f}s)"
 
                 ev = self._execute_full_exit(
                     pos,
@@ -601,7 +653,7 @@ class PaperTradingEngine:
             # 2. Maximum holding period timeout
             elapsed_minutes = (current_time - pos.entry_time).total_seconds() / 60.0
             if elapsed_minutes >= self.max_holding_minutes and not pos.is_t1_hit:
-                if is_fresh and opt_price > 0:
+                if bid_fresh and opt_price > 0:
                     ev = self._execute_full_exit(
                         pos,
                         opt_price,
@@ -615,7 +667,7 @@ class PaperTradingEngine:
                     pos.is_exit_triggered = True
                     pos.pending_exit_reason = ExitReason.TIMEOUT
                     self._save_position(pos)
-                    logger.info("Holding timeout reached for %s. Option quote stale (age %.1fs). Awaiting fresh quote.", pos.symbol, quote_age)
+                    logger.info("Holding timeout reached for %s. Option bid stale (age %.1fs). Awaiting fresh quote.", pos.symbol, pos.bid_age_seconds(current_time))
 
         return events
 
@@ -825,8 +877,8 @@ class PaperTradingEngine:
                 if res and res.get("s") == "ok" and res.get("d"):
                     val = res["d"][0].get("v", {})
                     ltp = float(val.get("lp", 0.0))
-                    bid = float(val.get("bid", ltp))
-                    ask = float(val.get("ask", ltp))
+                    bid = float(val.get("bid", 0.0) or 0.0)
+                    ask = float(val.get("ask", 0.0) or 0.0)
                     return {"ltp": ltp, "bid": bid, "ask": ask}
         except Exception as e:
             logger.debug("Failed to fetch on-demand quote for %s: %s", symbol, e)
@@ -879,6 +931,8 @@ class PaperTradingEngine:
         exit_time = self._parse_dt(row.get("exit_time"))
         last_quote_time = self._parse_dt(row.get("last_quote_time")) or entry_time
         last_candle_time = self._parse_dt(row.get("last_candle_time"))
+        last_bid_time = self._parse_dt(row.get("last_bid_time"))
+        last_ask_time = self._parse_dt(row.get("last_ask_time"))
         expiry = self._parse_date(row.get("expiry")) or entry_time.date()
 
         status_str = row.get("status", "OPEN")
@@ -926,6 +980,8 @@ class PaperTradingEngine:
             exit_price=float(row["exit_price"]) if row.get("exit_price") is not None else None,
             last_quote_time=last_quote_time,
             last_candle_time=last_candle_time,
+            last_bid_time=last_bid_time,
+            last_ask_time=last_ask_time,
             status=status,
             exit_reason=exit_reason,
             is_t1_hit=is_t1_hit,

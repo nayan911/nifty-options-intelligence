@@ -149,6 +149,8 @@ class PaperPosition:
     initial_stop_loss_premium: float = 0.0
     last_quote_time: Optional[datetime] = None
     last_candle_time: Optional[datetime] = None
+    last_bid_time: Optional[datetime] = None
+    last_ask_time: Optional[datetime] = None
     is_exit_triggered: bool = False
     pending_exit_reason: Optional[ExitReason] = None
 
@@ -164,6 +166,17 @@ class PaperPosition:
         """Returns elapsed seconds since last authentic option quote update."""
         ref_time = self.last_quote_time or self.entry_time
         return max(0.0, (current_time - ref_time).total_seconds())
+
+    def bid_age_seconds(self, current_time: datetime) -> float:
+        """Returns elapsed seconds since last authentic option bid quote update."""
+        ref_time = self.last_bid_time or self.entry_time
+        return max(0.0, (current_time - ref_time).total_seconds())
+
+    def has_fresh_bid(self, current_time: datetime, max_age_seconds: float) -> bool:
+        """Returns True only if current_bid is positive and last_bid_time is within max_age_seconds."""
+        if self.current_bid is None or self.current_bid <= 0:
+            return False
+        return self.bid_age_seconds(current_time) <= max_age_seconds
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -191,6 +204,8 @@ class PaperPosition:
             "exit_time": self.exit_time.isoformat() if self.exit_time else None,
             "last_quote_time": self.last_quote_time.isoformat() if self.last_quote_time else None,
             "last_candle_time": self.last_candle_time.isoformat() if self.last_candle_time else None,
+            "last_bid_time": self.last_bid_time.isoformat() if self.last_bid_time else None,
+            "last_ask_time": self.last_ask_time.isoformat() if self.last_ask_time else None,
             "status": self.status.value if isinstance(self.status, PositionStatus) else str(self.status),
             "exit_reason": self.exit_reason.value if isinstance(self.exit_reason, ExitReason) else (str(self.exit_reason) if self.exit_reason else None),
             "is_exit_triggered": self.is_exit_triggered,

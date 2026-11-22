@@ -1278,6 +1278,136 @@ def test_candle_closing_does_not_refresh_quote_timestamp():
     assert pos.pending_exit_reason == ExitReason.STOP_LOSS
 
 
+def test_ltp_only_ticks_do_not_refresh_bid_freshness():
+    """Verify that LTP-only option ticks do not refresh last_bid_time or make stale bids executable."""
+    engine = PaperTradingEngine(default_lots=1, slippage_points=0.5, max_quote_age_seconds=30.0)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        stop_loss=25070.0,
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+    # Initially, bid from candidate is 99.8
+    assert pos.current_bid == 99.8
+    assert pos.last_bid_time == entry_ts
+    assert pos.has_fresh_bid(entry_ts, 30.0) is True
+
+    # At 10:01:30 (90 seconds later), pos.last_bid_time is now 90s old
+    t1 = entry_ts + timedelta(seconds=90)
+    assert pos.has_fresh_bid(t1, 30.0) is False
+
+    # An LTP-only tick arrives with LTP 80.0 (below stop-loss premium)
+    # bid is None!
+    ltp_tick = Tick(
+        symbol=pos.symbol,
+        ltp=80.0,
+        bid=None,
+        ask=None,
+        volume=12000,
+        local_timestamp=t1,
+    )
+    events = engine.on_tick(ltp_tick)
+
+    # 1. LTP should be updated, and last_quote_time refreshed to t1
+    assert pos.current_ltp == 80.0
+    assert pos.last_quote_time == t1
+
+    # 2. But last_bid_time MUST NOT be refreshed; bid_fresh must still be False!
+    assert pos.last_bid_time == entry_ts
+    assert pos.has_fresh_bid(t1, 30.0) is False
+
+    # 3. Simulated sell fill must NOT execute against outdated 99.8 bid!
+    # Instead, exit must be marked as pending awaiting fresh bid
+    assert len(events) == 0
+    assert pos.status == PositionStatus.OPEN
+    assert pos.is_exit_triggered is True
+    assert pos.pending_exit_reason == ExitReason.STOP_LOSS
+
+    # 4. Now a fresh tick with authentic bid arrives at 10:01:32
+    t2 = entry_ts + timedelta(seconds=92)
+    fresh_tick = Tick(
+        symbol=pos.symbol,
+        ltp=79.5,
+        bid=79.0,
+        ask=80.0,
+        volume=15000,
+        local_timestamp=t2,
+    )
+    events2 = engine.on_tick(fresh_tick)
+
+    # 5. Pending exit should execute against the fresh bid of 79.0 (minus 0.5 slippage = 78.50)
+    assert len(events2) == 1
+    p, reason, exit_price = events2[0]
+    assert reason == ExitReason.STOP_LOSS
+    assert exit_price == 78.50
+    assert p.status == PositionStatus.CLOSED
+    assert p.is_exit_triggered is False
+    assert p.pending_exit_reason is None
+    assert p.last_bid_time == t2
+
+
+def test_duckdb_stores_and_recovers_bid_ask_timestamps(tmp_path):
+    """Verify last_bid_time and last_ask_time persist and recover accurately in DuckDB."""
+    db_file = str(tmp_path / "test_bid_ask_recovery.duckdb")
+    store = DuckDBStore(db_path=db_file)
+
+    engine = PaperTradingEngine(
+        store=store,
+        default_lots=1,
+        slippage_points=0.5,
+        max_quote_age_seconds=30.0,
+    )
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        stop_loss=25070.0,
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+
+    # Option tick updates bid and ask
+    bid_time = entry_ts + timedelta(seconds=15)
+    tick = Tick(
+        symbol=pos.symbol,
+        ltp=101.0,
+        bid=100.5,
+        ask=101.5,
+        volume=1000,
+        local_timestamp=bid_time,
+    )
+    engine.on_tick(tick)
+    assert pos.last_bid_time == bid_time
+    assert pos.last_ask_time == bid_time
+    store.save_paper_position(pos.to_dict())
+
+    # Recover in new engine instance
+    engine2 = PaperTradingEngine(
+        store=store,
+        default_lots=1,
+        slippage_points=0.5,
+        max_quote_age_seconds=30.0,
+    )
+    recovered_positions = engine2.get_open_positions()
+    assert len(recovered_positions) == 1
+    rec_pos = recovered_positions[0]
+    assert rec_pos.last_bid_time == bid_time
+    assert rec_pos.last_ask_time == bid_time
+    assert rec_pos.current_bid == 100.5
+    assert rec_pos.has_fresh_bid(bid_time + timedelta(seconds=10), 30.0) is True
+
+    store.close()
+
+
+
 
 
 
