@@ -16,6 +16,7 @@ import pytz
 
 from nifty_engine.analysis.technical.engine import TechnicalAnalysisEngine
 from nifty_engine.core.calendar import ExchangeCalendar
+from nifty_engine.core.interfaces import Candle
 from nifty_engine.data.fyers.rest_client import FyersRestClient
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.utils.timezone import now_ist
@@ -141,6 +142,31 @@ class HistoricalCandleManager:
 
         return results
 
+    def fetch_session_opening_candle(
+        self,
+        symbol: str,
+        session_date: date,
+    ) -> Optional[Candle]:
+        """Directly fetches and persists the confirmed 09:15:00 opening candle for session_date from FYERS,
+
+        bypassing latest-stored incremental sync shortcuts.
+        """
+        date_str = session_date.strftime("%Y-%m-%d")
+        try:
+            candles = self.rest_client.get_historical_candles_sync(
+                symbol=symbol,
+                resolution="5",
+                date_from=date_str,
+                date_to=date_str,
+            )
+            completed_candles = [c for c in candles if c.is_closed]
+            if completed_candles:
+                self.store.insert_candles_batch(completed_candles)
+            return self.store.get_session_opening_candle(symbol, session_date=session_date)
+        except Exception as e:
+            logger.warning("Failed direct 09:15 opening candle fetch for %s on %s: %s", symbol, date_str, e)
+            return None
+
     def get_daily_reference_levels(
         self,
         symbol: str,
@@ -165,12 +191,8 @@ class HistoricalCandleManager:
             if target_date < now.date() or (target_date == now.date() and now.time() >= time(9, 15)):
                 opening_candle = self.store.get_session_opening_candle(symbol, session_date=target_date)
                 if opening_candle is None:
-                    # Late startup fallback: query FYERS historical data for target_date to retrieve confirmed 09:15 bar
-                    try:
-                        self.sync_candles(symbol, "5m", days_back=1, end_date=target_date)
-                        opening_candle = self.store.get_session_opening_candle(symbol, session_date=target_date)
-                    except Exception as e:
-                        logger.warning("Failed on-demand 09:15 opening candle fetch for %s: %s", symbol, e)
+                    # Late startup fallback: directly query FYERS for target_date to retrieve confirmed 09:15 bar
+                    opening_candle = self.fetch_session_opening_candle(symbol, session_date=target_date)
 
                 if opening_candle is not None:
                     cdo_val = round(opening_candle.open, 2)

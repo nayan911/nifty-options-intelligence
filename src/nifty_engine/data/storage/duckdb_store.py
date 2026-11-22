@@ -279,7 +279,9 @@ class DuckDBStore(IStorageEngine):
         query = """
             SELECT symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed, observed_at
             FROM candles
-            WHERE symbol = ? AND timeframe IN ('D', '1D', 'd') AND CAST(timestamp AS DATE) < ? AND is_closed = TRUE
+            WHERE symbol = ? AND timeframe IN ('D', '1D', 'd')
+              AND CAST(timestamp AT TIME ZONE 'Asia/Kolkata' AS DATE) < ?
+              AND is_closed = TRUE
             ORDER BY timestamp DESC
             LIMIT 1
         """
@@ -305,14 +307,15 @@ class DuckDBStore(IStorageEngine):
     def get_session_opening_candle(self, symbol: str, session_date: date) -> Optional[Candle]:
         """Returns the confirmed 09:15:00 IST opening candle for the specified session date.
 
-        Prefers highest resolution first (1m -> 5m -> 15m).
+        Prefers highest resolution first (1m -> 5m -> 15m). Timezone-invariant across UTC and IST hosts.
         """
         query = """
             SELECT symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed, observed_at
             FROM candles
             WHERE symbol = ?
-              AND CAST(timestamp AS DATE) = ?
-              AND EXTRACT(HOUR FROM timestamp) = 9 AND EXTRACT(MINUTE FROM timestamp) = 15
+              AND CAST(timestamp AT TIME ZONE 'Asia/Kolkata' AS DATE) = ?
+              AND EXTRACT(HOUR FROM timestamp AT TIME ZONE 'Asia/Kolkata') = 9
+              AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'Asia/Kolkata') = 15
               AND is_closed = TRUE
             ORDER BY CASE timeframe WHEN '1m' THEN 1 WHEN '5m' THEN 2 WHEN '15m' THEN 3 ELSE 4 END ASC
             LIMIT 1

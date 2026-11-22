@@ -476,3 +476,33 @@ def test_late_startup_at_10am_missing_opening_candle_does_not_use_later_candle(s
     assert state.daily_reference_levels["CDO"] is None
     assert state.session_open_price is None
     assert not any(z.level_type == LevelType.CDO for z in snap_1000.sr_zones)
+
+
+def test_late_startup_recovers_missing_915_opening_candle_even_when_later_bars_exist(store, monkeypatch):
+    """Regression Test: Recover 09:15 opening candle from broker even if DuckDB already has a later bar from today (e.g. 09:55 AM)."""
+    sym = "NSE:NIFTY50-INDEX"
+
+    # Seed daily candle for Nov 20
+    store.insert_candle(make_candle(sym, "D", IST.localize(datetime(2026, 11, 20, 15, 30)), 25000.0, 25200.0, 24950.0, 25100.0))
+
+    # DuckDB already has 09:55 AM bar from today, but 09:15 AM opening bar is MISSING
+    c_0955 = make_candle(sym, "5m", IST.localize(datetime(2026, 11, 23, 9, 55)), 25170.0, 25185.0, 25165.0, 25180.0)
+    store.insert_candle(c_0955)
+
+    # Mock wall-clock time to 10:00 AM
+    mock_10am = IST.localize(datetime(2026, 11, 23, 10, 0))
+    monkeypatch.setattr("nifty_engine.data.historical_manager.now_ist", lambda: mock_10am)
+
+    # Broker returns the confirmed 09:15 AM candle
+    c_0915 = make_candle(sym, "5m", IST.localize(datetime(2026, 11, 23, 9, 15)), 25115.0, 25130.0, 25110.0, 25125.0)
+    mock_rest = MagicMock()
+    mock_rest.get_historical_candles_sync.return_value = [c_0915]
+    manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
+
+    # Query daily references
+    levels = manager.get_daily_reference_levels(sym, as_of_date=date(2026, 11, 23))
+
+    # Must NOT skip! Must call broker and recover the 09:15 opening price
+    mock_rest.get_historical_candles_sync.assert_called_once()
+    assert levels is not None
+    assert levels["CDO"] == 25115.0

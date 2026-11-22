@@ -453,3 +453,36 @@ def test_duckdb_schema_migration_from_legacy_database(tmp_path):
     assert row[10] == 80.5  # put_ask
 
     store.close()
+
+
+def test_get_session_opening_candle_timezone_invariant(store):
+    """Verify that get_session_opening_candle works identically under UTC and Asia/Kolkata connection timezones."""
+    sym = "NSE:NIFTY50-INDEX"
+    t_0915 = IST.localize(datetime(2026, 11, 23, 9, 15))
+    c = Candle(
+        symbol=sym,
+        timeframe="5m",
+        timestamp=t_0915,
+        open=25115.0,
+        high=25130.0,
+        low=25110.0,
+        close=25125.0,
+        volume=12000,
+        oi=500000,
+        is_closed=True,
+    )
+    store.insert_candle(c)
+
+    # 1. Under UTC connection timezone (common on GitHub Actions and cloud hosts)
+    store._conn.execute("SET TimeZone='UTC'")
+    c_utc = store.get_session_opening_candle(sym, session_date=date(2026, 11, 23))
+    assert c_utc is not None
+    assert c_utc.open == 25115.0
+    assert c_utc.high == 25130.0
+
+    # 2. Under Asia/Kolkata connection timezone
+    store._conn.execute("SET TimeZone='Asia/Kolkata'")
+    c_ist = store.get_session_opening_candle(sym, session_date=date(2026, 11, 23))
+    assert c_ist is not None
+    assert c_ist.open == 25115.0
+    assert c_ist.high == 25130.0
