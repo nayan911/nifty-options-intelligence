@@ -7,7 +7,7 @@ with dynamic freshness validation and zero hard vetoes on technical confluence s
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from typing import List, Optional
 
@@ -119,6 +119,7 @@ class DerivativesIntelligenceEngine:
         stop_loss: Optional[float] = None,
         target_1: Optional[float] = None,
         target_2: Optional[float] = None,
+        futures_expiry: Optional[date] = None,
         holding_minutes: Optional[float] = None,
     ) -> DerivativesAssessment:
         """Evaluates derivatives alignment for a given breakout direction and reference level.
@@ -293,11 +294,13 @@ class DerivativesIntelligenceEngine:
         if self.contract_selector is not None and not is_stale:
             actual_entry = entry_price if entry_price is not None else level_price
             fut_price = fut_analysis.price if fut_analysis else actual_entry
+            fut_exp = futures_expiry or (getattr(fut_analysis, "expiry", None) if fut_analysis else None)
             selected_contract = self.contract_selector.select_contract(
                 direction=direction,
                 spot_price=actual_entry,
                 chain_profile=oi_profile,
                 futures_price=fut_price,
+                futures_expiry=fut_exp,
                 as_of=as_of,
                 risk_points=risk_points,
                 target_points_t1=target_points_t1,

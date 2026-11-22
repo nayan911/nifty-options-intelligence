@@ -280,14 +280,14 @@ def test_second_order_taylor_premium_movement():
     )
 
     # Invariants:
-    # Target 1: delta move (0.50 * 30 = 15.0) + gamma (0.5 * 0.0004 * 900 = 0.18) - trading-day theta
-    trading_day_theta = 8.0 * (365.25 / 250.0)
-    expected_theta_loss = trading_day_theta * (30.0 / 375.0)
+    # Target 1: delta move (0.50 * 30 = 15.0) + gamma (0.5 * 0.0004 * 900 = 0.18) - calendar-time theta (8.0 * 30 / 1440 = 0.17)
+    calendar_theta_per_min = 8.0 / 1440.0
+    expected_theta_loss = round(calendar_theta_per_min * 30.0, 2)
     expected_gain_t1 = (0.50 * 30.0) + (0.5 * 0.0004 * 900.0) - expected_theta_loss
     assert abs(est_call.target_premium_t1 - (100.0 + expected_gain_t1)) < 0.1
     assert est_call.target_premium_t2 > est_call.target_premium_t1
     assert est_call.stop_loss_premium < 100.0
-    assert est_call.theta_cost == round(expected_theta_loss, 2)
+    assert est_call.theta_cost == expected_theta_loss
 
     # Quadratic spot move solver
     req_move = model.calculate_required_spot_move_for_premium_target(greeks_call, target_premium_gain=15.0)

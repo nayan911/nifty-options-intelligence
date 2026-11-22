@@ -11,7 +11,7 @@ Selects the single optimal option contract (strike, expiry, CE/PE) based on:
 import math
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pytz
 
@@ -48,6 +48,10 @@ class SelectedContract:
     selection_reasons: List[str]  # Quantitative rationale for selection
     premium_trajectory: PremiumEstimate  # Taylor-expansion premium targets
     execution_costs: ExecutionCosts  # Indian statutory fees and net R:R
+    bid_size: Optional[int] = None
+    ask_size: Optional[int] = None
+    quote_timestamp: Optional[datetime] = None
+    quote_age_seconds: float = 0.0
     holding_minutes: float = 30.0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -61,6 +65,10 @@ class SelectedContract:
             "ltp": self.ltp,
             "bid": self.bid,
             "ask": self.ask,
+            "bid_size": self.bid_size,
+            "ask_size": self.ask_size,
+            "quote_timestamp": self.quote_timestamp.isoformat() if self.quote_timestamp else None,
+            "quote_age_seconds": round(self.quote_age_seconds, 1),
             "spread": round(self.spread, 2),
             "spread_pct": round(self.spread_pct * 100.0, 2),
             "volume": self.volume,
@@ -86,7 +94,7 @@ class OptionContractSelector:
     """Evaluates option-chain strikes and selects the highest-scoring liquid contract.
 
     Strictly separates hard eligibility gates (real broker symbols, observed bid/ask quotes,
-    spread tolerance, volume liquidity, valid Greeks, and net R:R viability) from ranking.
+    quote freshness, spread tolerance, volume liquidity, valid Greeks, and net R:R viability) from ranking.
     """
 
     def __init__(
@@ -100,8 +108,11 @@ class OptionContractSelector:
         max_acceptable_delta: float = 0.70,
         max_acceptable_spread_pct: float = 0.03,  # Max 3% bid-ask spread
         min_liquidity_volume: int = 500,  # Minimum required trading volume
+        max_quote_age_seconds: float = 30.0,  # Strict quote freshness gate (max 30s)
+        quote_provider: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
         default_holding_minutes: float = 30.0,
         min_selection_score: float = 50.0,
+        instrument_master: Optional[Any] = None,
     ):
         self.greeks_engine = greeks_engine or GreeksEngine()
         self.cost_model = cost_model or PremiumCostModel()
@@ -112,8 +123,11 @@ class OptionContractSelector:
         self.max_acceptable_delta = max_acceptable_delta
         self.max_acceptable_spread_pct = max_acceptable_spread_pct
         self.min_liquidity_volume = min_liquidity_volume
+        self.max_quote_age_seconds = max_quote_age_seconds
+        self.quote_provider = quote_provider
         self.default_holding_minutes = default_holding_minutes
         self.min_selection_score = min_selection_score
+        self.instrument_master = instrument_master
 
     def compute_forward_price(
         self,
@@ -125,10 +139,12 @@ class OptionContractSelector:
     ) -> float:
         """Computes contract-expiry-matched forward price.
 
-        If a monthly futures price is provided and its expiry matches the contract expiry,
+        If a monthly futures price and its actual expiry are provided and match the contract expiry,
         uses futures_price directly.
-        If contract is a weekly option expiring before monthly futures, interpolates the
-        cost-of-carry basis so monthly futures basis is not falsely ascribed to a weekly option.
+        If contract is a weekly option expiring before monthly futures and futures_expiry is provided,
+        interpolates the cost-of-carry basis so monthly futures basis is not falsely ascribed to a weekly option.
+        If futures_expiry is None, uses clearly labeled theoretical cost-of-carry forward (S * exp(r * T))
+        rather than guessing an assumed maturity.
         """
         S = float(spot_price)
         T_opt = self.greeks_engine.compute_time_to_expiry_years(expiry, current_time)
@@ -137,24 +153,18 @@ class OptionContractSelector:
 
         r = self.greeks_engine.default_risk_free_rate
 
-        # If no futures price or futures price equals spot, use theoretical forward
-        if futures_price is None or abs(futures_price - S) < 0.1:
-            return round(S * math.exp(r * T_opt), 2)
-
-        # If futures expiry matches option expiry, use futures price directly
-        if futures_expiry and futures_expiry == expiry:
+        # 1. If futures expiry matches option expiry, use futures price directly
+        if futures_price and futures_expiry and futures_expiry == expiry:
             return float(futures_price)
 
-        # Interpolate cost of carry from monthly futures
-        T_fut = (
-            self.greeks_engine.compute_time_to_expiry_years(futures_expiry, current_time)
-            if futures_expiry
-            else max(T_opt, 25.0 / 365.25)
-        )
-        if T_fut > 0.001 and futures_price > 0.0:
-            basis_rate = math.log(futures_price / S) / T_fut
-            return round(S * math.exp(basis_rate * T_opt), 2)
+        # 2. If futures price and actual futures expiry are available, interpolate basis
+        if futures_price and futures_expiry and futures_price > 0.0:
+            T_fut = self.greeks_engine.compute_time_to_expiry_years(futures_expiry, current_time)
+            if T_fut > 0.001:
+                basis_rate = math.log(futures_price / S) / T_fut
+                return round(S * math.exp(basis_rate * T_opt), 2)
 
+        # 3. If futures_expiry is not supplied, use theoretical forward (no arbitrary maturity assumptions)
         return round(S * math.exp(r * T_opt), 2)
 
     def select_contract(
@@ -163,6 +173,7 @@ class OptionContractSelector:
         spot_price: float,
         chain_profile: OIProfile,
         futures_price: Optional[float] = None,
+        futures_expiry: Optional[date] = None,
         as_of: Optional[datetime] = None,
         risk_points: float = 20.0,
         target_points_t1: float = 30.0,
@@ -176,7 +187,7 @@ class OptionContractSelector:
         """Selects the single best option contract matching the technical breakout candidate.
 
         Enforces hard eligibility gates (real broker symbols, observed bid/ask quotes,
-        liquidity, Greeks, and net R:R viability) before scoring.
+        quote freshness, liquidity, Greeks, and net R:R viability) before scoring.
         """
         if not chain_profile or not chain_profile.strikes:
             return None
@@ -214,6 +225,7 @@ class OptionContractSelector:
             expiry=chain_profile.expiry,
             current_time=current_time,
             futures_price=futures_price,
+            futures_expiry=futures_expiry,
         )
 
         # Filter near-ATM strikes
@@ -234,6 +246,9 @@ class OptionContractSelector:
                 oi = strike_data.call_oi
                 bid = strike_data.call_bid
                 ask = strike_data.call_ask
+                bid_size = strike_data.call_bid_size
+                ask_size = strike_data.call_ask_size
+                quote_ts = strike_data.call_quote_timestamp or chain_profile.timestamp
                 broker_greeks = {
                     "iv": strike_data.call_iv,
                     "delta": strike_data.call_delta,
@@ -248,6 +263,9 @@ class OptionContractSelector:
                 oi = strike_data.put_oi
                 bid = strike_data.put_bid
                 ask = strike_data.put_ask
+                bid_size = strike_data.put_bid_size
+                ask_size = strike_data.put_ask_size
+                quote_ts = strike_data.put_quote_timestamp or chain_profile.timestamp
                 broker_greeks = {
                     "iv": strike_data.put_iv,
                     "delta": strike_data.put_delta,
@@ -260,18 +278,42 @@ class OptionContractSelector:
             if not symbol or not symbol.startswith("NSE:"):
                 continue
 
+            # Check for live quote refresh via quote_provider if supplied
+            if self.quote_provider is not None:
+                try:
+                    fresh_q = self.quote_provider(symbol)
+                    if fresh_q:
+                        if fresh_q.get("ltp") is not None:
+                            ltp = float(fresh_q["ltp"])
+                        if fresh_q.get("bid") is not None:
+                            bid = float(fresh_q["bid"])
+                        if fresh_q.get("ask") is not None:
+                            ask = float(fresh_q["ask"])
+                        if fresh_q.get("bid_size") is not None:
+                            bid_size = int(fresh_q["bid_size"])
+                        if fresh_q.get("ask_size") is not None:
+                            ask_size = int(fresh_q["ask_size"])
+                        quote_ts = fresh_q.get("timestamp") or fresh_q.get("quote_time") or current_time
+                except Exception:
+                    pass
+
             # HARD ELIGIBILITY GATE 2: Valid, observed broker bid and ask quotes
             if bid is None or ask is None or bid <= 0.0 or ask <= 0.0 or ask < bid:
+                continue
+
+            # HARD ELIGIBILITY GATE 3: Quote Freshness
+            quote_age = max(0.0, (current_time - quote_ts).total_seconds()) if quote_ts else 0.0
+            if quote_age > self.max_quote_age_seconds:
                 continue
 
             spread = round(ask - bid, 2)
             spread_pct = round(spread / ask, 4)
 
-            # HARD ELIGIBILITY GATE 3: Spread friction limit
+            # HARD ELIGIBILITY GATE 4: Spread friction limit
             if spread_pct > self.max_acceptable_spread_pct:
                 continue
 
-            # HARD ELIGIBILITY GATE 4: Liquidity volume threshold
+            # HARD ELIGIBILITY GATE 5: Liquidity volume threshold
             if volume < self.min_liquidity_volume:
                 continue
 
@@ -289,7 +331,7 @@ class OptionContractSelector:
                 broker_greeks=broker_greeks,
             )
 
-            # HARD ELIGIBILITY GATE 5: Valid Greeks and Delta limits
+            # HARD ELIGIBILITY GATE 6: Valid Greeks and Delta limits
             if not greeks.is_calculated and greeks.model_used != "FYERS":
                 continue
             if greeks.iv <= 0.001:
@@ -300,7 +342,7 @@ class OptionContractSelector:
             # Realistic entry premium: Buyer buys on the Ask price
             entry_premium = ask
 
-            # Estimate option premium trajectory based on exact technical entry/targets
+            # Estimate option premium trajectory with continuous calendar time / exact Black-76
             premium_est = self.cost_model.estimate_premium_trajectory(
                 greeks=greeks,
                 entry_premium=entry_premium,
@@ -310,6 +352,11 @@ class OptionContractSelector:
                 spot_sl=spot_sl,
                 direction=direction.value,
                 holding_minutes=hold_mins,
+                strike=strike,
+                expiry=chain_profile.expiry,
+                as_of=current_time,
+                greeks_engine=self.greeks_engine,
+                underlying_fwd=fwd_price,
             )
 
             # Evaluate exact asymmetric Indian execution costs
@@ -319,9 +366,11 @@ class OptionContractSelector:
                 stop_loss_premium=premium_est.stop_loss_premium,
                 bid_ask_spread=spread,
                 underlying=chain_profile.underlying,
+                symbol=symbol,
+                instrument_master=self.instrument_master,
             )
 
-            # HARD ELIGIBILITY GATE 6: Net Reward-to-Risk viability
+            # HARD ELIGIBILITY GATE 7: Net Reward-to-Risk viability
             if not costs.is_cost_viable:
                 continue
 
@@ -345,6 +394,10 @@ class OptionContractSelector:
                     ltp=round(mkt_price, 2),
                     bid=bid,
                     ask=ask,
+                    bid_size=bid_size,
+                    ask_size=ask_size,
+                    quote_timestamp=quote_ts,
+                    quote_age_seconds=round(quote_age, 1),
                     spread=spread,
                     spread_pct=spread_pct,
                     volume=volume,

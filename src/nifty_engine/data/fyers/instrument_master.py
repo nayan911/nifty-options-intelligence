@@ -235,3 +235,12 @@ class FyersInstrumentMaster(IInstrumentMaster):
         ]["expiry_date"].unique()
 
         return sorted(list(future_expiries))
+
+    def get_lot_size(self, symbol: str) -> Optional[int]:
+        """Fast lookup of official contract lot size by symbol from master."""
+        if self._df is None:
+            return None
+        matches = self._df[self._df["symbol"] == symbol]
+        if not matches.empty:
+            return int(matches.iloc[0]["lot"])
+        return None

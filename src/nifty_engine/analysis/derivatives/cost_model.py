@@ -9,7 +9,8 @@ Implements:
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional
+from datetime import date, datetime
+from typing import Any, Dict, Optional
 
 from nifty_engine.analysis.derivatives.greeks import OptionGreeks
 
@@ -122,20 +123,34 @@ class PremiumCostModel:
         self.default_slippage_points = default_slippage_points
         self.min_net_rr = min_net_rr
 
-    def get_lot_size(self, underlying: Optional[str] = None) -> int:
-        """Resolves official lot size by underlying instrument."""
-        if underlying:
-            u = underlying.upper()
-            if "BANKNIFTY" in u or "NIFTYBANK" in u:
-                return DEFAULT_LOT_SIZES.get("BANKNIFTY", 15)
-            elif "NIFTY" in u:
-                return DEFAULT_LOT_SIZES.get("NIFTY", 65)
-            elif "SENSEX" in u:
-                return DEFAULT_LOT_SIZES.get("SENSEX", 10)
-            elif "FINNIFTY" in u:
-                return DEFAULT_LOT_SIZES.get("FINNIFTY", 65)
-            elif "MIDCPNIFTY" in u:
-                return DEFAULT_LOT_SIZES.get("MIDCPNIFTY", 120)
+    def get_lot_size(
+        self,
+        underlying: Optional[str] = None,
+        symbol: Optional[str] = None,
+        instrument_master: Optional[Any] = None,
+    ) -> int:
+        """Resolves official lot size from instrument master or verified underlying mapping."""
+        if instrument_master and symbol:
+            try:
+                master_lot = instrument_master.get_lot_size(symbol)
+                if master_lot and master_lot > 0:
+                    return int(master_lot)
+            except Exception:
+                pass
+
+        query = (symbol or underlying or "").upper()
+        # Order matters! Specific names MUST be tested before generic substring "NIFTY"
+        if "BANKNIFTY" in query or "NIFTYBANK" in query:
+            return DEFAULT_LOT_SIZES.get("BANKNIFTY", 15)
+        elif "FINNIFTY" in query:
+            return DEFAULT_LOT_SIZES.get("FINNIFTY", 65)
+        elif "MIDCPNIFTY" in query:
+            return DEFAULT_LOT_SIZES.get("MIDCPNIFTY", 120)
+        elif "SENSEX" in query:
+            return DEFAULT_LOT_SIZES.get("SENSEX", 10)
+        elif "NIFTY" in query:
+            return DEFAULT_LOT_SIZES.get("NIFTY", 65)
+
         return self.lot_size
 
     def estimate_premium_trajectory(
@@ -149,8 +164,16 @@ class PremiumCostModel:
         direction: str,  # "BULLISH" or "BEARISH"
         holding_minutes: float = 30.0,
         iv_change_pts: float = 0.0,
+        strike: Optional[float] = None,
+        expiry: Optional[date] = None,
+        as_of: Optional[datetime] = None,
+        greeks_engine: Optional[Any] = None,
+        underlying_fwd: Optional[float] = None,
     ) -> PremiumEstimate:
-        """Estimates option premium movement using second-order Taylor expansion."""
+        """Estimates option premium movement under technical price targets using consistent
+
+        calendar-time units, supporting exact Black-76 theoretical exit repricing.
+        """
         p_entry = max(0.05, float(entry_premium))
 
         # Signed spot price move
@@ -160,16 +183,70 @@ class PremiumCostModel:
         ds_t2 = spot_target_t2 - spot_entry
         ds_sl = spot_sl - spot_entry
 
-        # Intraday theta cost:
-        # Standard trading year = 250 days; Indian session = 375 minutes (09:15 to 15:30 IST).
-        # Black-76 theta is conventionally computed per calendar day (1/365.25 of annual).
-        # We scale calendar theta to trading-day theta (365.25 / 250.0) so scaling by (holding_minutes / 375.0)
-        # represents exact intraday minute-by-minute session time decay.
-        trading_day_theta = abs(greeks.theta) * (365.25 / 250.0) if greeks.theta is not None else 0.0
-        time_frac = max(0.0, min(1.0, holding_minutes / 375.0))
-        theta_decay = round(trading_day_theta * time_frac, 2)
+        # Continuous calendar-time elapsed:
+        # In Black-76, time to expiry T is continuous in calendar years (365.25 days).
+        # Elapsed time over holding_minutes is holding_minutes / (365.25 * 1440.0) in years.
+        # Elapsed fraction of a calendar day is holding_minutes / 1440.0.
+        opt_type = "CE" if direction == "BULLISH" else "PE"
 
-        # Vega contribution
+        # Theoretical Black-76 repricing at exit timestamp if full parameters provided
+        if (
+            greeks_engine is not None
+            and strike is not None
+            and expiry is not None
+            and as_of is not None
+            and underlying_fwd is not None
+            and greeks.iv > 0.001
+        ):
+            t_entry = greeks_engine.compute_time_to_expiry_years(expiry, as_of)
+            delta_t_years = holding_minutes / (365.25 * 1440.0)
+            t_exit = max(0.00001, t_entry - delta_t_years)
+            sigma = greeks.iv
+            r = greeks_engine.default_risk_free_rate
+
+            fwd_entry = float(underlying_fwd)
+            fwd_t1 = max(1.0, fwd_entry + ds_t1)
+            fwd_t2 = max(1.0, fwd_entry + ds_t2)
+            fwd_sl = max(1.0, fwd_entry + ds_sl)
+
+            theo_entry = greeks_engine.calculate_black76_price(opt_type, fwd_entry, strike, t_entry, sigma, r)
+            theo_exit_flat = greeks_engine.calculate_black76_price(opt_type, fwd_entry, strike, t_exit, sigma, r)
+            theta_decay = max(0.0, round(theo_entry - theo_exit_flat, 2))
+
+            theo_t1 = greeks_engine.calculate_black76_price(opt_type, fwd_t1, strike, t_exit, sigma, r)
+            theo_t2 = greeks_engine.calculate_black76_price(opt_type, fwd_t2, strike, t_exit, sigma, r)
+            theo_sl = greeks_engine.calculate_black76_price(opt_type, fwd_sl, strike, t_exit, sigma, r)
+
+            # Trajectory moves anchored to entry premium
+            dp_theo_t1 = theo_t1 - theo_entry
+            dp_theo_t2 = theo_t2 - theo_entry
+            dp_theo_sl = theo_sl - theo_entry
+
+            p_t1 = max(0.05, p_entry + dp_theo_t1)
+            p_t2 = max(0.05, p_entry + dp_theo_t2)
+            p_sl = max(0.05, min(p_entry, p_entry + dp_theo_sl))
+
+            delta_pnl_t1 = greeks.delta * ds_t1
+            gamma_pnl_t1 = 0.5 * greeks.gamma * (ds_t1**2)
+            vega_pnl = greeks.vega * iv_change_pts
+
+            return PremiumEstimate(
+                initial_premium=round(p_entry, 2),
+                target_premium_t1=round(p_t1, 2),
+                target_premium_t2=round(p_t2, 2),
+                stop_loss_premium=round(p_sl, 2),
+                delta_contribution_t1=round(delta_pnl_t1, 2),
+                gamma_contribution_t1=round(gamma_pnl_t1, 2),
+                theta_cost=round(theta_decay, 2),
+                vega_contribution=round(vega_pnl, 2),
+                required_spot_move_t1=round(abs(ds_t1), 2),
+                confidence="THEORETICAL_EXACT",
+            )
+
+        # Standard Taylor expansion with continuous calendar time theta
+        # daily_theta (1/365.25 of annual) decays over (holding_minutes / 1440.0) of a calendar day
+        calendar_theta_per_min = abs(greeks.theta) / 1440.0 if greeks.theta is not None else 0.0
+        theta_decay = round(calendar_theta_per_min * holding_minutes, 2)
         vega_pnl = greeks.vega * iv_change_pts
 
         # 1. Target 1 trajectory
@@ -188,7 +265,6 @@ class PremiumCostModel:
         delta_pnl_sl = greeks.delta * ds_sl
         gamma_pnl_sl = 0.5 * greeks.gamma * (ds_sl**2)
         dp_sl = delta_pnl_sl + gamma_pnl_sl - theta_decay + vega_pnl
-        # Stop loss cannot exceed entry premium
         p_sl = max(0.05, min(p_entry, p_entry + dp_sl))
 
         return PremiumEstimate(
@@ -213,12 +289,16 @@ class PremiumCostModel:
         slippage_points: Optional[float] = None,
         lot_size: Optional[int] = None,
         underlying: Optional[str] = None,
+        symbol: Optional[str] = None,
+        instrument_master: Optional[Any] = None,
     ) -> ExecutionCosts:
         """Calculates comprehensive transaction fees, slippage, and net R:R metrics
 
         with separate, exact Target exit and Stop-Loss exit cost scenarios.
         """
-        lot = lot_size or self.get_lot_size(underlying)
+        lot = lot_size or self.get_lot_size(
+            underlying=underlying, symbol=symbol, instrument_master=instrument_master
+        )
         p_buy = max(0.05, float(entry_premium))
         p_target = max(0.05, float(target_premium_t1))
         p_sl = max(0.05, float(stop_loss_premium))

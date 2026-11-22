@@ -56,6 +56,9 @@ class StrikeOIAnalysis:
     call_symbol: str = ""
     call_bid: Optional[float] = None
     call_ask: Optional[float] = None
+    call_bid_size: Optional[int] = None
+    call_ask_size: Optional[int] = None
+    call_quote_timestamp: Optional[datetime] = None
     call_iv: Optional[float] = None
     call_delta: Optional[float] = None
     call_gamma: Optional[float] = None
@@ -76,6 +79,9 @@ class StrikeOIAnalysis:
     put_symbol: str = ""
     put_bid: Optional[float] = None
     put_ask: Optional[float] = None
+    put_bid_size: Optional[int] = None
+    put_ask_size: Optional[int] = None
+    put_quote_timestamp: Optional[datetime] = None
     put_iv: Optional[float] = None
     put_delta: Optional[float] = None
     put_gamma: Optional[float] = None
@@ -103,6 +109,7 @@ class FuturesOIAnalysis:
     directional_bias: DirectionalBias
     bar_close_time: Optional[datetime] = None
     available_at: Optional[datetime] = None
+    expiry: Optional[date] = None
 
     def __post_init__(self) -> None:
         if self.bar_close_time is None:
@@ -394,6 +401,9 @@ class OpenInterestAnalyzer:
                 c_sym = str(c_curr.get("symbol") or "")
                 c_bid = float(c_curr["bid"]) if c_curr.get("bid") is not None else None
                 c_ask = float(c_curr["ask"]) if c_curr.get("ask") is not None else None
+                c_bid_size = int(c_curr.get("bid_size") or c_curr.get("bid_qty") or 0) if (c_curr.get("bid_size") or c_curr.get("bid_qty")) else None
+                c_ask_size = int(c_curr.get("ask_size") or c_curr.get("ask_qty") or 0) if (c_curr.get("ask_size") or c_curr.get("ask_qty")) else None
+                c_quote_ts = c_curr.get("quote_timestamp") or snapshot.api_timestamp
                 c_iv = float(c_curr["iv"]) if c_curr.get("iv") is not None else None
                 c_delta = float(c_curr["delta"]) if c_curr.get("delta") is not None else None
                 c_gamma = float(c_curr["gamma"]) if c_curr.get("gamma") is not None else None
@@ -448,6 +458,9 @@ class OpenInterestAnalyzer:
                 c_sym = ""
                 c_bid = None
                 c_ask = None
+                c_bid_size = None
+                c_ask_size = None
+                c_quote_ts = snapshot.api_timestamp
                 c_iv = None
                 c_delta = None
                 c_gamma = None
@@ -470,6 +483,9 @@ class OpenInterestAnalyzer:
                 p_sym = str(p_curr.get("symbol") or "")
                 p_bid = float(p_curr["bid"]) if p_curr.get("bid") is not None else None
                 p_ask = float(p_curr["ask"]) if p_curr.get("ask") is not None else None
+                p_bid_size = int(p_curr.get("bid_size") or p_curr.get("bid_qty") or 0) if (p_curr.get("bid_size") or p_curr.get("bid_qty")) else None
+                p_ask_size = int(p_curr.get("ask_size") or p_curr.get("ask_qty") or 0) if (p_curr.get("ask_size") or p_curr.get("ask_qty")) else None
+                p_quote_ts = p_curr.get("quote_timestamp") or snapshot.api_timestamp
                 p_iv = float(p_curr["iv"]) if p_curr.get("iv") is not None else None
                 p_delta = float(p_curr["delta"]) if p_curr.get("delta") is not None else None
                 p_gamma = float(p_curr["gamma"]) if p_curr.get("gamma") is not None else None
@@ -524,6 +540,9 @@ class OpenInterestAnalyzer:
                 p_sym = ""
                 p_bid = None
                 p_ask = None
+                p_bid_size = None
+                p_ask_size = None
+                p_quote_ts = snapshot.api_timestamp
                 p_iv = None
                 p_delta = None
                 p_gamma = None
@@ -555,6 +574,9 @@ class OpenInterestAnalyzer:
                 call_symbol=c_sym,
                 call_bid=c_bid,
                 call_ask=c_ask,
+                call_bid_size=c_bid_size,
+                call_ask_size=c_ask_size,
+                call_quote_timestamp=c_quote_ts,
                 call_iv=c_iv,
                 call_delta=c_delta,
                 call_gamma=c_gamma,
@@ -572,6 +594,9 @@ class OpenInterestAnalyzer:
                 put_symbol=p_sym,
                 put_bid=p_bid,
                 put_ask=p_ask,
+                put_bid_size=p_bid_size,
+                put_ask_size=p_ask_size,
+                put_quote_timestamp=p_quote_ts,
                 put_iv=p_iv,
                 put_delta=p_delta,
                 put_gamma=p_gamma,
