@@ -14,7 +14,10 @@ from typing import Any, Dict, List, Optional, Set
 
 import pytz
 
-from nifty_engine.analysis.derivatives import DerivativesIntelligenceEngine
+from nifty_engine.analysis.derivatives import (
+    DerivativesIntelligenceEngine,
+    OptionContractSelector,
+)
 from nifty_engine.analysis.technical.breakouts import BreakoutContext
 from nifty_engine.analysis.technical.engine import (
     TechnicalAnalysisEngine,
@@ -53,7 +56,11 @@ class MarketDataEngine:
         self.running = True
 
         self.builder = RealtimeCandleBuilder(on_candle_close=self._on_candle_closed)
-        self.derivatives_engine = DerivativesIntelligenceEngine(primary_futures="NSE:NIFTY26NOVFUT")
+        self.contract_selector = OptionContractSelector(quote_provider=self._get_live_quote)
+        self.derivatives_engine = DerivativesIntelligenceEngine(
+            primary_futures="NSE:NIFTY26NOVFUT",
+            contract_selector=self.contract_selector,
+        )
         self.technical_engine = TechnicalAnalysisEngine(
             primary_index=settings.PRIMARY_INDEX,
             primary_futures="NSE:NIFTY26NOVFUT",
