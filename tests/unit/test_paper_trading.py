@@ -1471,6 +1471,135 @@ def test_on_candle_stale_bid_defers_to_pending_exit():
     assert p.pending_exit_reason is None
 
 
+def test_rest_quote_fallback_rejects_missing_or_stale_bid():
+    """Verify on-demand quote provider rejects missing/zero bids and stale broker timestamps."""
+    current_mock_quote = {"ltp": 80.0, "bid": 0.0, "ask": 81.0, "timestamp": None}
+
+    def mock_quote_provider(symbol: str):
+        return current_mock_quote
+
+    engine = PaperTradingEngine(
+        default_lots=1,
+        slippage_points=0.5,
+        max_quote_age_seconds=30.0,
+        quote_provider=mock_quote_provider,
+    )
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        stop_loss=25070.0,
+        entry_ltp=100.0,
+        ask=100.0,
+        sl_premium=85.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+
+    # Trigger time: 10:02:00 (quote from entry is stale, 120s old)
+    trigger_time = entry_ts + timedelta(minutes=2)
+
+    # 1. Quote provider returns zero bid (missing bid from broker): REJECTED
+    current_mock_quote = {"ltp": 80.0, "bid": 0.0, "ask": 81.0, "timestamp": trigger_time}
+    spot_tick = Tick(
+        symbol="NSE:NIFTY50-INDEX",
+        ltp=25060.0,  # Below spot SL
+        volume=1000,
+        local_timestamp=trigger_time,
+    )
+    events = engine.on_tick(spot_tick)
+    assert len(events) == 0
+    assert pos.is_exit_triggered is True
+
+    # 2. Quote provider returns positive bid but broker timestamp is 60s stale (> 30s): REJECTED
+    current_mock_quote = {
+        "ltp": 80.0,
+        "bid": 79.5,
+        "ask": 80.5,
+        "timestamp": trigger_time - timedelta(seconds=60),
+    }
+    events = engine.on_tick(spot_tick)
+    assert len(events) == 0
+    assert pos.status == PositionStatus.OPEN
+
+    # 3. Quote provider returns authentic positive bid with fresh timestamp (5s old): ACCEPTED
+    current_mock_quote = {
+        "ltp": 80.0,
+        "bid": 79.5,
+        "ask": 80.5,
+        "timestamp": trigger_time - timedelta(seconds=5),
+    }
+    events = engine.on_tick(spot_tick)
+    assert len(events) == 1
+    p, reason, exit_price = events[0]
+    assert reason == ExitReason.STOP_LOSS
+    assert exit_price == 79.0  # 79.5 bid - 0.5 slippage
+    assert p.status == PositionStatus.CLOSED
+
+
+def test_checkpoint_does_not_redundantly_write_unchanged_positions():
+    """Verify checkpointing avoids redundant DuckDB writes when position quote state is unchanged."""
+    save_count = 0
+
+    class MockStore(DuckDBStore):
+        def __init__(self):
+            super().__init__(db_path=":memory:")
+
+        def save_paper_position(self, pos_dict):
+            nonlocal save_count
+            save_count += 1
+            return super().save_paper_position(pos_dict)
+
+    store = MockStore()
+    engine = PaperTradingEngine(store=store, default_lots=1, checkpoint_interval_seconds=1.0)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        stop_loss=25070.0,
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+    # 1 save from initial candidate creation
+    assert save_count == 1
+
+    # Call checkpoint multiple times at 10:00:05, 10:00:10, 10:00:15 without new quotes
+    for secs in (5, 10, 15):
+        engine.checkpoint_active_positions(
+            force=False,
+            current_time=entry_ts + timedelta(seconds=secs),
+        )
+    # save_count MUST remain 1 because no new quote/candle telemetry arrived!
+    assert save_count == 1
+
+    # Now a new option tick arrives at 10:00:20
+    tick_time = entry_ts + timedelta(seconds=20)
+    tick = Tick(
+        symbol=pos.symbol,
+        ltp=100.5,
+        bid=100.0,
+        ask=101.0,
+        volume=1000,
+        local_timestamp=tick_time,
+    )
+    engine.on_tick(tick)
+    # Because quote state mutated and > 1.0s elapsed, checkpoint triggers exactly once
+    assert save_count == 2
+
+    # Subsequent checkpoints with no new quotes do NOT re-write
+    for secs in (25, 30):
+        engine.checkpoint_active_positions(
+            force=False,
+            current_time=entry_ts + timedelta(seconds=secs),
+        )
+    assert save_count == 2
+    store.close()
+
+
 
 
 

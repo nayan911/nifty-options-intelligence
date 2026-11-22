@@ -10,6 +10,8 @@ import uuid
 from datetime import date, datetime, time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+import pytz
+
 from nifty_engine.analysis.derivatives.cost_model import PremiumCostModel
 from nifty_engine.analysis.technical.multi_timeframe import TechnicalCandidate
 from nifty_engine.core.interfaces import Candle, IStorageEngine, Tick
@@ -75,7 +77,9 @@ class PaperTradingEngine:
         self.closed_positions: List[PaperPosition] = []
         self.orders: Dict[str, PaperOrder] = {}  # order_id -> PaperOrder
         self.subscribed_option_symbols: Set[str] = set()
-        self._last_checkpoint_times: Dict[str, datetime] = {}
+        self._last_persisted_time: Dict[str, datetime] = {}
+        self._last_persisted_quote_time: Dict[str, Optional[datetime]] = {}
+        self._last_persisted_candle_time: Dict[str, Optional[datetime]] = {}
 
         # Cumulative P&L and cost tracking
         self.total_realized_gross_pnl: float = 0.0
@@ -238,7 +242,9 @@ class PaperTradingEngine:
 
         self.active_positions[position_id] = position
         self.subscribed_option_symbols.add(contract.symbol)
-        self._last_checkpoint_times[position_id] = now
+        self._last_persisted_time[position_id] = now
+        self._last_persisted_quote_time[position_id] = now
+        self._last_persisted_candle_time[position_id] = None
 
         # Persist to DuckDB if available
         if self.store is not None:
@@ -311,20 +317,15 @@ class PaperTradingEngine:
                 pos.net_pnl = unrealized_gross - pos.total_costs
 
                 # Controlled-interval checkpoint: automatically persist updated quote state to DuckDB
-                last_save = self._last_checkpoint_times.get(pos.position_id, pos.entry_time)
-                if (current_time - last_save).total_seconds() >= self.checkpoint_interval_seconds:
-                    self._save_position(pos)
+                last_persisted = self._last_persisted_time.get(pos.position_id, pos.entry_time)
+                if (current_time - last_persisted).total_seconds() >= self.checkpoint_interval_seconds:
+                    self._save_position(pos, persist_time=current_time)
 
                 # Handle pending triggered exits awaiting fresh quote
                 if pos.is_exit_triggered and pos.pending_exit_reason:
                     # Require fresh bid before executing pending sell exits
-                    if not bid_fresh and self.quote_provider is not None:
-                        fresh_quote = self._fetch_fresh_quote(pos.symbol)
-                        if fresh_quote and fresh_quote.get("bid", 0) > 0:
-                            pos.current_bid = fresh_quote["bid"]
-                            pos.last_bid_time = current_time
-                            pos.last_quote_time = current_time
-                            bid_fresh = True
+                    if not bid_fresh:
+                        bid_fresh = self._apply_fresh_quote(pos, current_time)
 
                     if bid_fresh and pos.current_bid and pos.current_bid > 0:
                         reason = pos.pending_exit_reason
@@ -347,13 +348,8 @@ class PaperTradingEngine:
 
                 if t2_hit or t1_hit or sl_hit:
                     # Require fresh bid before simulating sell fill
-                    if not bid_fresh and self.quote_provider is not None:
-                        fresh_quote = self._fetch_fresh_quote(pos.symbol)
-                        if fresh_quote and fresh_quote.get("bid", 0) > 0:
-                            pos.current_bid = fresh_quote["bid"]
-                            pos.last_bid_time = current_time
-                            pos.last_quote_time = current_time
-                            bid_fresh = True
+                    if not bid_fresh:
+                        bid_fresh = self._apply_fresh_quote(pos, current_time)
 
                     if t2_hit:
                         if bid_fresh and pos.current_bid and pos.current_bid > 0:
@@ -363,7 +359,7 @@ class PaperTradingEngine:
                         else:
                             pos.is_exit_triggered = True
                             pos.pending_exit_reason = ExitReason.TARGET_2
-                            self._save_position(pos)
+                            self._save_position(pos, persist_time=current_time)
                             logger.info("Option T2 reached for %s. Option bid stale (age %.1fs). Awaiting fresh bid.", pos.symbol, pos.bid_age_seconds(current_time))
 
                     elif t1_hit:
@@ -374,7 +370,7 @@ class PaperTradingEngine:
                         else:
                             pos.is_exit_triggered = True
                             pos.pending_exit_reason = ExitReason.TARGET_1
-                            self._save_position(pos)
+                            self._save_position(pos, persist_time=current_time)
                             logger.info("Option T1 reached for %s. Option bid stale (age %.1fs). Awaiting fresh bid.", pos.symbol, pos.bid_age_seconds(current_time))
 
                     elif sl_hit:
@@ -386,7 +382,7 @@ class PaperTradingEngine:
                         else:
                             pos.is_exit_triggered = True
                             pos.pending_exit_reason = reason
-                            self._save_position(pos)
+                            self._save_position(pos, persist_time=current_time)
                             logger.info("Option SL hit for %s. Option bid stale (age %.1fs). Awaiting fresh bid.", pos.symbol, pos.bid_age_seconds(current_time))
 
             # 2. Underlying Spot Tick: Evaluate spot-level technical stop & target invalidation
@@ -404,17 +400,9 @@ class PaperTradingEngine:
 
                 # Validate option bid freshness before executing sell fill
                 bid_fresh = pos.has_fresh_bid(current_time, self.max_quote_age_seconds)
+                if not bid_fresh:
+                    bid_fresh = self._apply_fresh_quote(pos, current_time)
                 opt_price = pos.current_bid if (bid_fresh and pos.current_bid is not None and pos.current_bid > 0) else 0.0
-
-                # Try on-demand quote provider if bid is stale or missing
-                if not bid_fresh and self.quote_provider is not None:
-                    fresh_quote = self._fetch_fresh_quote(pos.symbol)
-                    if fresh_quote and fresh_quote.get("bid", 0) > 0:
-                        opt_price = fresh_quote["bid"]
-                        pos.current_bid = opt_price
-                        pos.last_bid_time = current_time
-                        pos.last_quote_time = current_time
-                        bid_fresh = True
 
                 # Spot Stop Loss Breach
                 if spot_sl_hit:
@@ -426,7 +414,7 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = reason
-                        self._save_position(pos)
+                        self._save_position(pos, persist_time=current_time)
                         logger.info("Spot SL breached for %s. Option bid stale (age %.1fs). Awaiting fresh bid.", pos.symbol, pos.bid_age_seconds(current_time))
                     continue
 
@@ -439,7 +427,7 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = ExitReason.TARGET_2
-                        self._save_position(pos)
+                        self._save_position(pos, persist_time=current_time)
                         logger.info("Spot T2 reached for %s. Option bid stale (age %.1fs). Awaiting fresh bid.", pos.symbol, pos.bid_age_seconds(current_time))
                     continue
 
@@ -452,7 +440,7 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = ExitReason.TARGET_1
-                        self._save_position(pos)
+                        self._save_position(pos, persist_time=current_time)
                         logger.info("Spot T1 reached for %s. Option bid stale (age %.1fs). Awaiting fresh bid.", pos.symbol, pos.bid_age_seconds(current_time))
 
         return events
@@ -505,17 +493,9 @@ class PaperTradingEngine:
 
                 # Validate executable bid freshness
                 bid_fresh = pos.has_fresh_bid(current_time, self.max_quote_age_seconds)
+                if not bid_fresh:
+                    bid_fresh = self._apply_fresh_quote(pos, current_time)
                 opt_price = pos.current_bid if (bid_fresh and pos.current_bid is not None and pos.current_bid > 0) else 0.0
-
-                # On-demand quote lookup if bid is stale or missing
-                if not bid_fresh and self.quote_provider is not None:
-                    fresh_quote = self._fetch_fresh_quote(pos.symbol)
-                    if fresh_quote and fresh_quote.get("bid", 0) > 0:
-                        opt_price = fresh_quote["bid"]
-                        pos.current_bid = opt_price
-                        pos.last_bid_time = current_time
-                        pos.last_quote_time = current_time
-                        bid_fresh = True
 
                 # Process pending exit if bid has become fresh
                 if pos.is_exit_triggered and pos.pending_exit_reason:
@@ -548,7 +528,7 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = reason
-                        self._save_position(pos)
+                        self._save_position(pos, persist_time=current_time)
                         logger.info(
                             "Intrabar SL low breached for %s (low=%.2f <= sl=%.2f). Option bid stale. Retaining pending exit.",
                             pos.symbol,
@@ -572,7 +552,7 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = ExitReason.TARGET_2
-                        self._save_position(pos)
+                        self._save_position(pos, persist_time=current_time)
                         logger.info(
                             "Intrabar T2 reached for %s (high=%.2f >= t2=%.2f). Option bid stale. Retaining pending exit.",
                             pos.symbol,
@@ -595,7 +575,7 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = ExitReason.TARGET_1
-                        self._save_position(pos)
+                        self._save_position(pos, persist_time=current_time)
                         logger.info(
                             "Intrabar T1 reached for %s (high=%.2f >= t1=%.2f). Option bid stale. Retaining pending exit.",
                             pos.symbol,
@@ -607,20 +587,14 @@ class PaperTradingEngine:
             elif "INDEX" in sym and pos.underlying in sym:
                 is_call = pos.option_type == "CE"
                 bid_fresh = pos.has_fresh_bid(current_time, self.max_quote_age_seconds)
+                if not bid_fresh:
+                    bid_fresh = self._apply_fresh_quote(pos, current_time)
                 opt_price = pos.current_bid if (bid_fresh and pos.current_bid is not None and pos.current_bid > 0) else 0.0
 
                 # Adverse-first check: spot SL breach
                 spot_sl_hit = (candle.low <= pos.spot_sl) if is_call else (candle.high >= pos.spot_sl)
                 if spot_sl_hit:
                     reason = ExitReason.TRAILING_STOP if pos.is_breakeven_sl_active else ExitReason.STOP_LOSS
-                    if not bid_fresh and self.quote_provider is not None:
-                        fresh_quote = self._fetch_fresh_quote(pos.symbol)
-                        if fresh_quote and fresh_quote.get("bid", 0) > 0:
-                            opt_price = fresh_quote["bid"]
-                            pos.current_bid = opt_price
-                            pos.last_bid_time = current_time
-                            pos.last_quote_time = current_time
-                            bid_fresh = True
                     if bid_fresh and opt_price > 0:
                         ev = self._execute_full_exit(pos, opt_price, reason, current_time, notes="Intrabar spot SL breach")
                         if ev:
@@ -628,20 +602,12 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = reason
-                        self._save_position(pos)
+                        self._save_position(pos, persist_time=current_time)
                     continue
 
                 # Favorable check: Target 2
                 spot_t2_hit = (candle.high >= pos.spot_target_t2) if is_call else (candle.low <= pos.spot_target_t2)
                 if spot_t2_hit:
-                    if not bid_fresh and self.quote_provider is not None:
-                        fresh_quote = self._fetch_fresh_quote(pos.symbol)
-                        if fresh_quote and fresh_quote.get("bid", 0) > 0:
-                            opt_price = fresh_quote["bid"]
-                            pos.current_bid = opt_price
-                            pos.last_bid_time = current_time
-                            pos.last_quote_time = current_time
-                            bid_fresh = True
                     if bid_fresh and opt_price > 0:
                         ev = self._execute_full_exit(pos, opt_price, ExitReason.TARGET_2, current_time, notes="Intrabar spot T2 reached")
                         if ev:
@@ -649,20 +615,12 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = ExitReason.TARGET_2
-                        self._save_position(pos)
+                        self._save_position(pos, persist_time=current_time)
                     continue
 
                 # Favorable check: Target 1
                 spot_t1_hit = (candle.high >= pos.spot_target_t1) if is_call else (candle.low <= pos.spot_target_t1)
                 if not pos.is_t1_hit and spot_t1_hit:
-                    if not bid_fresh and self.quote_provider is not None:
-                        fresh_quote = self._fetch_fresh_quote(pos.symbol)
-                        if fresh_quote and fresh_quote.get("bid", 0) > 0:
-                            opt_price = fresh_quote["bid"]
-                            pos.current_bid = opt_price
-                            pos.last_bid_time = current_time
-                            pos.last_quote_time = current_time
-                            bid_fresh = True
                     if bid_fresh and opt_price > 0:
                         ev = self._execute_partial_exit_t1(pos, opt_price, current_time, notes="Intrabar spot T1 reached")
                         if ev:
@@ -670,7 +628,7 @@ class PaperTradingEngine:
                     else:
                         pos.is_exit_triggered = True
                         pos.pending_exit_reason = ExitReason.TARGET_1
-                        self._save_position(pos)
+                        self._save_position(pos, persist_time=current_time)
 
         # Controlled-interval checkpoint active positions
         self.checkpoint_active_positions(force=False, current_time=current_time)
@@ -687,17 +645,9 @@ class PaperTradingEngine:
                 continue
 
             bid_fresh = pos.has_fresh_bid(current_time, self.max_quote_age_seconds)
+            if not bid_fresh:
+                bid_fresh = self._apply_fresh_quote(pos, current_time)
             opt_price = pos.current_bid if (bid_fresh and pos.current_bid is not None and pos.current_bid > 0) else 0.0
-
-            # Try quote provider if stale
-            if not bid_fresh and self.quote_provider is not None:
-                fresh_quote = self._fetch_fresh_quote(pos.symbol)
-                if fresh_quote and fresh_quote.get("bid", 0) > 0:
-                    opt_price = fresh_quote["bid"]
-                    pos.current_bid = opt_price
-                    pos.last_bid_time = current_time
-                    pos.last_quote_time = current_time
-                    bid_fresh = True
 
             # 1. EOD Auto Square-Off at 15:15 IST
             if is_eod:
@@ -737,7 +687,7 @@ class PaperTradingEngine:
                 else:
                     pos.is_exit_triggered = True
                     pos.pending_exit_reason = ExitReason.TIMEOUT
-                    self._save_position(pos)
+                    self._save_position(pos, persist_time=current_time)
                     logger.info("Holding timeout reached for %s. Option bid stale (age %.1fs). Awaiting fresh quote.", pos.symbol, pos.bid_age_seconds(current_time))
 
         # Controlled-interval checkpoint active positions
@@ -930,12 +880,15 @@ class PaperTradingEngine:
 
         return (pos, reason, exit_price)
 
-    def _save_position(self, pos: PaperPosition) -> None:
+    def _save_position(self, pos: PaperPosition, persist_time: Optional[datetime] = None) -> None:
         """Persists position state transition to DuckDB store if available."""
         if self.store is not None:
             try:
                 self.store.save_paper_position(pos.to_dict())
-                self._last_checkpoint_times[pos.position_id] = pos.last_quote_time or pos.entry_time or now_ist()
+                actual_time = persist_time or now_ist()
+                self._last_persisted_time[pos.position_id] = actual_time
+                self._last_persisted_quote_time[pos.position_id] = pos.last_quote_time
+                self._last_persisted_candle_time[pos.position_id] = pos.last_candle_time
             except Exception as e:
                 logger.warning("Failed to persist paper position %s to DuckDB: %s", pos.position_id, e)
 
@@ -951,11 +904,16 @@ class PaperTradingEngine:
         for pos in list(self.active_positions.values()):
             if pos.status == PositionStatus.CLOSED:
                 continue
-            last_save = self._last_checkpoint_times.get(pos.position_id, pos.entry_time)
-            if force or (now - last_save).total_seconds() >= self.checkpoint_interval_seconds:
-                self._save_position(pos)
+            last_persisted = self._last_persisted_time.get(pos.position_id, pos.entry_time)
+            if force or (now - last_persisted).total_seconds() >= self.checkpoint_interval_seconds:
+                has_updates = (
+                    pos.last_quote_time != self._last_persisted_quote_time.get(pos.position_id)
+                    or pos.last_candle_time != self._last_persisted_candle_time.get(pos.position_id)
+                )
+                if force or has_updates:
+                    self._save_position(pos, persist_time=now)
 
-    def _fetch_fresh_quote(self, symbol: str) -> Optional[Dict[str, float]]:
+    def _fetch_fresh_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Queries quote_provider for an on-demand quote when external triggers fire."""
         if self.quote_provider is None:
             return None
@@ -967,12 +925,64 @@ class PaperTradingEngine:
                 if res and res.get("s") == "ok" and res.get("d"):
                     val = res["d"][0].get("v", {})
                     ltp = float(val.get("lp", 0.0))
-                    bid = float(val.get("bid", 0.0) or 0.0)
-                    ask = float(val.get("ask", 0.0) or 0.0)
-                    return {"ltp": ltp, "bid": bid, "ask": ask}
+                    raw_bid = val.get("bid")
+                    raw_ask = val.get("ask")
+                    bid = float(raw_bid) if (raw_bid is not None and float(raw_bid) > 0) else 0.0
+                    ask = float(raw_ask) if (raw_ask is not None and float(raw_ask) > 0) else 0.0
+                    quote_ts = None
+                    tt = val.get("tt")
+                    if tt is not None and int(tt) > 0:
+                        try:
+                            quote_ts = datetime.fromtimestamp(int(tt), tz=pytz.timezone("Asia/Kolkata"))
+                        except Exception:
+                            quote_ts = None
+                    return {"ltp": ltp, "bid": bid, "ask": ask, "timestamp": quote_ts}
         except Exception as e:
             logger.debug("Failed to fetch on-demand quote for %s: %s", symbol, e)
         return None
+
+    def _apply_fresh_quote(
+        self,
+        pos: PaperPosition,
+        current_time: datetime,
+    ) -> bool:
+        """Attempts to fetch an on-demand quote and apply it if the bid is authentic, positive, and fresh.
+
+        Returns True if a valid, fresh bid was successfully applied.
+        """
+        if self.quote_provider is None:
+            return False
+        fresh_quote = self._fetch_fresh_quote(pos.symbol)
+        if not fresh_quote:
+            return False
+
+        raw_bid = fresh_quote.get("bid")
+        bid = float(raw_bid) if (raw_bid is not None and float(raw_bid) > 0) else 0.0
+        if bid <= 0.0:
+            logger.debug("Rejected on-demand quote for %s: missing or non-positive bid (%.2f)", pos.symbol, bid)
+            return False
+
+        # Validate broker quote timestamp freshness if provided
+        quote_ts = fresh_quote.get("timestamp") or current_time
+        quote_age = max(0.0, (current_time - quote_ts).total_seconds())
+        if quote_age > self.max_quote_age_seconds:
+            logger.debug(
+                "Rejected on-demand quote for %s: quote timestamp is stale (age %.1fs > %.1fs)",
+                pos.symbol,
+                quote_age,
+                self.max_quote_age_seconds,
+            )
+            return False
+
+        pos.current_bid = bid
+        pos.last_bid_time = quote_ts
+        pos.last_quote_time = quote_ts
+        if fresh_quote.get("ltp") is not None and float(fresh_quote["ltp"]) > 0:
+            pos.current_ltp = float(fresh_quote["ltp"])
+        if fresh_quote.get("ask") is not None and float(fresh_quote["ask"]) > 0:
+            pos.current_ask = float(fresh_quote["ask"])
+            pos.last_ask_time = quote_ts
+        return True
 
     def _recover_from_store(self) -> None:
         """Reconstructs active positions, closed positions, and cumulative accounting from DuckDB on startup."""
@@ -1005,7 +1015,9 @@ class PaperTradingEngine:
                     pos = self._row_to_position(row, orders=orders_by_pos.get(str(row.get("position_id")), []))
                     self.active_positions[pos.position_id] = pos
                     self.subscribed_option_symbols.add(pos.symbol)
-                    self._last_checkpoint_times[pos.position_id] = pos.last_quote_time or pos.entry_time
+                    self._last_persisted_time[pos.position_id] = now_ist()
+                    self._last_persisted_quote_time[pos.position_id] = pos.last_quote_time
+                    self._last_persisted_candle_time[pos.position_id] = pos.last_candle_time
 
             logger.info(
                 "Recovered %d active and %d closed paper positions from DuckDB. Historical Net P&L: ₹%.2f",

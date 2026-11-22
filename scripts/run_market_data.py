@@ -102,7 +102,7 @@ class MarketDataEngine:
         self.option_chain_failure_count: int = 0
         self.option_chain_last_error: Optional[str] = None
 
-    def _get_live_quote(self, symbol: str) -> Optional[Dict[str, float]]:
+    def _get_live_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Provides on-demand authentic broker quote snapshot for paper engine."""
         try:
             client = self.auth.get_client()
@@ -110,9 +110,27 @@ class MarketDataEngine:
             if q_res and q_res.get("s") == "ok" and q_res.get("d"):
                 val = q_res["d"][0].get("v", {})
                 ltp = float(val.get("lp", 0.0))
-                bid = float(val.get("bid", ltp))
-                ask = float(val.get("ask", ltp))
-                return {"ltp": ltp, "bid": bid, "ask": ask}
+                # Authentic broker bid/ask depth only: NEVER substitute LTP for bid or ask
+                raw_bid = val.get("bid")
+                raw_ask = val.get("ask")
+                bid = float(raw_bid) if (raw_bid is not None and float(raw_bid) > 0) else 0.0
+                ask = float(raw_ask) if (raw_ask is not None and float(raw_ask) > 0) else 0.0
+
+                # Extract authentic broker quote timestamp if available
+                quote_ts = None
+                tt = val.get("tt")
+                if tt is not None and int(tt) > 0:
+                    try:
+                        quote_ts = datetime.fromtimestamp(int(tt), tz=pytz.timezone("Asia/Kolkata"))
+                    except Exception:
+                        quote_ts = None
+
+                return {
+                    "ltp": ltp,
+                    "bid": bid,
+                    "ask": ask,
+                    "timestamp": quote_ts,
+                }
         except Exception as e:
             logger.debug("Failed on-demand quote lookup for %s: %s", symbol, e)
         return None
