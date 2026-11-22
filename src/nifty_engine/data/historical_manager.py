@@ -159,11 +159,27 @@ class HistoricalCandleManager:
                 logger.warning("Failed on-demand daily candle fetch for %s: %s", symbol, e)
 
         if daily_candle:
+            cdo_val: Optional[float] = None
+            now = now_ist()
+            # If target_date is in the past, or target_date is today and session has already commenced (>= 09:15 IST)
+            if target_date < now.date() or (target_date == now.date() and now.time() >= time(9, 15)):
+                opening_candle = self.store.get_session_opening_candle(symbol, session_date=target_date)
+                if opening_candle is None:
+                    # Late startup fallback: query FYERS historical data for target_date to retrieve confirmed 09:15 bar
+                    try:
+                        self.sync_candles(symbol, "5m", days_back=1, end_date=target_date)
+                        opening_candle = self.store.get_session_opening_candle(symbol, session_date=target_date)
+                    except Exception as e:
+                        logger.warning("Failed on-demand 09:15 opening candle fetch for %s: %s", symbol, e)
+
+                if opening_candle is not None:
+                    cdo_val = round(opening_candle.open, 2)
+
             return {
                 "PDH": round(daily_candle.high, 2),
                 "PDL": round(daily_candle.low, 2),
                 "PDC": round(daily_candle.close, 2),
-                "CDO": None,
+                "CDO": cdo_val,
             }
 
         return None

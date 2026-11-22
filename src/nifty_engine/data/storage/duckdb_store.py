@@ -302,6 +302,40 @@ class DuckDBStore(IStorageEngine):
                 )
         return None
 
+    def get_session_opening_candle(self, symbol: str, session_date: date) -> Optional[Candle]:
+        """Returns the confirmed 09:15:00 IST opening candle for the specified session date.
+
+        Prefers highest resolution first (1m -> 5m -> 15m).
+        """
+        query = """
+            SELECT symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed, observed_at
+            FROM candles
+            WHERE symbol = ?
+              AND CAST(timestamp AS DATE) = ?
+              AND EXTRACT(HOUR FROM timestamp) = 9 AND EXTRACT(MINUTE FROM timestamp) = 15
+              AND is_closed = TRUE
+            ORDER BY CASE timeframe WHEN '1m' THEN 1 WHEN '5m' THEN 2 WHEN '15m' THEN 3 ELSE 4 END ASC
+            LIMIT 1
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            row = cur.execute(query, [symbol, session_date]).fetchone()
+            if row:
+                return Candle(
+                    symbol=row[0],
+                    timeframe=row[1],
+                    timestamp=row[2],
+                    open=row[3],
+                    high=row[4],
+                    low=row[5],
+                    close=row[6],
+                    volume=row[7],
+                    oi=row[8],
+                    is_closed=row[9],
+                    observed_at=row[10],
+                )
+        return None
+
     def get_recent_candles(
         self,
         symbol: str,

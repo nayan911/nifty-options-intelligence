@@ -386,3 +386,93 @@ def test_first_live_opening_candle_populates_cdo_sr_zones_across_timeframes():
     cdo_1m_2 = next((z for z in snap_1m_2.sr_zones if z.level_type == LevelType.CDO), None)
     assert cdo_1m_2 is not None
     assert cdo_1m_2.nominal_price == 25115.0
+
+
+def test_late_startup_at_10am_retrieves_confirmed_915_opening_candle(store, monkeypatch):
+    """Regression Test: Startup at 10:00 AM retrieves confirmed 09:15 candle and does not use 10:00 AM open."""
+    sym = "NSE:NIFTY50-INDEX"
+
+    # Seed daily candle for Nov 20
+    store.insert_candle(make_candle(sym, "D", IST.localize(datetime(2026, 11, 20, 15, 30)), 25000.0, 25200.0, 24950.0, 25100.0))
+    # Seed 09:15 AM opening candle for Monday Nov 23 (open = 25115.0)
+    c_0915 = make_candle(sym, "5m", IST.localize(datetime(2026, 11, 23, 9, 15)), 25115.0, 25130.0, 25110.0, 25125.0)
+    store.insert_candle(c_0915)
+
+    # Mock wall-clock time to 10:00 AM on Monday Nov 23
+    mock_10am = IST.localize(datetime(2026, 11, 23, 10, 0))
+    monkeypatch.setattr("nifty_engine.data.historical_manager.now_ist", lambda: mock_10am)
+
+    mock_rest = MagicMock()
+    manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
+
+    levels = manager.get_daily_reference_levels(sym, as_of_date=date(2026, 11, 23))
+    assert levels is not None
+    assert levels["PDH"] == 25200.0
+    # CDO must be retrieved from the confirmed 09:15 candle!
+    assert levels["CDO"] == 25115.0
+
+    engine = TechnicalAnalysisEngine(
+        primary_index=sym,
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    engine.prepare_session(date(2026, 11, 23))
+    engine.set_daily_references(sym, pdh=levels["PDH"], pdl=levels["PDL"], pdc=levels["PDC"], cdo=levels["CDO"])
+
+    state = engine.states[sym]
+    assert state.daily_reference_levels["CDO"] == 25115.0
+    assert state.session_open_price == 25115.0
+
+    # First live candle seen by engine arrives from 10:00 AM with open = 25180.0
+    c_1000 = make_candle(sym, "5m", IST.localize(datetime(2026, 11, 23, 10, 0)), 25180.0, 25195.0, 25175.0, 25190.0)
+    snap_1000 = engine.on_candle(c_1000)
+    assert snap_1000 is not None
+
+    # CRITICAL: CDO must remain 25115.0, NOT 25180.0!
+    assert state.daily_reference_levels["CDO"] == 25115.0
+    assert state.session_open_price == 25115.0
+    cdo_zone = next((z for z in snap_1000.sr_zones if z.level_type == LevelType.CDO), None)
+    assert cdo_zone is not None
+    assert cdo_zone.nominal_price == 25115.0
+
+
+def test_late_startup_at_10am_missing_opening_candle_does_not_use_later_candle(store, monkeypatch):
+    """Regression Test: If 09:15 opening candle is completely missing, 10:00 AM candle does NOT become CDO."""
+    sym = "NSE:NIFTY50-INDEX"
+
+    # Seed daily candle for Nov 20, but DO NOT seed any 09:15 candle for Nov 23
+    store.insert_candle(make_candle(sym, "D", IST.localize(datetime(2026, 11, 20, 15, 30)), 25000.0, 25200.0, 24950.0, 25100.0))
+
+    # Mock wall-clock time to 10:00 AM on Monday Nov 23
+    mock_10am = IST.localize(datetime(2026, 11, 23, 10, 0))
+    monkeypatch.setattr("nifty_engine.data.historical_manager.now_ist", lambda: mock_10am)
+
+    # Mock REST client history returns empty (unable to recover 09:15 candle)
+    mock_rest = MagicMock()
+    mock_rest.get_historical_candles_sync.return_value = []
+    manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
+
+    levels = manager.get_daily_reference_levels(sym, as_of_date=date(2026, 11, 23))
+    assert levels is not None
+    assert levels["PDH"] == 25200.0
+    assert levels["CDO"] is None
+
+    engine = TechnicalAnalysisEngine(
+        primary_index=sym,
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    engine.prepare_session(date(2026, 11, 23))
+    engine.set_daily_references(sym, pdh=levels["PDH"], pdl=levels["PDL"], pdc=levels["PDC"], cdo=levels["CDO"])
+
+    state = engine.states[sym]
+    assert state.daily_reference_levels["CDO"] is None
+    assert state.session_open_price is None
+
+    # First live candle arrives at 10:00 AM with open = 25180.0
+    c_1000 = make_candle(sym, "5m", IST.localize(datetime(2026, 11, 23, 10, 0)), 25180.0, 25195.0, 25175.0, 25190.0)
+    snap_1000 = engine.on_candle(c_1000)
+    assert snap_1000 is not None
+
+    # CRITICAL: Because candle timestamp is 10:00 AM and NOT 09:15 AM, CDO must remain None
+    assert state.daily_reference_levels["CDO"] is None
+    assert state.session_open_price is None
+    assert not any(z.level_type == LevelType.CDO for z in snap_1000.sr_zones)

@@ -216,6 +216,8 @@ class SymbolTechnicalState:
             "PDC": pdc,
             "CDO": cdo,
         }
+        if cdo is not None and self.session_open_price is None:
+            self.session_open_price = cdo
 
     def _check_session_rollover(self, candle_timestamp: datetime) -> bool:
         """Enforces clean trading-session boundaries across multiple trading days.
@@ -292,8 +294,10 @@ class SymbolTechnicalState:
         if candle.timeframe in self._pending_breakout_eval:
             self.complete_breakout_evaluation(candle.timeframe, futures_rvol=None, on_setup_candidate=on_setup_candidate)
 
-        if self.session_open_price is None:
-            self.session_open_price = candle.open
+        # Only the confirmed 09:15:00 opening candle sets session open price and CDO
+        if candle.timestamp.time() == time(9, 15):
+            if self.session_open_price is None:
+                self.session_open_price = candle.open
             if self.daily_reference_levels is not None and self.daily_reference_levels.get("CDO") is None:
                 self.daily_reference_levels["CDO"] = candle.open
 
