@@ -56,6 +56,7 @@ class PaperOrder:
     requested_price: Optional[float] = None
     filled_price: Optional[float] = None
     slippage_points: float = 0.0
+    is_estimated_fill: bool = False
     filled_at: Optional[datetime] = None
     rejection_reason: Optional[str] = None
 
@@ -72,6 +73,7 @@ class PaperOrder:
             "requested_price": self.requested_price,
             "filled_price": self.filled_price,
             "slippage": self.slippage_points,
+            "is_estimated_fill": self.is_estimated_fill,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "filled_at": self.filled_at.isoformat() if self.filled_at else None,
             "rejection_reason": self.rejection_reason,

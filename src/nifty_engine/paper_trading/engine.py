@@ -55,6 +55,7 @@ class PaperTradingEngine:
         no_new_entries_time: time = time(15, 0, 0),
         market_open_time: time = time(9, 15, 0),
         checkpoint_interval_seconds: float = 1.0,
+        clock_skew_tolerance_seconds: float = 2.0,
         calendar: Optional[ExchangeCalendar] = None,
         on_trade_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
@@ -72,6 +73,7 @@ class PaperTradingEngine:
         self.no_new_entries_time = no_new_entries_time
         self.market_open_time = market_open_time
         self.checkpoint_interval_seconds = checkpoint_interval_seconds
+        self.clock_skew_tolerance_seconds = clock_skew_tolerance_seconds
         self.calendar = calendar or ExchangeCalendar()
         self.on_trade_event = on_trade_event
 
@@ -780,6 +782,7 @@ class PaperTradingEngine:
             requested_price=market_price,
             filled_price=exit_price,
             slippage_points=self.slippage_points,
+            is_estimated_fill=False,
             created_at=current_time,
             filled_at=current_time,
             status=OrderStatus.FILLED,
@@ -844,6 +847,7 @@ class PaperTradingEngine:
             requested_price=market_price,
             filled_price=exit_price,
             slippage_points=self.slippage_points,
+            is_estimated_fill=is_estimated_fill,
             created_at=current_time,
             filled_at=current_time,
             status=OrderStatus.FILLED,
@@ -1010,7 +1014,17 @@ class PaperTradingEngine:
             logger.debug("Rejected on-demand quote for %s: missing broker quote timestamp", pos.symbol)
             return False
 
-        quote_age = max(0.0, (current_time - quote_ts).total_seconds())
+        delta_seconds = (current_time - quote_ts).total_seconds()
+        if delta_seconds < -self.clock_skew_tolerance_seconds:
+            logger.debug(
+                "Rejected on-demand quote for %s: quote timestamp is in the future (skew %.1fs > allowed %.1fs)",
+                pos.symbol,
+                -delta_seconds,
+                self.clock_skew_tolerance_seconds,
+            )
+            return False
+
+        quote_age = max(0.0, delta_seconds)
         if quote_age > self.max_quote_age_seconds:
             logger.debug(
                 "Rejected on-demand quote for %s: quote timestamp is stale (age %.1fs > %.1fs)",
@@ -1175,7 +1189,7 @@ class PaperTradingEngine:
                     turnover=round(price * qty, 2),
                     costs=costs,
                     reason=trade_reason,
-                    is_estimated_fill=bool(row.get("is_estimated_exit", False)) if not is_buy else False,
+                    is_estimated_fill=getattr(order, "is_estimated_fill", False) if not is_buy else False,
                 )
                 trades.append(trade)
 
@@ -1249,6 +1263,7 @@ class PaperTradingEngine:
             requested_price=float(row["requested_price"]) if row.get("requested_price") is not None else None,
             filled_price=float(row["filled_price"]) if row.get("filled_price") is not None else None,
             slippage_points=float(row.get("slippage", 0.0)),
+            is_estimated_fill=bool(row.get("is_estimated_fill", False)),
             rejection_reason=row.get("rejection_reason"),
         )
 
@@ -1288,12 +1303,12 @@ class PaperTradingEngine:
         """Returns all completed paper trading positions."""
         return list(self.closed_positions)
 
-    def get_account_summary(self) -> Dict[str, Any]:
-        """Computes comprehensive paper trading performance telemetry."""
-        closed = self.closed_positions
-        total_trades = len(closed)
-        wins = [p for p in closed if p.net_pnl > 0]
-        losses = [p for p in closed if p.net_pnl <= 0]
+    @staticmethod
+    def _calc_performance_stats(positions: List[PaperPosition]) -> Dict[str, Any]:
+        """Calculates performance statistics for a collection of closed positions."""
+        total_trades = len(positions)
+        wins = [p for p in positions if p.net_pnl > 0]
+        losses = [p for p in positions if p.net_pnl <= 0]
 
         win_rate = (len(wins) / total_trades) if total_trades > 0 else 0.0
         avg_win = (sum(p.net_pnl for p in wins) / len(wins)) if wins else 0.0
@@ -1302,22 +1317,48 @@ class PaperTradingEngine:
         gross_loss = abs(sum(p.gross_pnl for p in losses))
         profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
 
-        open_unrealized_gross = sum(p.gross_pnl for p in self.active_positions.values())
-        open_unrealized_net = sum(p.net_pnl for p in self.active_positions.values())
+        realized_gross = sum(p.gross_pnl for p in positions)
+        realized_net = sum(p.net_pnl for p in positions)
+        costs_paid = sum(p.total_costs for p in positions)
 
         return {
             "total_trades": total_trades,
             "winning_trades": len(wins),
             "losing_trades": len(losses),
             "win_rate_pct": round(win_rate * 100.0, 1),
-            "total_realized_gross_pnl": round(self.total_realized_gross_pnl, 2),
-            "total_realized_net_pnl": round(self.total_realized_net_pnl, 2),
-            "total_costs_paid": round(self.total_costs_paid, 2),
-            "cost_drag_pct": round((self.total_costs_paid / gross_profit * 100.0), 1) if gross_profit > 0 else 0.0,
+            "total_realized_gross_pnl": round(realized_gross, 2),
+            "total_realized_net_pnl": round(realized_net, 2),
+            "total_costs_paid": round(costs_paid, 2),
+            "cost_drag_pct": round((costs_paid / gross_profit * 100.0), 1) if gross_profit > 0 else 0.0,
             "profit_factor": profit_factor,
             "avg_win_inr": round(avg_win, 2),
             "avg_loss_inr": round(avg_loss, 2),
+        }
+
+    def get_account_summary(self) -> Dict[str, Any]:
+        """Computes comprehensive paper trading performance telemetry.
+
+        Maintains separate verified-only (authentic broker fills) and all-trades performance summaries,
+        ensuring estimated penalty fills do not distort verified strategy profitability.
+        """
+        closed = self.closed_positions
+        verified_closed = [p for p in closed if not p.is_estimated_exit]
+        estimated_closed = [p for p in closed if p.is_estimated_exit]
+
+        verified_stats = self._calc_performance_stats(verified_closed)
+        all_stats = self._calc_performance_stats(closed)
+
+        open_unrealized_gross = sum(p.gross_pnl for p in self.active_positions.values())
+        open_unrealized_net = sum(p.net_pnl for p in self.active_positions.values())
+
+        return {
+            # Primary performance metrics reflect verified-only trades
+            **verified_stats,
+            "estimated_trades_count": len(estimated_closed),
             "open_positions_count": len(self.active_positions),
             "open_unrealized_gross_pnl": round(open_unrealized_gross, 2),
             "open_unrealized_net_pnl": round(open_unrealized_net, 2),
+            # Explicit separate summaries
+            "verified_only": verified_stats,
+            "all_trades": all_stats,
         }

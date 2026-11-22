@@ -119,6 +119,12 @@ class DuckDBStore(IStorageEngine):
                 except Exception:
                     pass
 
+            # Idempotently migrate columns for paper_orders if table exists from prior runs
+            try:
+                cur.execute("ALTER TABLE paper_orders ADD COLUMN IF NOT EXISTS is_estimated_fill BOOLEAN DEFAULT FALSE")
+            except Exception:
+                pass
+
     def insert_tick(self, tick: Tick) -> None:
         """Buffer a single tick for high-throughput single-writer batch insert."""
         with self._lock:
@@ -440,8 +446,8 @@ class DuckDBStore(IStorageEngine):
                 INSERT OR REPLACE INTO paper_orders (
                     order_id, position_id, signal_id, symbol, side, order_type,
                     status, quantity, requested_price, filled_price, slippage,
-                    created_at, filled_at, rejection_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_estimated_fill, created_at, filled_at, rejection_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     order.get("order_id"),
@@ -455,6 +461,7 @@ class DuckDBStore(IStorageEngine):
                     order.get("requested_price"),
                     order.get("filled_price"),
                     order.get("slippage", 0.0),
+                    order.get("is_estimated_fill", False),
                     order.get("created_at"),
                     order.get("filled_at"),
                     order.get("rejection_reason"),

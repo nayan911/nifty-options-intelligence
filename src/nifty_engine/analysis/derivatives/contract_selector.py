@@ -110,6 +110,7 @@ class OptionContractSelector:
         min_liquidity_volume: int = 500,  # Minimum required trading volume
         max_quote_age_seconds: float = 30.0,  # Strict quote freshness gate (max 30s)
         quote_provider: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+        clock_skew_tolerance_seconds: float = 2.0,
         default_holding_minutes: float = 30.0,
         min_selection_score: float = 50.0,
         instrument_master: Optional[Any] = None,
@@ -125,6 +126,7 @@ class OptionContractSelector:
         self.min_liquidity_volume = min_liquidity_volume
         self.max_quote_age_seconds = max_quote_age_seconds
         self.quote_provider = quote_provider
+        self.clock_skew_tolerance_seconds = clock_skew_tolerance_seconds
         self.default_holding_minutes = default_holding_minutes
         self.min_selection_score = min_selection_score
         self.instrument_master = instrument_master
@@ -302,7 +304,14 @@ class OptionContractSelector:
                 continue
 
             # HARD ELIGIBILITY GATE 3: Quote Freshness
-            quote_age = max(0.0, (current_time - quote_ts).total_seconds()) if quote_ts else 0.0
+            if quote_ts:
+                delta_sec = (current_time - quote_ts).total_seconds()
+                if delta_sec < -self.clock_skew_tolerance_seconds:
+                    continue
+                quote_age = max(0.0, delta_sec)
+            else:
+                quote_age = 0.0
+
             if quote_age > self.max_quote_age_seconds:
                 continue
 

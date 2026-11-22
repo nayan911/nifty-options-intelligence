@@ -438,7 +438,7 @@ def test_on_candle_intrabar_adverse_first_evaluation():
     engine = PaperTradingEngine(
         default_lots=1,
         slippage_points=0.5,
-        quote_provider=lambda sym: {"ltp": 83.0, "bid": 83.0, "ask": 83.5, "timestamp": entry_ts + timedelta(minutes=15)},
+        quote_provider=lambda sym: {"ltp": 83.0, "bid": 83.0, "ask": 83.5, "timestamp": entry_ts + timedelta(minutes=1)},
     )
 
     cand = create_mock_candidate(
@@ -916,7 +916,7 @@ def test_quote_provider_fallback_in_on_candle():
     def mock_quote_provider(symbol: str) -> Dict[str, Any]:
         nonlocal fetched
         fetched = True
-        return {"ltp": 82.0, "bid": 81.5, "ask": 82.5, "timestamp": entry_ts + timedelta(minutes=15)}
+        return {"ltp": 82.0, "bid": 81.5, "ask": 82.5, "timestamp": entry_ts + timedelta(seconds=60)}
 
     engine = PaperTradingEngine(
         quote_provider=mock_quote_provider,
@@ -992,7 +992,7 @@ def test_candle_timing_prevents_retroactive_trades():
     engine = PaperTradingEngine(
         default_lots=1,
         slippage_points=0.5,
-        quote_provider=lambda sym: {"ltp": 80.0, "bid": 80.0, "ask": 80.5, "timestamp": entry_ts + timedelta(minutes=5)},
+        quote_provider=lambda sym: {"ltp": 80.0, "bid": 80.0, "ask": 80.5, "timestamp": entry_ts + timedelta(minutes=1)},
     )
 
     cand = create_mock_candidate(
@@ -1535,7 +1535,18 @@ def test_rest_quote_fallback_rejects_missing_or_stale_bid():
     assert len(events) == 0
     assert pos.status == PositionStatus.OPEN
 
-    # 4. Quote provider returns authentic positive bid with fresh timestamp (5s old): ACCEPTED
+    # 4. Quote provider returns positive bid but broker timestamp is materially future-dated (10s > 2s skew tolerance): REJECTED
+    current_mock_quote = {
+        "ltp": 80.0,
+        "bid": 79.5,
+        "ask": 80.5,
+        "timestamp": trigger_time + timedelta(seconds=10),
+    }
+    events = engine.on_tick(spot_tick)
+    assert len(events) == 0
+    assert pos.status == PositionStatus.OPEN
+
+    # 5. Quote provider returns authentic positive bid with fresh timestamp (5s old): ACCEPTED
     current_mock_quote = {
         "ltp": 80.0,
         "bid": 79.5,
@@ -1757,6 +1768,183 @@ def test_duckdb_recovery_restores_estimated_exit_state(tmp_path):
     assert rec_pos.is_estimated_exit is True
     assert rec_pos.trades[-1].is_estimated_fill is True
     store.close()
+
+
+def test_future_dated_rest_quote_rejection_and_skew_tolerance():
+    """Verify quote provider rejects materially future-dated quotes while permitting small clock-skew."""
+    engine = PaperTradingEngine(
+        default_lots=1,
+        slippage_points=0.5,
+        clock_skew_tolerance_seconds=2.0,
+    )
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+    cand = create_mock_candidate(timestamp=entry_ts, entry_ltp=100.0, ask=100.0)
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+
+    current_eval_time = entry_ts + timedelta(minutes=5)
+
+    # 1. Quote is 10 seconds in the future (skew 10s > 2.0s allowed) -> REJECTED
+    engine.quote_provider = lambda sym: {
+        "ltp": 99.0,
+        "bid": 98.5,
+        "ask": 99.5,
+        "timestamp": current_eval_time + timedelta(seconds=10),
+    }
+    applied = engine._apply_fresh_quote(pos, current_eval_time)
+    assert applied is False
+
+    # 2. Quote is 1 second in the future (skew 1.0s <= 2.0s allowed tolerance) -> ACCEPTED
+    engine.quote_provider = lambda sym: {
+        "ltp": 99.0,
+        "bid": 98.5,
+        "ask": 99.5,
+        "timestamp": current_eval_time + timedelta(seconds=1),
+    }
+    applied = engine._apply_fresh_quote(pos, current_eval_time)
+    assert applied is True
+    assert pos.current_bid == 98.5
+
+
+def test_account_summary_separates_verified_and_all_trades():
+    """Verify get_account_summary calculates verified-only metrics cleanly separated from estimated fills."""
+    engine = PaperTradingEngine(default_lots=1, slippage_points=0.5)
+
+    # Position 1: Verified winning trade (closed via authentic broker bid at Target 2)
+    t1_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+    cand1 = create_mock_candidate(
+        candidate_id="POS_1_VERIFIED",
+        timestamp=t1_ts,
+        entry_ltp=100.0,
+        ask=100.0,
+        t2_premium=130.0,
+    )
+    pos1 = engine.process_technical_candidate(cand1, current_time=t1_ts)
+    assert pos1 is not None
+
+    tick1 = Tick(
+        symbol=pos1.symbol,
+        ltp=131.0,
+        bid=130.5,
+        ask=131.5,
+        volume=5000,
+        local_timestamp=t1_ts + timedelta(minutes=5),
+    )
+    engine.on_tick(tick1)
+    assert pos1.status == PositionStatus.CLOSED
+    assert pos1.is_estimated_exit is False
+    assert pos1.net_pnl > 0.0
+
+    # Position 2: Stale EOD exit resulting in estimated fallback penalty fill
+    t2_ts = IST.localize(datetime(2026, 11, 26, 14, 0, 0))
+    cand2 = create_mock_candidate(
+        candidate_id="POS_2_ESTIMATED",
+        timestamp=t2_ts,
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+    pos2 = engine.process_technical_candidate(cand2, current_time=t2_ts)
+    assert pos2 is not None
+
+    # Stale EOD trigger (quote is 1h15m old, no quote provider)
+    eod_ts = IST.localize(datetime(2026, 11, 26, 15, 15, 2))
+    events = engine.check_time_events(eod_ts)
+    assert len(events) == 1
+    assert pos2.status == PositionStatus.CLOSED
+    assert pos2.is_estimated_exit is True
+
+    # Account summary telemetry check
+    summary = engine.get_account_summary()
+
+    # Primary metrics strictly reflect verified-only trades (1 trade, 100% win rate)
+    assert summary["total_trades"] == 1
+    assert summary["winning_trades"] == 1
+    assert summary["losing_trades"] == 0
+    assert summary["win_rate_pct"] == 100.0
+    assert summary["estimated_trades_count"] == 1
+
+    # Verified-only sub-dictionary
+    assert summary["verified_only"]["total_trades"] == 1
+    assert summary["verified_only"]["winning_trades"] == 1
+    assert summary["verified_only"]["win_rate_pct"] == 100.0
+
+    # All-trades sub-dictionary contains both verified and estimated
+    assert summary["all_trades"]["total_trades"] == 2
+    assert summary["all_trades"]["winning_trades"] == 1
+    assert summary["all_trades"]["losing_trades"] == 1
+    assert summary["all_trades"]["win_rate_pct"] == 50.0
+
+
+def test_order_level_estimated_fill_persistence_and_recovery(tmp_path):
+    """Verify partial exit preserves is_estimated_fill=False even when final exit is estimated."""
+    db_path = tmp_path / "test_order_level_recovery.duckdb"
+    store = DuckDBStore(db_path=db_path)
+
+    engine = PaperTradingEngine(
+        store=store,
+        default_lots=2,
+        slippage_points=0.5,
+    )
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+    cand = create_mock_candidate(
+        candidate_id="MULTI_LOT_TEST",
+        timestamp=entry_ts,
+        entry_ltp=100.0,
+        ask=100.0,
+        t1_premium=120.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+    assert pos.initial_quantity == 130  # 2 lots of 65
+
+    # 1. Target 1 achieved with authentic broker bid -> partial exit order (is_estimated_fill=False)
+    t1_tick = Tick(
+        symbol=pos.symbol,
+        ltp=121.0,
+        bid=120.5,
+        ask=121.5,
+        volume=2000,
+        local_timestamp=entry_ts + timedelta(minutes=5),
+    )
+    events_t1 = engine.on_tick(t1_tick)
+    assert len(events_t1) == 1
+    assert pos.status == PositionStatus.PARTIALLY_CLOSED
+    assert pos.remaining_quantity == 65
+    assert len(pos.trades) == 2
+    assert pos.trades[1].is_estimated_fill is False
+
+    # 2. Final exit at EOD with stale quote -> estimated penalty exit (is_estimated_fill=True)
+    eod_ts = IST.localize(datetime(2026, 11, 26, 15, 15, 2))
+    events_eod = engine.check_time_events(eod_ts)
+    assert len(events_eod) == 1
+    assert pos.status == PositionStatus.CLOSED
+    assert pos.is_estimated_exit is True
+    assert len(pos.trades) == 3
+    assert pos.trades[2].is_estimated_fill is True
+
+    # Check orders table in DuckDB
+    orders = store.get_paper_orders(pos.position_id)
+    assert len(orders) == 3
+    # Order 0: BUY, Order 1: SELL T1 (is_estimated_fill=False), Order 2: SELL EOD (is_estimated_fill=True)
+    assert orders[0]["is_estimated_fill"] is False
+    assert orders[1]["is_estimated_fill"] is False
+    assert orders[2]["is_estimated_fill"] is True
+
+    # 3. Simulate process restart and recover from DuckDB
+    engine_recovered = PaperTradingEngine(store=store)
+    assert len(engine_recovered.closed_positions) == 1
+    rec_pos = engine_recovered.closed_positions[0]
+    assert rec_pos.position_id == pos.position_id
+    assert rec_pos.is_estimated_exit is True
+    assert len(rec_pos.trades) == 3
+
+    # CRITICAL CHECK: Trade 1 (T1 partial exit) MUST remain is_estimated_fill=False upon recovery!
+    assert rec_pos.trades[0].is_estimated_fill is False  # BUY
+    assert rec_pos.trades[1].is_estimated_fill is False  # T1 partial exit (verified)
+    assert rec_pos.trades[2].is_estimated_fill is True   # EOD exit (estimated)
+
+    store.close()
+
 
 
 
