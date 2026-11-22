@@ -197,3 +197,101 @@ def test_missing_expiry_raises_error():
     }
     with pytest.raises(ValueError, match="Could not resolve contract expiry date"):
         FyersRestClient.parse_option_chain_payload(payload, "NSE:NIFTY50-INDEX")
+
+
+def test_fyers_option_chain_parser_synchronization_and_timestamp_provenance():
+    """Verify that production FYERS snapshots default to is_synchronized_snapshot=False and extract explicit timestamps."""
+    from datetime import datetime
+
+    import pytz
+
+    from nifty_engine.analysis.derivatives.contract_selector import OptionContractSelector
+    from nifty_engine.analysis.derivatives.oi_analysis import OpenInterestAnalyzer
+    from nifty_engine.analysis.technical.breakouts import BreakoutDirection
+
+    ist = pytz.timezone("Asia/Kolkata")
+    t0 = ist.localize(datetime(2026, 11, 23, 10, 0))
+
+    # 1. Standard production FYERS payload (no synchronicity guarantee)
+    payload_prod = {
+        "underlyingValue": 25100.0,
+        "expiryData": [{"date": "26-Nov-2026", "timestamp": 1795687200}],
+        "optionsChain": [
+            {
+                "symbol": "NSE:NIFTY26NOV25100CE",
+                "strike_price": 25100.0,
+                "option_type": "CE",
+                "ltp": 95.0,
+                "oi": 140000,
+                "volume": 45000,
+                "bid": 94.5,
+                "ask": 95.5,
+                "greeks": {
+                    "iv": 14.5,
+                    "delta": 0.50,
+                    "gamma": 0.0004,
+                    "theta": -8.5,
+                    "vega": 12.0,
+                },
+            }
+        ],
+    }
+
+    snap_prod = FyersRestClient.parse_option_chain_payload(payload_prod, "NSE:NIFTY50-INDEX")
+    # Must NOT assume synchronization by default
+    assert snap_prod.is_synchronized_snapshot is False
+
+    t0 = snap_prod.api_timestamp
+
+    oi_analyzer = OpenInterestAnalyzer()
+    profile = oi_analyzer.on_option_chain(snap_prod)
+    strike_info = profile.strikes[25100.0]
+    # Provenance must be INFERRED and greeks_timestamp must be None
+    assert strike_info.call_greeks_provenance == "INFERRED"
+    assert strike_info.call_greeks_timestamp is None
+
+    # Downstream contract selector must safely calculate Black-76 model Greeks
+    selector = OptionContractSelector()
+    res = selector.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=t0,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res is not None
+    assert res.greeks.model_used == "BLACK_76"
+    assert res.greeks.is_calculated is True
+
+    # 2. Payload with explicit broker greeks timestamp
+    payload_with_ts = {
+        "underlyingValue": 25100.0,
+        "expiryData": [{"date": "26-Nov-2026", "timestamp": 1795687200}],
+        "optionsChain": [
+            {
+                "symbol": "NSE:NIFTY26NOV25100CE",
+                "strike_price": 25100.0,
+                "option_type": "CE",
+                "ltp": 95.0,
+                "oi": 140000,
+                "volume": 45000,
+                "bid": 94.5,
+                "ask": 95.5,
+                "quote_timestamp": int(t0.timestamp()),
+                "greeks": {
+                    "iv": 14.5,
+                    "delta": 0.50,
+                    "gamma": 0.0004,
+                    "theta": -8.5,
+                    "vega": 12.0,
+                    "greeks_timestamp": int(t0.timestamp()),
+                },
+            }
+        ],
+    }
+    snap_explicit = FyersRestClient.parse_option_chain_payload(payload_with_ts, "NSE:NIFTY50-INDEX")
+    profile_explicit = oi_analyzer.on_option_chain(snap_explicit)
+    assert profile_explicit.strikes[25100.0].call_greeks_provenance == "EXPLICIT"
+    assert profile_explicit.strikes[25100.0].call_greeks_timestamp is not None
+

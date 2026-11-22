@@ -112,7 +112,7 @@ class OptionChainSnapshot(BaseModel):
     total_call_oi: int = 0
     total_put_oi: int = 0
     pcr: float = 0.0
-    is_synchronized_snapshot: bool = Field(default=True, description="True if broker API guarantees synchronized quotes and Greeks in this snapshot")
+    is_synchronized_snapshot: bool = Field(default=False, description="True if broker API guarantees synchronized quotes and Greeks in this snapshot")
 
 
 # Abstract Interfaces

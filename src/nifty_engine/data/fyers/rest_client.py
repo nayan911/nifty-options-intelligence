@@ -240,6 +240,12 @@ class FyersRestClient:
         else:
             underlying = underlying_symbol
 
+        is_synced = bool(
+            chain_data.get("is_synchronized")
+            or chain_data.get("is_synchronized_snapshot")
+            or chain_data.get("greeks_synchronized", False)
+        )
+
         return OptionChainSnapshot(
             underlying=underlying,
             spot_price=spot_price,
@@ -249,6 +255,7 @@ class FyersRestClient:
             total_call_oi=total_call_oi,
             total_put_oi=total_put_oi,
             pcr=pcr,
+            is_synchronized_snapshot=is_synced,
         )
 
     @staticmethod
@@ -274,6 +281,34 @@ class FyersRestClient:
         raw_theta = greeks.get("theta") if greeks.get("theta") is not None else raw.get("theta")
         raw_vega = greeks.get("vega") if greeks.get("vega") is not None else raw.get("vega")
 
+        # Extract explicit quote and greeks timestamps if present in raw broker record
+        quote_ts = None
+        raw_q_ts = raw.get("quote_timestamp") or raw.get("timestamp") or raw.get("tt")
+        if raw_q_ts is not None:
+            if isinstance(raw_q_ts, datetime):
+                quote_ts = raw_q_ts
+            elif isinstance(raw_q_ts, (int, float)) and raw_q_ts > 0:
+                try:
+                    quote_ts = datetime.fromtimestamp(int(raw_q_ts), tz=IST)
+                except Exception:
+                    quote_ts = None
+
+        greeks_ts = None
+        raw_g_ts = (
+            greeks.get("timestamp")
+            or greeks.get("greeks_timestamp")
+            or greeks.get("greeks_time")
+            or raw.get("greeks_timestamp")
+        )
+        if raw_g_ts is not None:
+            if isinstance(raw_g_ts, datetime):
+                greeks_ts = raw_g_ts
+            elif isinstance(raw_g_ts, (int, float)) and raw_g_ts > 0:
+                try:
+                    greeks_ts = datetime.fromtimestamp(int(raw_g_ts), tz=IST)
+                except Exception:
+                    greeks_ts = None
+
         return {
             "symbol": raw.get("symbol", ""),
             "ltp": float(raw["ltp"]) if raw.get("ltp") is not None else None,
@@ -287,4 +322,6 @@ class FyersRestClient:
             "gamma": float(raw_gamma) if raw_gamma is not None else None,
             "theta": float(raw_theta) if raw_theta is not None else None,
             "vega": float(raw_vega) if raw_vega is not None else None,
+            "quote_timestamp": quote_ts,
+            "greeks_timestamp": greeks_ts,
         }

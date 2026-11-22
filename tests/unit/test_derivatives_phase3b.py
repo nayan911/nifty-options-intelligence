@@ -102,6 +102,7 @@ def create_phase3b_chain(
         total_call_oi=tot_c_oi,
         total_put_oi=tot_p_oi,
         pcr=round(tot_p_oi / tot_c_oi, 3) if tot_c_oi > 0 else 0.0,
+        is_synchronized_snapshot=True,
     )
 
 
