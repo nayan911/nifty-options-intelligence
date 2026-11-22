@@ -1238,6 +1238,10 @@ class TechnicalAnalysisEngine:
     def set_futures_ticker(self, futures_ticker: str) -> None:
         """Dynamically updates active primary futures ticker (e.g. at contract rollover)."""
         with self._lock:
+            old_futures = self.index_futures_map.get(self.primary_index)
+            if old_futures and old_futures != futures_ticker:
+                self.futures_index_map.pop(old_futures, None)
+
             self.primary_futures = futures_ticker
             self.index_futures_map[self.primary_index] = futures_ticker
             self.futures_index_map[futures_ticker] = self.primary_index
@@ -1251,6 +1255,10 @@ class TechnicalAnalysisEngine:
     def set_index_futures_mapping(self, index_symbol: str, futures_symbol: str) -> None:
         """Explicitly pairs a spot index with its corresponding futures instrument."""
         with self._lock:
+            old_futures = self.index_futures_map.get(index_symbol)
+            if old_futures and old_futures != futures_symbol:
+                self.futures_index_map.pop(old_futures, None)
+
             self.index_futures_map[index_symbol] = futures_symbol
             self.futures_index_map[futures_symbol] = index_symbol
             self._get_or_create_state(futures_symbol, is_index=False)
@@ -1278,15 +1286,15 @@ class TechnicalAnalysisEngine:
             is_idx = ("INDEX" in candle.symbol) or (candle.symbol in self.index_futures_map)
             state = self._get_or_create_state(candle.symbol, is_index=is_idx)
 
+            # Reject older trading dates before modifying state or forwarding to derivatives
+            if state.current_session_date is not None and candle.timestamp.date() < state.current_session_date:
+                return state.latest_snapshots.get(candle.timeframe) or state._create_generic_snapshot(candle)
+
             # Phase 3A: Update derivatives futures positioning if candle has OI
             if self.derivatives_engine is not None and (
                 candle.symbol in self.futures_index_map or candle.symbol == self.primary_futures
             ):
                 self.derivatives_engine.oi_analyzer.on_futures_candle(candle)
-
-            # Reject older trading dates before modifying state
-            if state.current_session_date is not None and candle.timestamp.date() < state.current_session_date:
-                return state.latest_snapshots.get(candle.timeframe) or state._create_generic_snapshot(candle)
 
             # 1. Spot Index Candle: Check if mapped futures volume is available or pending
             paired_futures = self.index_futures_map.get(candle.symbol)

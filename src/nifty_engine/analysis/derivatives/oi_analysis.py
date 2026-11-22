@@ -195,8 +195,12 @@ class OpenInterestAnalyzer:
         close_time = get_bar_close_time(candle.timestamp, candle.timeframe)
         avail_at = max(candle.observed_at, close_time) if candle.observed_at is not None else close_time
 
-        # Reject duplicate or out-of-order candles based on effective availability
-        if history and avail_at <= history[-1].available_at:
+        # Reject candles from prior trading sessions
+        if self.current_session_date is not None and candle.timestamp.date() < self.current_session_date:
+            return history[-1] if history else None
+
+        # Reject duplicate or out-of-order candles: opening timestamp must increase strictly
+        if history and candle.timestamp <= history[-1].timestamp:
             return history[-1]
 
         # Session rollover tracking: clean baseline for a new trading day

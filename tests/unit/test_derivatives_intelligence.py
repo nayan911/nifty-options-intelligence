@@ -1091,3 +1091,194 @@ def test_p1_expired_option_chain_not_selected_returns_insufficient_data():
     assert assessment.assessment_type == DerivativesAssessmentType.INSUFFICIENT_DATA
     assert assessment.is_stale is True
 
+
+def test_p1_delayed_older_futures_candle_rejected_and_cannot_corrupt_history():
+    """Verify P1: Delayed older futures candles arriving with later observation timestamps
+
+    are strictly rejected by opening timestamp and cannot corrupt chronological OI history.
+    """
+    analyzer = OpenInterestAnalyzer()
+    fut_sym = "NSE:NIFTY26NOVFUT"
+
+    # Candle 1: interval 10:05-10:10 arrives first at 10:10:01
+    t_1005 = IST.localize(datetime(2026, 11, 23, 10, 5))
+    c_newer = Candle(
+        symbol=fut_sym,
+        timeframe="5m",
+        timestamp=t_1005,
+        open=25000.0,
+        high=25060.0,
+        low=25000.0,
+        close=25050.0,
+        volume=3000,
+        oi=105000,
+        is_closed=True,
+        observed_at=t_1005 + timedelta(minutes=5, seconds=1),  # 10:10:01
+    )
+    res_newer = analyzer.on_futures_candle(c_newer)
+    assert res_newer.timestamp == t_1005
+    assert res_newer.price == 25050.0
+    assert res_newer.oi == 105000
+
+    # Candle 0: delayed interval 10:00-10:05 arrives LATER at 10:11:00
+    t_1000 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    c_older_delayed = Candle(
+        symbol=fut_sym,
+        timeframe="5m",
+        timestamp=t_1000,
+        open=25000.0,
+        high=25020.0,
+        low=24990.0,
+        close=25000.0,
+        volume=1000,
+        oi=100000,
+        is_closed=True,
+        observed_at=t_1005 + timedelta(minutes=6),  # 10:11:00 (later than 10:10:01!)
+    )
+    res_rejected = analyzer.on_futures_candle(c_older_delayed)
+
+    # Invariant: Older candle is rejected; history head remains the 10:05 candle
+    assert res_rejected.timestamp == t_1005
+    assert res_rejected.price == 25050.0
+    assert res_newer.oi == 105000
+    history = analyzer._futures_history[(fut_sym, "5m")]
+    assert len(history) == 1
+    assert history[-1].timestamp == t_1005
+
+
+def test_p1_partial_option_chain_missing_ce_does_not_distort_pcr_or_returns_unavailable():
+    """Verify P1: Missing CE contracts do not fabricate artificial bullish PCR;
+
+    PCR is evaluated strictly over valid comparable CE/PE observations and returns None when coverage < threshold.
+    """
+    pcr_engine = PCREngine(min_strike_coverage=0.5, min_valid_strikes=2)
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+
+    # Scenario A: 5 strikes, but 4 have missing CE -> coverage = 1/5 = 20% < 50%
+    snap_low_coverage = OptionChainSnapshot(
+        underlying="NIFTY",
+        spot_price=25100.0,
+        api_timestamp=t0,
+        expiry=date(2026, 11, 26),
+        strikes=[
+            OptionChainStrike(
+                strike=25000.0,
+                call={"symbol": "NSE:NIFTY25000CE", "oi": 50000, "ltp": 150.0, "volume": 5000},
+                put={"symbol": "NSE:NIFTY25000PE", "oi": 50000, "ltp": 40.0, "volume": 5000},
+            ),
+            OptionChainStrike(
+                strike=25050.0,
+                call={"symbol": "NSE:NIFTY25050CE", "oi": None, "ltp": None, "volume": None},
+                put={"symbol": "NSE:NIFTY25050PE", "oi": 100000, "ltp": 60.0, "volume": 10000},
+            ),
+            OptionChainStrike(
+                strike=25100.0,
+                call={"symbol": "NSE:NIFTY25100CE", "oi": None, "ltp": None, "volume": None},
+                put={"symbol": "NSE:NIFTY25100PE", "oi": 100000, "ltp": 80.0, "volume": 10000},
+            ),
+            OptionChainStrike(
+                strike=25150.0,
+                call={"symbol": "NSE:NIFTY25150CE", "oi": None, "ltp": None, "volume": None},
+                put={"symbol": "NSE:NIFTY25150PE", "oi": 100000, "ltp": 110.0, "volume": 10000},
+            ),
+            OptionChainStrike(
+                strike=25200.0,
+                call={"symbol": "NSE:NIFTY25200CE", "oi": None, "ltp": None, "volume": None},
+                put={"symbol": "NSE:NIFTY25200PE", "oi": 100000, "ltp": 150.0, "volume": 10000},
+            ),
+        ],
+        total_call_oi=50000,
+        total_put_oi=450000,
+        pcr=9.0,
+    )
+    pcr_low = pcr_engine.on_option_chain(snap_low_coverage)
+
+    # Invariant: When coverage < 50%, aggregate and near-ATM PCR are unavailable (None), NOT distorted 9.0!
+    assert pcr_low.strike_coverage == 0.2
+    assert pcr_low.valid_strikes_count == 1
+    assert pcr_low.aggregate_oi_pcr is None
+    assert pcr_low.near_atm_oi_pcr is None
+    assert pcr_low.strike_weighted_pcr is None
+
+    # Scenario B: 4 strikes, 3 have valid CE and PE (50k each), 1 has missing CE and 100k PE
+    # Coverage = 3/4 = 75% >= 50%
+    t1 = t0 + timedelta(minutes=3)
+    snap_good_coverage = OptionChainSnapshot(
+        underlying="NIFTY",
+        spot_price=25100.0,
+        api_timestamp=t1,
+        expiry=date(2026, 11, 26),
+        strikes=[
+            OptionChainStrike(
+                strike=25000.0,
+                call={"symbol": "NSE:NIFTY25000CE", "oi": 50000, "ltp": 150.0, "volume": 5000},
+                put={"symbol": "NSE:NIFTY25000PE", "oi": 50000, "ltp": 40.0, "volume": 5000},
+            ),
+            OptionChainStrike(
+                strike=25050.0,
+                call={"symbol": "NSE:NIFTY25050CE", "oi": 50000, "ltp": 110.0, "volume": 6000},
+                put={"symbol": "NSE:NIFTY25050PE", "oi": 50000, "ltp": 60.0, "volume": 6000},
+            ),
+            OptionChainStrike(
+                strike=25100.0,
+                call={"symbol": "NSE:NIFTY25100CE", "oi": 50000, "ltp": 80.0, "volume": 10000},
+                put={"symbol": "NSE:NIFTY25100PE", "oi": 50000, "ltp": 80.0, "volume": 10000},
+            ),
+            OptionChainStrike(
+                strike=25150.0,
+                call={"symbol": "NSE:NIFTY25150CE", "oi": None, "ltp": None, "volume": None},
+                put={"symbol": "NSE:NIFTY25150PE", "oi": 100000, "ltp": 110.0, "volume": 10000},
+            ),
+        ],
+        total_call_oi=150000,
+        total_put_oi=250000,
+        pcr=1.667,
+    )
+    pcr_good = pcr_engine.on_option_chain(snap_good_coverage)
+
+    # Invariant: Evaluated strictly over the 3 valid comparable strikes (150k PE / 150k CE = 1.0)
+    # The missing CE strike (25150) is excluded, preventing artificial bullish skew!
+    assert pcr_good.strike_coverage == 0.75
+    assert pcr_good.valid_strikes_count == 3
+    assert pcr_good.aggregate_oi_pcr == 1.0
+    assert pcr_good.near_atm_oi_pcr == 1.0
+
+
+def test_p2_futures_rollover_cleans_up_obsolete_reverse_mapping():
+    """Verify P2: Technical engine removes obsolete reverse mappings on contract rollover
+
+    while preserving historical records for research.
+    """
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    # Initial state
+    assert engine.primary_futures == "NSE:NIFTY26NOVFUT"
+    assert engine.index_futures_map["NSE:NIFTY50-INDEX"] == "NSE:NIFTY26NOVFUT"
+    assert engine.futures_index_map["NSE:NIFTY26NOVFUT"] == "NSE:NIFTY50-INDEX"
+
+    # Simulate monthly rollover to December contract
+    engine.set_futures_ticker("NSE:NIFTY26DECFUT")
+
+    # Invariant: Active mappings point to December contract
+    assert engine.primary_futures == "NSE:NIFTY26DECFUT"
+    assert engine.index_futures_map["NSE:NIFTY50-INDEX"] == "NSE:NIFTY26DECFUT"
+    assert engine.futures_index_map["NSE:NIFTY26DECFUT"] == "NSE:NIFTY50-INDEX"
+
+    # Invariant: Obsolete reverse mapping for November contract is REMOVED
+    assert "NSE:NIFTY26NOVFUT" not in engine.futures_index_map
+
+    # Invariant: Historical state for November contract is PRESERVED for research
+    assert "NSE:NIFTY26NOVFUT" in engine.states
+
+    # Test explicit set_index_futures_mapping rollover
+    engine.set_index_futures_mapping("NSE:BANKNIFTY-INDEX", "NSE:BANKNIFTY26NOVFUT")
+    assert engine.futures_index_map["NSE:BANKNIFTY26NOVFUT"] == "NSE:BANKNIFTY-INDEX"
+
+    engine.set_index_futures_mapping("NSE:BANKNIFTY-INDEX", "NSE:BANKNIFTY26DECFUT")
+    assert engine.futures_index_map["NSE:BANKNIFTY26DECFUT"] == "NSE:BANKNIFTY-INDEX"
+    assert "NSE:BANKNIFTY26NOVFUT" not in engine.futures_index_map
+    assert "NSE:BANKNIFTY26NOVFUT" in engine.states
+
+

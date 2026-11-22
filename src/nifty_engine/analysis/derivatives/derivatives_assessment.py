@@ -170,8 +170,9 @@ class DerivativesIntelligenceEngine:
             if s.call_oi > 0 and s.put_oi > 0 and s.call_ltp > 0.0 and s.put_ltp > 0.0
         )
         strike_coverage = min(1.0, valid_strikes_count / expected_strikes)
+        pcr_coverage = getattr(pcr_snap, "strike_coverage", 1.0)
         fut_present = 1.0 if fut_analysis is not None else 0.5
-        data_quality = round(0.4 * freshness_factor + 0.3 * strike_coverage + 0.3 * fut_present, 2)
+        data_quality = round(0.35 * freshness_factor + 0.25 * strike_coverage + 0.2 * pcr_coverage + 0.2 * fut_present, 2)
 
         supporting_reasons: List[str] = []
         contra_reasons: List[str] = []

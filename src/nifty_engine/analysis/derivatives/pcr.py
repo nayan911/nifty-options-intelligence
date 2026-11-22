@@ -44,6 +44,8 @@ class PCRSnapshot:
     # Metadata
     strikes_evaluated_count: int
     is_stale: bool = False
+    strike_coverage: float = 1.0
+    valid_strikes_count: int = 0
 
 
 class PCREngine:
@@ -57,11 +59,15 @@ class PCREngine:
         near_atm_strike_range: int = 5,
         weighting_decay_points: float = 150.0,
         max_snapshot_age_seconds: float = 360.0,
+        min_strike_coverage: float = 0.5,
+        min_valid_strikes: int = 1,
         history_max_len: int = 100,
     ):
         self.near_atm_strike_range = near_atm_strike_range
         self.weighting_decay_points = weighting_decay_points
         self.max_snapshot_age_seconds = max_snapshot_age_seconds
+        self.min_strike_coverage = min_strike_coverage
+        self.min_valid_strikes = min_valid_strikes
         self.history_max_len = history_max_len
 
         # Current session date tracking
@@ -115,40 +121,74 @@ class PCREngine:
 
         spot = snapshot.spot_price
         strikes = snapshot.strikes
+        total_strikes_count = len(strikes)
 
-        total_call_oi = sum((s.call.get("oi") or 0) for s in strikes if s.call)
-        total_put_oi = sum((s.put.get("oi") or 0) for s in strikes if s.put)
-        total_call_vol = sum((s.call.get("volume") or 0) for s in strikes if s.call)
-        total_put_vol = sum((s.put.get("volume") or 0) for s in strikes if s.put)
+        # Filter valid comparable CE/PE strikes: both CE and PE must exist and have non-None OI
+        valid_strikes = [
+            s for s in strikes
+            if s.call and s.put
+            and s.call.get("oi") is not None
+            and s.put.get("oi") is not None
+        ]
+        valid_strikes_count = len(valid_strikes)
+        strike_coverage = round(valid_strikes_count / total_strikes_count, 4) if total_strikes_count > 0 else 0.0
 
-        # 1. Aggregate OI PCR: Sum(Put OI) / Sum(Call OI)
-        agg_oi_pcr = round(total_put_oi / total_call_oi, 4) if total_call_oi > 0 else None
+        has_sufficient_coverage = (
+            valid_strikes_count >= self.min_valid_strikes
+            and strike_coverage >= self.min_strike_coverage
+        )
 
-        # 2. Cumulative Volume PCR: Sum(Put Vol) / Sum(Call Vol)
-        cum_vol_pcr = round(total_put_vol / total_call_vol, 4) if total_call_vol > 0 else None
+        total_call_oi = sum(int(s.call["oi"]) for s in valid_strikes)
+        total_put_oi = sum(int(s.put["oi"]) for s in valid_strikes)
 
-        # 3. Near-ATM OI PCR: restricted to ATM ± N strikes
-        sorted_strikes = sorted(strikes, key=lambda s: s.strike)
-        sorted_by_dist = sorted(sorted_strikes, key=lambda s: abs(s.strike - spot))
+        valid_vol_strikes = [
+            s for s in valid_strikes
+            if s.call.get("volume") is not None and s.put.get("volume") is not None
+        ]
+        total_call_vol = sum(int(s.call["volume"]) for s in valid_vol_strikes)
+        total_put_vol = sum(int(s.put["volume"]) for s in valid_vol_strikes)
+
+        # 1. Aggregate OI PCR: Sum(Put OI) / Sum(Call OI) over valid comparable strikes
+        agg_oi_pcr = (
+            round(total_put_oi / total_call_oi, 4)
+            if (has_sufficient_coverage and total_call_oi > 0)
+            else None
+        )
+
+        # 2. Cumulative Volume PCR: Sum(Put Vol) / Sum(Call Vol) over valid volume strikes
+        cum_vol_pcr = (
+            round(total_put_vol / total_call_vol, 4)
+            if (has_sufficient_coverage and total_call_vol > 0)
+            else None
+        )
+
+        # 3. Near-ATM OI PCR: restricted to ATM ± N valid comparable strikes
+        sorted_by_dist = sorted(valid_strikes, key=lambda s: abs(s.strike - spot))
         near_atm_strikes = sorted_by_dist[: 2 * self.near_atm_strike_range + 1]
 
-        near_atm_call_oi = sum((s.call.get("oi") or 0) for s in near_atm_strikes if s.call)
-        near_atm_put_oi = sum((s.put.get("oi") or 0) for s in near_atm_strikes if s.put)
-        near_atm_pcr = round(near_atm_put_oi / near_atm_call_oi, 4) if near_atm_call_oi > 0 else None
+        near_atm_call_oi = sum(int(s.call["oi"]) for s in near_atm_strikes)
+        near_atm_put_oi = sum(int(s.put["oi"]) for s in near_atm_strikes)
+        near_atm_pcr = (
+            round(near_atm_put_oi / near_atm_call_oi, 4)
+            if (has_sufficient_coverage and near_atm_call_oi > 0)
+            else None
+        )
 
-        # 4. Strike-Weighted PCR: strikes closer to ATM have higher weight
+        # 4. Strike-Weighted PCR: strikes closer to ATM have higher weight over valid comparable strikes
         weighted_put_sum = 0.0
         weighted_call_sum = 0.0
-        for s in strikes:
+        for s in valid_strikes:
             dist = abs(s.strike - spot)
             w = math.exp(-0.5 * (dist / self.weighting_decay_points) ** 2)
-            c_oi = (s.call.get("oi") or 0) if s.call else 0
-            p_oi = (s.put.get("oi") or 0) if s.put else 0
+            c_oi = int(s.call["oi"])
+            p_oi = int(s.put["oi"])
             weighted_call_sum += w * c_oi
             weighted_put_sum += w * p_oi
 
         weighted_pcr = (
-            round(weighted_put_sum / weighted_call_sum, 4) if weighted_call_sum > 0.0 else None
+            round(weighted_put_sum / weighted_call_sum, 4)
+            if (has_sufficient_coverage and weighted_call_sum > 0.0)
+            else None
         )
 
         # 5. Interval Volume PCR & Invariant-Safe Delta PCR (ΔPCR)
@@ -156,43 +196,48 @@ class PCREngine:
         delta_oi_pcr = None
         delta_weighted_pcr = None
 
-        if prev_snapshot is not None:
+        if prev_snapshot is not None and has_sufficient_coverage:
             # Map previous strikes
             prev_map = {s.strike: s for s in prev_snapshot.strikes}
-
-            # Interval Volume PCR across all matching strikes with valid data in both
-            int_put_vol = 0
-            int_call_vol = 0
-            for s in strikes:
-                if s.strike in prev_map and s.call and s.put and prev_map[s.strike].call and prev_map[s.strike].put:
-                    prev_s = prev_map[s.strike]
-                    c_curr_vol = s.call.get("volume") or 0
-                    c_prev_vol = prev_s.call.get("volume") or 0
-                    p_curr_vol = s.put.get("volume") or 0
-                    p_prev_vol = prev_s.put.get("volume") or 0
-
-                    int_call_vol += max(0, c_curr_vol - c_prev_vol)
-                    int_put_vol += max(0, p_curr_vol - p_prev_vol)
-
-            if int_call_vol > 0:
-                interval_vol_pcr = round(int_put_vol / int_call_vol, 4)
 
             # Invariant-Safe ΔPCR:
             # Must be evaluated on the COMPARABLE STRIKE BASKET (intersection of strikes where both CE and PE existed with non-None OI)
             common_strikes = [
-                s for s in strikes
+                s for s in valid_strikes
                 if s.strike in prev_map
-                and s.call and s.put
-                and prev_map[s.strike].call and prev_map[s.strike].put
-                and s.call.get("oi") is not None and s.put.get("oi") is not None
-                and prev_map[s.strike].call.get("oi") is not None and prev_map[s.strike].put.get("oi") is not None
+                and prev_map[s.strike].call
+                and prev_map[s.strike].put
+                and prev_map[s.strike].call.get("oi") is not None
+                and prev_map[s.strike].put.get("oi") is not None
             ]
-            if common_strikes:
-                curr_common_call_oi = sum(s.call.get("oi") or 0 for s in common_strikes)
-                curr_common_put_oi = sum(s.put.get("oi") or 0 for s in common_strikes)
 
-                prev_common_call_oi = sum(prev_map[s.strike].call.get("oi") or 0 for s in common_strikes)
-                prev_common_put_oi = sum(prev_map[s.strike].put.get("oi") or 0 for s in common_strikes)
+            # Interval Volume PCR across all matching strikes with valid volume in both
+            common_vol_strikes = [
+                s for s in common_strikes
+                if s.call.get("volume") is not None
+                and s.put.get("volume") is not None
+                and prev_map[s.strike].call.get("volume") is not None
+                and prev_map[s.strike].put.get("volume") is not None
+            ]
+
+            int_put_vol = sum(
+                max(0, int(s.put["volume"]) - int(prev_map[s.strike].put["volume"]))
+                for s in common_vol_strikes
+            )
+            int_call_vol = sum(
+                max(0, int(s.call["volume"]) - int(prev_map[s.strike].call["volume"]))
+                for s in common_vol_strikes
+            )
+
+            if int_call_vol > 0:
+                interval_vol_pcr = round(int_put_vol / int_call_vol, 4)
+
+            if common_strikes:
+                curr_common_call_oi = sum(int(s.call["oi"]) for s in common_strikes)
+                curr_common_put_oi = sum(int(s.put["oi"]) for s in common_strikes)
+
+                prev_common_call_oi = sum(int(prev_map[s.strike].call["oi"]) for s in common_strikes)
+                prev_common_put_oi = sum(int(prev_map[s.strike].put["oi"]) for s in common_strikes)
 
                 if curr_common_call_oi > 0 and prev_common_call_oi > 0:
                     curr_common_pcr = curr_common_put_oi / curr_common_call_oi
@@ -209,10 +254,10 @@ class PCREngine:
                     dist = abs(s.strike - spot)
                     w = math.exp(-0.5 * (dist / self.weighting_decay_points) ** 2)
 
-                    c_c = s.call.get("oi", 0)
-                    p_c = s.put.get("oi", 0)
-                    c_p = prev_map[s.strike].call.get("oi", 0)
-                    p_p = prev_map[s.strike].put.get("oi", 0)
+                    c_c = int(s.call["oi"])
+                    p_c = int(s.put["oi"])
+                    c_p = int(prev_map[s.strike].call["oi"])
+                    p_p = int(prev_map[s.strike].put["oi"])
 
                     w_curr_call += w * c_c
                     w_curr_put += w * p_c
@@ -242,6 +287,8 @@ class PCREngine:
             total_call_volume=total_call_vol,
             strikes_evaluated_count=len(strikes),
             is_stale=is_stale,
+            strike_coverage=strike_coverage,
+            valid_strikes_count=valid_strikes_count,
         )
 
         self._pcr_history[key].append(pcr_snap)
