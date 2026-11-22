@@ -246,13 +246,34 @@ def test_fyers_option_chain_parser_synchronization_and_timestamp_provenance():
     oi_analyzer = OpenInterestAnalyzer()
     profile = oi_analyzer.on_option_chain(snap_prod)
     strike_info = profile.strikes[25100.0]
-    # Provenance must be INFERRED and greeks_timestamp must be None
+    # Provenance must be INFERRED and timestamps must be None
     assert strike_info.call_greeks_provenance == "INFERRED"
     assert strike_info.call_greeks_timestamp is None
+    assert strike_info.call_quote_timestamp is None
 
-    # Downstream contract selector must safely calculate Black-76 model Greeks
-    selector = OptionContractSelector()
-    res = selector.select_contract(
+    # Downstream contract selector without quote_provider must REJECT because quote timestamp is missing
+    selector_unverified = OptionContractSelector()
+    res_rejected = selector_unverified.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=t0,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res_rejected is None
+
+    # When supplied with a verifiably fresh on-demand quote provider, it safely enters and calculates Black-76 Greeks
+    def fresh_q_provider(sym):
+        return {
+            "bid": 94.5,
+            "ask": 95.5,
+            "ltp": 95.0,
+            "timestamp": t0,
+        }
+
+    selector_verified = OptionContractSelector(quote_provider=fresh_q_provider)
+    res = selector_verified.select_contract(
         direction=BreakoutDirection.BULLISH,
         spot_price=25100.0,
         chain_profile=profile,
@@ -294,4 +315,106 @@ def test_fyers_option_chain_parser_synchronization_and_timestamp_provenance():
     profile_explicit = oi_analyzer.on_option_chain(snap_explicit)
     assert profile_explicit.strikes[25100.0].call_greeks_provenance == "EXPLICIT"
     assert profile_explicit.strikes[25100.0].call_greeks_timestamp is not None
+    assert profile_explicit.strikes[25100.0].call_quote_timestamp is not None
+
+
+def test_timestampless_option_chain_rejected_unless_quote_refreshed():
+    """Regression test: Newly received option chain with absent bid/ask timestamps is rejected
+
+    unless an independent, verifiably fresh quote is supplied.
+    """
+    from datetime import datetime, timedelta
+
+    import pytz
+
+    from nifty_engine.analysis.derivatives.contract_selector import OptionContractSelector
+    from nifty_engine.analysis.derivatives.oi_analysis import OpenInterestAnalyzer
+    from nifty_engine.analysis.technical.breakouts import BreakoutDirection
+
+    ist = pytz.timezone("Asia/Kolkata")
+    now = ist.localize(datetime(2026, 11, 23, 10, 30))
+
+    # Newly received option-chain response, but bid/ask timestamps are absent
+    payload = {
+        "underlyingValue": 25100.0,
+        "expiryData": [{"date": "26-Nov-2026", "timestamp": 1795687200}],
+        "optionsChain": [
+            {
+                "symbol": "NSE:NIFTY26NOV25100CE",
+                "strike_price": 25100.0,
+                "option_type": "CE",
+                "ltp": 95.0,
+                "oi": 150000,
+                "volume": 50000,
+                "bid": 94.5,
+                "ask": 95.5,
+                # No quote_timestamp or tt present!
+            }
+        ],
+    }
+
+    snap = FyersRestClient.parse_option_chain_payload(payload, "NSE:NIFTY50-INDEX")
+    assert snap.is_synchronized_snapshot is False
+
+    analyzer = OpenInterestAnalyzer()
+    profile = analyzer.on_option_chain(snap)
+
+    strike = profile.strikes[25100.0]
+    # Timestamp must not be replaced with API receipt time
+    assert strike.call_quote_timestamp is None
+
+    # Case 1: Selector without quote_provider must reject due to missing timestamp
+    selector_default = OptionContractSelector()
+    res1 = selector_default.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=now,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res1 is None, "Expected contract rejection when quote timestamp is absent"
+
+    # Case 2: Selector with stale quote_provider must reject due to stale quote age
+    def stale_provider(sym):
+        return {
+            "bid": 94.5,
+            "ask": 95.5,
+            "ltp": 95.0,
+            "timestamp": now - timedelta(seconds=60),
+        }
+
+    selector_stale = OptionContractSelector(quote_provider=stale_provider)
+    res2 = selector_stale.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=now,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res2 is None, "Expected contract rejection when refreshed quote is stale"
+
+    # Case 3: Selector with fresh verified quote_provider must qualify
+    def fresh_provider(sym):
+        return {
+            "bid": 94.5,
+            "ask": 95.5,
+            "ltp": 95.0,
+            "timestamp": now,
+        }
+
+    selector_fresh = OptionContractSelector(quote_provider=fresh_provider)
+    res3 = selector_fresh.select_contract(
+        direction=BreakoutDirection.BULLISH,
+        spot_price=25100.0,
+        chain_profile=profile,
+        as_of=now,
+        risk_points=15.0,
+        target_points_t1=45.0,
+    )
+    assert res3 is not None, "Expected contract selection when verifiably fresh quote is provided"
+    assert res3.symbol == "NSE:NIFTY26NOV25100CE"
+    assert res3.quote_timestamp == now
+
 

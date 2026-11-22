@@ -254,7 +254,9 @@ class OptionContractSelector:
                 ask = strike_data.call_ask
                 bid_size = strike_data.call_bid_size
                 ask_size = strike_data.call_ask_size
-                quote_ts = strike_data.call_quote_timestamp or chain_profile.timestamp
+                quote_ts = strike_data.call_quote_timestamp
+                if quote_ts is None and getattr(chain_profile, "is_synchronized_snapshot", False):
+                    quote_ts = chain_profile.timestamp
                 # Determine Greeks timestamp with provenance gating:
                 # - If explicit Greeks timestamp is recorded, use it
                 # - Allow fallback to quote timestamp ONLY if broker response guarantees synchronized snapshot
@@ -263,7 +265,7 @@ class OptionContractSelector:
                     greeks_ts = strike_data.call_greeks_timestamp
                 elif (
                     getattr(strike_data, "call_greeks_provenance", "SYNCHRONIZED_SNAPSHOT") in ("EXPLICIT", "SYNCHRONIZED_SNAPSHOT")
-                    and getattr(chain_profile, "is_synchronized_snapshot", True)
+                    and getattr(chain_profile, "is_synchronized_snapshot", False)
                 ):
                     greeks_ts = strike_data.call_quote_timestamp or chain_profile.timestamp
                 else:
@@ -286,12 +288,14 @@ class OptionContractSelector:
                 ask = strike_data.put_ask
                 bid_size = strike_data.put_bid_size
                 ask_size = strike_data.put_ask_size
-                quote_ts = strike_data.put_quote_timestamp or chain_profile.timestamp
+                quote_ts = strike_data.put_quote_timestamp
+                if quote_ts is None and getattr(chain_profile, "is_synchronized_snapshot", False):
+                    quote_ts = chain_profile.timestamp
                 if strike_data.put_greeks_timestamp is not None:
                     greeks_ts = strike_data.put_greeks_timestamp
                 elif (
                     getattr(strike_data, "put_greeks_provenance", "SYNCHRONIZED_SNAPSHOT") in ("EXPLICIT", "SYNCHRONIZED_SNAPSHOT")
-                    and getattr(chain_profile, "is_synchronized_snapshot", True)
+                    and getattr(chain_profile, "is_synchronized_snapshot", False)
                 ):
                     greeks_ts = strike_data.put_quote_timestamp or chain_profile.timestamp
                 else:

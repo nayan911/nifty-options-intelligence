@@ -140,7 +140,7 @@ class OIProfile:
     aggregate_bias: DirectionalBias
     observation_interval_seconds: float = 0.0
     is_stale: bool = False
-    is_synchronized_snapshot: bool = True
+    is_synchronized_snapshot: bool = False
 
 
 class OpenInterestAnalyzer:
@@ -386,7 +386,7 @@ class OpenInterestAnalyzer:
         max_put_oi = -1
         put_wall_strike = 0.0
 
-        is_synced = getattr(snapshot, "is_synchronized_snapshot", True)
+        is_synced = getattr(snapshot, "is_synchronized_snapshot", False)
 
         for s in snapshot.strikes:
             strike = s.strike
@@ -410,12 +410,12 @@ class OpenInterestAnalyzer:
                 c_ask = float(c_curr["ask"]) if c_curr.get("ask") is not None else None
                 c_bid_size = int(c_curr.get("bid_size") or c_curr.get("bid_qty") or 0) if (c_curr.get("bid_size") or c_curr.get("bid_qty")) else None
                 c_ask_size = int(c_curr.get("ask_size") or c_curr.get("ask_qty") or 0) if (c_curr.get("ask_size") or c_curr.get("ask_qty")) else None
-                c_quote_ts = c_curr.get("quote_timestamp") or snapshot.api_timestamp
+                c_quote_ts = c_curr.get("quote_timestamp")
                 if c_curr.get("greeks_timestamp") or c_curr.get("greeks_time"):
                     c_greeks_ts = c_curr.get("greeks_timestamp") or c_curr.get("greeks_time")
                     c_greeks_prov = "EXPLICIT"
                 elif is_synced:
-                    c_greeks_ts = c_quote_ts
+                    c_greeks_ts = c_quote_ts or snapshot.api_timestamp
                     c_greeks_prov = "SYNCHRONIZED_SNAPSHOT"
                 else:
                     c_greeks_ts = None
@@ -477,7 +477,7 @@ class OpenInterestAnalyzer:
                 c_ask = None
                 c_bid_size = None
                 c_ask_size = None
-                c_quote_ts = snapshot.api_timestamp
+                c_quote_ts = None
                 c_greeks_ts = snapshot.api_timestamp if is_synced else None
                 c_greeks_prov = "SYNCHRONIZED_SNAPSHOT" if is_synced else "INFERRED"
                 c_iv = None
@@ -504,12 +504,12 @@ class OpenInterestAnalyzer:
                 p_ask = float(p_curr["ask"]) if p_curr.get("ask") is not None else None
                 p_bid_size = int(p_curr.get("bid_size") or p_curr.get("bid_qty") or 0) if (p_curr.get("bid_size") or p_curr.get("bid_qty")) else None
                 p_ask_size = int(p_curr.get("ask_size") or p_curr.get("ask_qty") or 0) if (p_curr.get("ask_size") or p_curr.get("ask_qty")) else None
-                p_quote_ts = p_curr.get("quote_timestamp") or snapshot.api_timestamp
+                p_quote_ts = p_curr.get("quote_timestamp")
                 if p_curr.get("greeks_timestamp") or p_curr.get("greeks_time"):
                     p_greeks_ts = p_curr.get("greeks_timestamp") or p_curr.get("greeks_time")
                     p_greeks_prov = "EXPLICIT"
                 elif is_synced:
-                    p_greeks_ts = p_quote_ts
+                    p_greeks_ts = p_quote_ts or snapshot.api_timestamp
                     p_greeks_prov = "SYNCHRONIZED_SNAPSHOT"
                 else:
                     p_greeks_ts = None
@@ -571,7 +571,7 @@ class OpenInterestAnalyzer:
                 p_ask = None
                 p_bid_size = None
                 p_ask_size = None
-                p_quote_ts = snapshot.api_timestamp
+                p_quote_ts = None
                 p_greeks_ts = snapshot.api_timestamp if is_synced else None
                 p_greeks_prov = "SYNCHRONIZED_SNAPSHOT" if is_synced else "INFERRED"
                 p_iv = None
