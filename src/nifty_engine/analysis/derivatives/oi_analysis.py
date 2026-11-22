@@ -13,6 +13,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import pytz
 
+from nifty_engine.core.calendar import get_bar_close_time
 from nifty_engine.core.interfaces import Candle, OptionChainSnapshot
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -82,6 +83,14 @@ class FuturesOIAnalysis:
     oi_change_pct: float
     buildup: BuildupType
     directional_bias: DirectionalBias
+    bar_close_time: Optional[datetime] = None
+    available_at: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        if self.bar_close_time is None:
+            self.bar_close_time = self.timestamp
+        if self.available_at is None:
+            self.available_at = self.bar_close_time
 
 
 @dataclass
@@ -183,19 +192,29 @@ class OpenInterestAnalyzer:
         current_price = candle.close
         current_oi = candle.oi
 
-        # Reject duplicate or out-of-order candles
-        if history and current_time <= history[-1].timestamp:
+        close_time = get_bar_close_time(candle.timestamp, candle.timeframe)
+        avail_at = max(candle.observed_at, close_time) if candle.observed_at is not None else close_time
+
+        # Reject duplicate or out-of-order candles based on effective availability
+        if history and avail_at <= history[-1].available_at:
             return history[-1]
 
-        # Session rollover tracking
-        if self.current_session_date is None or current_time.date() > self.current_session_date:
-            self.current_session_date = current_time.date()
+        # Session rollover tracking: clean baseline for a new trading day
+        is_new_session = (
+            self.current_session_date is None
+            or candle.timestamp.date() > self.current_session_date
+            or (history and history[-1].bar_close_time.date() < close_time.date())
+        )
+        if self.current_session_date is None or candle.timestamp.date() > self.current_session_date:
+            self.current_session_date = candle.timestamp.date()
 
-        if not history:
+        if not history or is_new_session:
             analysis = FuturesOIAnalysis(
                 symbol=candle.symbol,
                 timeframe=candle.timeframe,
                 timestamp=current_time,
+                bar_close_time=close_time,
+                available_at=avail_at,
                 price=current_price,
                 price_change=0.0,
                 price_change_pct=0.0,
@@ -227,6 +246,8 @@ class OpenInterestAnalyzer:
             symbol=candle.symbol,
             timeframe=candle.timeframe,
             timestamp=current_time,
+            bar_close_time=close_time,
+            available_at=avail_at,
             price=current_price,
             price_change=round(price_diff, 2),
             price_change_pct=round(price_diff_pct, 2),
@@ -263,10 +284,10 @@ class OpenInterestAnalyzer:
         if as_of is None:
             return history[-1]
 
-        # Reverse lookup for most recent observation on or before as_of
+        # Reverse lookup for most recent observation available on or before as_of
         for obs in reversed(history):
-            if obs.timestamp <= as_of:
-                age = (as_of - obs.timestamp).total_seconds()
+            if obs.available_at <= as_of:
+                age = (as_of - obs.available_at).total_seconds()
                 if age <= self.max_futures_age_seconds:
                     return obs
                 return None
@@ -287,7 +308,19 @@ class OpenInterestAnalyzer:
         expiry = snapshot.expiry
         current_time = as_of or snapshot.api_timestamp
 
+        key = (underlying, expiry)
+        if key not in self._chain_history:
+            self._chain_history[key] = deque(maxlen=self.history_max_len)
+            self._profile_history[key] = deque(maxlen=self.history_max_len)
+
+        history = self._chain_history[key]
+
         # Session date update
+        is_new_session = (
+            self.current_session_date is None
+            or current_time.date() > self.current_session_date
+            or (bool(history) and history[-1].api_timestamp.date() < current_time.date())
+        )
         if self.current_session_date is None or current_time.date() > self.current_session_date:
             self.current_session_date = current_time.date()
 
@@ -295,17 +328,13 @@ class OpenInterestAnalyzer:
         if expiry < self.current_session_date:
             return None
 
-        key = (underlying, expiry)
-        if key not in self._chain_history:
-            self._chain_history[key] = deque(maxlen=self.history_max_len)
-            self._profile_history[key] = deque(maxlen=self.history_max_len)
-
-        history = self._chain_history[key]
         # Reject duplicate or out-of-order snapshots
         if history and snapshot.api_timestamp <= history[-1].api_timestamp:
             return self._profile_history[key][-1] if self._profile_history[key] else None
 
-        prev_snapshot: Optional[OptionChainSnapshot] = history[-1] if history else None
+        prev_snapshot: Optional[OptionChainSnapshot] = None
+        if history and not is_new_session:
+            prev_snapshot = history[-1]
         history.append(snapshot)
 
         interval_seconds = 0.0
@@ -332,11 +361,21 @@ class OpenInterestAnalyzer:
             c_prev = prev_s.call if prev_s else None
 
             if c_curr is not None:
-                c_oi = int(c_curr.get("oi", 0))
-                c_ltp = float(c_curr.get("ltp", 0.0))
-                c_vol = int(c_curr.get("volume", 0))
+                c_oi_raw = c_curr.get("oi")
+                c_ltp_raw = c_curr.get("ltp")
+                c_vol_raw = c_curr.get("volume")
 
-                if c_prev is not None:
+                c_oi = int(c_oi_raw) if c_oi_raw is not None else 0
+                c_ltp = float(c_ltp_raw) if c_ltp_raw is not None else 0.0
+                c_vol = int(c_vol_raw) if c_vol_raw is not None else 0
+
+                if (
+                    c_prev is not None
+                    and c_oi_raw is not None
+                    and c_prev.get("oi") is not None
+                    and c_ltp_raw is not None
+                    and c_prev.get("ltp") is not None
+                ):
                     c_prev_oi = int(c_prev.get("oi", c_oi))
                     c_prev_ltp = float(c_prev.get("ltp", c_ltp))
                     c_prev_vol = int(c_prev.get("volume", c_vol))
@@ -347,7 +386,7 @@ class OpenInterestAnalyzer:
                     c_ltp_change_pct = (c_ltp_change / c_prev_ltp * 100.0) if c_prev_ltp > 0 else 0.0
                     c_vol_change = c_vol - c_prev_vol
                 else:
-                    # Newly appearing strike: establish baseline, zero delta
+                    # Newly appearing strike or missing data: establish baseline, zero delta
                     c_oi_change = 0
                     c_oi_change_pct = 0.0
                     c_ltp_change = 0.0
@@ -381,11 +420,21 @@ class OpenInterestAnalyzer:
             p_prev = prev_s.put if prev_s else None
 
             if p_curr is not None:
-                p_oi = int(p_curr.get("oi", 0))
-                p_ltp = float(p_curr.get("ltp", 0.0))
-                p_vol = int(p_curr.get("volume", 0))
+                p_oi_raw = p_curr.get("oi")
+                p_ltp_raw = p_curr.get("ltp")
+                p_vol_raw = p_curr.get("volume")
 
-                if p_prev is not None:
+                p_oi = int(p_oi_raw) if p_oi_raw is not None else 0
+                p_ltp = float(p_ltp_raw) if p_ltp_raw is not None else 0.0
+                p_vol = int(p_vol_raw) if p_vol_raw is not None else 0
+
+                if (
+                    p_prev is not None
+                    and p_oi_raw is not None
+                    and p_prev.get("oi") is not None
+                    and p_ltp_raw is not None
+                    and p_prev.get("ltp") is not None
+                ):
                     p_prev_oi = int(p_prev.get("oi", p_oi))
                     p_prev_ltp = float(p_prev.get("ltp", p_ltp))
                     p_prev_vol = int(p_prev.get("volume", p_vol))
@@ -396,7 +445,7 @@ class OpenInterestAnalyzer:
                     p_ltp_change_pct = (p_ltp_change / p_prev_ltp * 100.0) if p_prev_ltp > 0 else 0.0
                     p_vol_change = p_vol - p_prev_vol
                 else:
-                    # Newly appearing strike: establish baseline, zero delta
+                    # Newly appearing strike or missing data: establish baseline, zero delta
                     p_oi_change = 0
                     p_oi_change_pct = 0.0
                     p_ltp_change = 0.0
@@ -588,12 +637,13 @@ class OpenInterestAnalyzer:
         if not matching_keys:
             return None
 
-        # Exclude expired contracts
+        # Exclude expired contracts relative to query date
+        query_date = as_of.date() if as_of is not None else (self.current_session_date or date.today())
         active_keys = [
-            k for k in matching_keys if (self.current_session_date is None or k[1] >= self.current_session_date)
+            k for k in matching_keys if k[1] >= query_date
         ]
         if not active_keys:
-            active_keys = matching_keys
+            return None
 
         # Select nearest active expiry
         active_keys.sort(key=lambda k: k[1])

@@ -90,12 +90,17 @@ class DerivativesIntelligenceEngine:
         self.pcr_engine = pcr_engine or PCREngine()
         self.primary_futures = primary_futures
 
+    def set_futures_ticker(self, futures_ticker: str) -> None:
+        """Updates active primary futures symbol (e.g. upon monthly expiry rollover)."""
+        self.primary_futures = futures_ticker
+
     def evaluate_setup(
         self,
         direction: BreakoutDirection,
         level_price: float,
         as_of: datetime,
         underlying: str = "NIFTY",
+        futures_symbol: Optional[str] = None,
         confirmation_status: str = "CONFIRMED",
     ) -> DerivativesAssessment:
         """Evaluates derivatives alignment for a given breakout direction and reference level.
@@ -103,16 +108,17 @@ class DerivativesIntelligenceEngine:
         Strictly descriptive: Causal as of cutoff `as_of`, with dynamic freshness validation
         and zero hard vetoes.
         """
+        active_futures = futures_symbol or self.primary_futures
         # Causal retrieval as of as_of
         oi_profile = self.oi_analyzer.get_profile(underlying=underlying, as_of=as_of)
         pcr_snap = self.pcr_engine.get_pcr(underlying=underlying, as_of=as_of)
         fut_analysis = self.oi_analyzer.get_futures_analysis(
-            symbol=self.primary_futures, timeframe="5m", as_of=as_of
+            symbol=active_futures, timeframe="5m", as_of=as_of
         )
         if fut_analysis is None:
             # Fallback to 1m futures analysis if 5m is not ready
             fut_analysis = self.oi_analyzer.get_futures_analysis(
-                symbol=self.primary_futures, timeframe="1m", as_of=as_of
+                symbol=active_futures, timeframe="1m", as_of=as_of
             )
 
         # Check data sufficiency and dynamic freshness relative to as_of
@@ -155,10 +161,15 @@ class DerivativesIntelligenceEngine:
                 is_stale=True,
             )
 
-        # Compute dynamic data quality score (0.0 to 1.0)
+        # Compute dynamic data quality score (0.0 to 1.0) based on valid non-None observations
         age_seconds = max(0.0, (as_of - oi_profile.timestamp).total_seconds())
         freshness_factor = max(0.0, 1.0 - (age_seconds / self.oi_analyzer.max_snapshot_age_seconds))
-        strike_coverage = min(1.0, len(oi_profile.near_atm_strikes) / max(1, 2 * self.oi_analyzer.near_atm_strikes_count + 1))
+        expected_strikes = max(1, 2 * self.oi_analyzer.near_atm_strikes_count + 1)
+        valid_strikes_count = sum(
+            1 for s in oi_profile.near_atm_strikes
+            if s.call_oi > 0 and s.put_oi > 0 and s.call_ltp > 0.0 and s.put_ltp > 0.0
+        )
+        strike_coverage = min(1.0, valid_strikes_count / expected_strikes)
         fut_present = 1.0 if fut_analysis is not None else 0.5
         data_quality = round(0.4 * freshness_factor + 0.3 * strike_coverage + 0.3 * fut_present, 2)
 

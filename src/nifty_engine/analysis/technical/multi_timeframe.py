@@ -627,10 +627,28 @@ class MultiTimeframeAnalyzer:
         deriv_engine = self.derivatives_engine or getattr(self.engine, "derivatives_engine", None)
         deriv_assessment = None
         if deriv_engine is not None:
+            sym_upper = setup.symbol.upper()
+            if "BANKNIFTY" in sym_upper or "NIFTYBANK" in sym_upper:
+                underlying = "BANKNIFTY"
+            elif "NIFTY" in sym_upper:
+                underlying = "NIFTY"
+            elif "SENSEX" in sym_upper:
+                underlying = "SENSEX"
+            else:
+                underlying = setup.symbol
+
+            futures_symbol = None
+            if hasattr(self.engine, "index_futures_map"):
+                futures_symbol = self.engine.index_futures_map.get(setup.symbol)
+            if futures_symbol is None and hasattr(self.engine, "primary_futures"):
+                futures_symbol = self.engine.primary_futures
+
             deriv_assessment = deriv_engine.evaluate_setup(
                 direction=setup.direction,
                 level_price=nominal_lvl,
                 as_of=decision_time,
+                underlying=underlying,
+                futures_symbol=futures_symbol,
                 confirmation_status=confirmation_status,
             )
 

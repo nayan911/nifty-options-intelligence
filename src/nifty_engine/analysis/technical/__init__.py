@@ -9,8 +9,6 @@ from nifty_engine.analysis.technical.engine import (
     SymbolTechnicalState,
     TechnicalAnalysisEngine,
     TechnicalSnapshot,
-    get_bar_close_time,
-    get_bar_duration,
 )
 from nifty_engine.analysis.technical.indicators import (
     compute_atr,
@@ -35,6 +33,10 @@ from nifty_engine.analysis.technical.support_resistance import (
 )
 from nifty_engine.analysis.technical.swings import SwingDetector, SwingPoint, SwingType
 from nifty_engine.analysis.technical.trendlines import Trendline, TrendlineDetector
+from nifty_engine.core.calendar import (
+    get_bar_close_time,
+    get_bar_duration,
+)
 
 __all__ = [
     "MultiTimeframeAnalyzer",

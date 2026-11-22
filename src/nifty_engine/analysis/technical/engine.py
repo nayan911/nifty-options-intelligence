@@ -16,7 +16,7 @@ Orchestrates streaming technical and structural quantitative analysis across sub
 import threading
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -39,24 +39,8 @@ from nifty_engine.analysis.technical.support_resistance import (
     SupportResistanceEngine,
 )
 from nifty_engine.analysis.technical.swings import SwingDetector, SwingPoint
+from nifty_engine.core.calendar import get_bar_close_time
 from nifty_engine.core.interfaces import BreakoutState, Candle
-
-
-def get_bar_duration(timeframe: str) -> timedelta:
-    """Returns standard duration for supported candlestick timeframe."""
-    duration_map = {
-        "1m": timedelta(minutes=1),
-        "5m": timedelta(minutes=5),
-        "15m": timedelta(minutes=15),
-        "1h": timedelta(hours=1),
-        "1d": timedelta(days=1),
-    }
-    return duration_map.get(timeframe, timedelta(minutes=1))
-
-
-def get_bar_close_time(timestamp: datetime, timeframe: str) -> datetime:
-    """Computes exact close/completion timestamp for a candle with opening timestamp."""
-    return timestamp + get_bar_duration(timeframe)
 
 
 @dataclass
@@ -1258,6 +1242,11 @@ class TechnicalAnalysisEngine:
             self.index_futures_map[self.primary_index] = futures_ticker
             self.futures_index_map[futures_ticker] = self.primary_index
             self._get_or_create_state(futures_ticker, is_index=False)
+            if self.derivatives_engine is not None:
+                if hasattr(self.derivatives_engine, "set_futures_ticker"):
+                    self.derivatives_engine.set_futures_ticker(futures_ticker)
+                else:
+                    self.derivatives_engine.primary_futures = futures_ticker
 
     def set_index_futures_mapping(self, index_symbol: str, futures_symbol: str) -> None:
         """Explicitly pairs a spot index with its corresponding futures instrument."""

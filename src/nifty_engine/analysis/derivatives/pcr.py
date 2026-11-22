@@ -82,7 +82,19 @@ class PCREngine:
         expiry = snapshot.expiry
         current_time = as_of or snapshot.api_timestamp
 
+        key = (underlying, expiry)
+        if key not in self._snapshot_history:
+            self._snapshot_history[key] = deque(maxlen=self.history_max_len)
+            self._pcr_history[key] = deque(maxlen=self.history_max_len)
+
+        snap_history = self._snapshot_history[key]
+
         # Session date update
+        is_new_session = (
+            self.current_session_date is None
+            or current_time.date() > self.current_session_date
+            or (bool(snap_history) and snap_history[-1].api_timestamp.date() < current_time.date())
+        )
         if self.current_session_date is None or current_time.date() > self.current_session_date:
             self.current_session_date = current_time.date()
 
@@ -90,17 +102,13 @@ class PCREngine:
         if expiry < self.current_session_date:
             return None
 
-        key = (underlying, expiry)
-        if key not in self._snapshot_history:
-            self._snapshot_history[key] = deque(maxlen=self.history_max_len)
-            self._pcr_history[key] = deque(maxlen=self.history_max_len)
-
-        snap_history = self._snapshot_history[key]
         # Reject duplicate or out-of-order snapshots
         if snap_history and snapshot.api_timestamp <= snap_history[-1].api_timestamp:
             return self._pcr_history[key][-1] if self._pcr_history[key] else None
 
-        prev_snapshot: Optional[OptionChainSnapshot] = snap_history[-1] if snap_history else None
+        prev_snapshot: Optional[OptionChainSnapshot] = None
+        if snap_history and not is_new_session:
+            prev_snapshot = snap_history[-1]
         snap_history.append(snapshot)
 
         is_stale = (current_time - snapshot.api_timestamp).total_seconds() > self.max_snapshot_age_seconds
@@ -108,10 +116,10 @@ class PCREngine:
         spot = snapshot.spot_price
         strikes = snapshot.strikes
 
-        total_call_oi = sum((s.call or {}).get("oi", 0) for s in strikes if s.call)
-        total_put_oi = sum((s.put or {}).get("oi", 0) for s in strikes if s.put)
-        total_call_vol = sum((s.call or {}).get("volume", 0) for s in strikes if s.call)
-        total_put_vol = sum((s.put or {}).get("volume", 0) for s in strikes if s.put)
+        total_call_oi = sum((s.call.get("oi") or 0) for s in strikes if s.call)
+        total_put_oi = sum((s.put.get("oi") or 0) for s in strikes if s.put)
+        total_call_vol = sum((s.call.get("volume") or 0) for s in strikes if s.call)
+        total_put_vol = sum((s.put.get("volume") or 0) for s in strikes if s.put)
 
         # 1. Aggregate OI PCR: Sum(Put OI) / Sum(Call OI)
         agg_oi_pcr = round(total_put_oi / total_call_oi, 4) if total_call_oi > 0 else None
@@ -124,8 +132,8 @@ class PCREngine:
         sorted_by_dist = sorted(sorted_strikes, key=lambda s: abs(s.strike - spot))
         near_atm_strikes = sorted_by_dist[: 2 * self.near_atm_strike_range + 1]
 
-        near_atm_call_oi = sum((s.call or {}).get("oi", 0) for s in near_atm_strikes if s.call)
-        near_atm_put_oi = sum((s.put or {}).get("oi", 0) for s in near_atm_strikes if s.put)
+        near_atm_call_oi = sum((s.call.get("oi") or 0) for s in near_atm_strikes if s.call)
+        near_atm_put_oi = sum((s.put.get("oi") or 0) for s in near_atm_strikes if s.put)
         near_atm_pcr = round(near_atm_put_oi / near_atm_call_oi, 4) if near_atm_call_oi > 0 else None
 
         # 4. Strike-Weighted PCR: strikes closer to ATM have higher weight
@@ -134,8 +142,8 @@ class PCREngine:
         for s in strikes:
             dist = abs(s.strike - spot)
             w = math.exp(-0.5 * (dist / self.weighting_decay_points) ** 2)
-            c_oi = (s.call or {}).get("oi", 0) if s.call else 0
-            p_oi = (s.put or {}).get("oi", 0) if s.put else 0
+            c_oi = (s.call.get("oi") or 0) if s.call else 0
+            p_oi = (s.put.get("oi") or 0) if s.put else 0
             weighted_call_sum += w * c_oi
             weighted_put_sum += w * p_oi
 
@@ -158,10 +166,10 @@ class PCREngine:
             for s in strikes:
                 if s.strike in prev_map and s.call and s.put and prev_map[s.strike].call and prev_map[s.strike].put:
                     prev_s = prev_map[s.strike]
-                    c_curr_vol = s.call.get("volume", 0)
-                    c_prev_vol = prev_s.call.get("volume", 0)
-                    p_curr_vol = s.put.get("volume", 0)
-                    p_prev_vol = prev_s.put.get("volume", 0)
+                    c_curr_vol = s.call.get("volume") or 0
+                    c_prev_vol = prev_s.call.get("volume") or 0
+                    p_curr_vol = s.put.get("volume") or 0
+                    p_prev_vol = prev_s.put.get("volume") or 0
 
                     int_call_vol += max(0, c_curr_vol - c_prev_vol)
                     int_put_vol += max(0, p_curr_vol - p_prev_vol)
@@ -170,19 +178,21 @@ class PCREngine:
                 interval_vol_pcr = round(int_put_vol / int_call_vol, 4)
 
             # Invariant-Safe ΔPCR:
-            # Must be evaluated on the COMPARABLE STRIKE BASKET (intersection of strikes where both CE and PE existed)
+            # Must be evaluated on the COMPARABLE STRIKE BASKET (intersection of strikes where both CE and PE existed with non-None OI)
             common_strikes = [
                 s for s in strikes
                 if s.strike in prev_map
                 and s.call and s.put
                 and prev_map[s.strike].call and prev_map[s.strike].put
+                and s.call.get("oi") is not None and s.put.get("oi") is not None
+                and prev_map[s.strike].call.get("oi") is not None and prev_map[s.strike].put.get("oi") is not None
             ]
             if common_strikes:
-                curr_common_call_oi = sum(s.call.get("oi", 0) for s in common_strikes)
-                curr_common_put_oi = sum(s.put.get("oi", 0) for s in common_strikes)
+                curr_common_call_oi = sum(s.call.get("oi") or 0 for s in common_strikes)
+                curr_common_put_oi = sum(s.put.get("oi") or 0 for s in common_strikes)
 
-                prev_common_call_oi = sum(prev_map[s.strike].call.get("oi", 0) for s in common_strikes)
-                prev_common_put_oi = sum(prev_map[s.strike].put.get("oi", 0) for s in common_strikes)
+                prev_common_call_oi = sum(prev_map[s.strike].call.get("oi") or 0 for s in common_strikes)
+                prev_common_put_oi = sum(prev_map[s.strike].put.get("oi") or 0 for s in common_strikes)
 
                 if curr_common_call_oi > 0 and prev_common_call_oi > 0:
                     curr_common_pcr = curr_common_put_oi / curr_common_call_oi
@@ -251,12 +261,13 @@ class PCREngine:
         if not matching_keys:
             return None
 
-        # Exclude expired contracts
+        # Exclude expired contracts relative to query date
+        query_date = as_of.date() if as_of is not None else (self.current_session_date or date.today())
         active_keys = [
-            k for k in matching_keys if (self.current_session_date is None or k[1] >= self.current_session_date)
+            k for k in matching_keys if k[1] >= query_date
         ]
         if not active_keys:
-            active_keys = matching_keys
+            return None
 
         # Select nearest active expiry
         active_keys.sort(key=lambda k: k[1])

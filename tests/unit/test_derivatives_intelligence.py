@@ -36,6 +36,7 @@ from nifty_engine.core.interfaces import (
     OptionChainSnapshot,
     OptionChainStrike,
 )
+from nifty_engine.data.fyers.rest_client import FyersRestClient
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -718,25 +719,36 @@ def test_derivatives_assessment_retrieves_latest_futures_at_decision_at():
     oi_analyzer.on_option_chain(snap)
     pcr_engine.on_option_chain(snap)
 
-    # Initial futures candle at 10:00
-    c0 = Candle(symbol=fut_sym, timeframe="5m", timestamp=t0, open=25000.0, high=25020.0, low=24990.0, close=25000.0, volume=1000, oi=100000, is_closed=True)
+    # Initial futures candle covering 09:55-10:00 (closes at 10:00)
+    c0 = Candle(symbol=fut_sym, timeframe="5m", timestamp=t0 - timedelta(minutes=5), open=25000.0, high=25020.0, low=24990.0, close=25000.0, volume=1000, oi=100000, is_closed=True)
     oi_analyzer.on_futures_candle(c0)
 
-    # At 10:05 (before next option chain poll at 10:06), a new futures candle arrives showing Long Buildup
+    # At 10:05 (before next option chain poll at 10:06), a new 10:00-10:05 futures candle arrives showing Long Buildup
     t1 = t0 + timedelta(minutes=5)
-    c1 = Candle(symbol=fut_sym, timeframe="5m", timestamp=t1, open=25000.0, high=25060.0, low=25000.0, close=25050.0, volume=3000, oi=105000, is_closed=True)
+    c1 = Candle(symbol=fut_sym, timeframe="5m", timestamp=t0, open=25000.0, high=25060.0, low=25000.0, close=25050.0, volume=3000, oi=105000, is_closed=True, observed_at=t1)
     oi_analyzer.on_futures_candle(c1)
 
-    # Evaluate setup at 10:05
+    # Invariant P0: At 10:03 (mid-candle), 10:00-10:05 candle is NOT available (zero lookahead)
+    assessment_1003 = engine.evaluate_setup(
+        direction=BreakoutDirection.BULLISH,
+        level_price=25100.0,
+        as_of=t0 + timedelta(minutes=3),
+    )
+    assert assessment_1003.futures_analysis is not None
+    assert assessment_1003.futures_analysis.timestamp == t0 - timedelta(minutes=5)
+    assert assessment_1003.futures_bias == DirectionalBias.NEUTRAL
+
+    # Evaluate setup at 10:05 when 10:00-10:05 candle has closed and become available
     assessment = engine.evaluate_setup(
         direction=BreakoutDirection.BULLISH,
         level_price=25100.0,
         as_of=t1,
     )
-    # Invariant: Retrieved futures positioning from 10:05 candle (Long Buildup), NOT stale 10:00!
+    # Invariant: Retrieved futures positioning from 10:05 completed candle (Long Buildup), NOT stale 10:00!
     assert assessment.futures_bias == DirectionalBias.BULLISH
     assert assessment.futures_analysis is not None
-    assert assessment.futures_analysis.timestamp == t1
+    assert assessment.futures_analysis.timestamp == t0
+    assert assessment.futures_analysis.bar_close_time == t1
     assert assessment.futures_analysis.buildup == BuildupType.LONG_BUILDUP
 
 
@@ -777,3 +789,305 @@ def test_missing_strike_data_handling_not_treated_as_zero():
 
     # Invariant: ΔPCR evaluated only on common strikes (25050, 25100), yielding delta_oi_pcr == 0.0
     assert pcr1.delta_oi_pcr == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Dedicated Regression Tests for Phase 3A Fixes
+# ---------------------------------------------------------------------------
+
+
+def test_p0_futures_oi_causal_timing_and_availability():
+    """Verify P0: Retrospective query mid-candle (e.g. 10:03) cannot see 10:00-10:05 candle,
+
+    and late-arriving futures candle respects observed_at availability timestamp.
+    """
+    analyzer = OpenInterestAnalyzer()
+    fut_sym = "NSE:NIFTY26NOVFUT"
+    t_open = IST.localize(datetime(2026, 11, 23, 10, 0))
+    t_close = t_open + timedelta(minutes=5)
+    t_mid = t_open + timedelta(minutes=3)
+
+    # 1. Candle opens at 10:00, scheduled close is 10:05
+    c0 = Candle(
+        symbol=fut_sym,
+        timeframe="5m",
+        timestamp=t_open,
+        open=25000.0,
+        high=25050.0,
+        low=24990.0,
+        close=25040.0,
+        volume=2000,
+        oi=100000,
+        is_closed=True,
+    )
+    analyzer.on_futures_candle(c0)
+
+    # Mid-candle query at 10:03:00 MUST NOT see the 10:00-10:05 candle!
+    obs_1003 = analyzer.get_futures_analysis(symbol=fut_sym, timeframe="5m", as_of=t_mid)
+    assert obs_1003 is None
+
+    # Query at scheduled close 10:05:00: Candle is closed and available
+    obs_1005 = analyzer.get_futures_analysis(symbol=fut_sym, timeframe="5m", as_of=t_close)
+    assert obs_1005 is not None
+    assert obs_1005.timestamp == t_open
+    assert obs_1005.bar_close_time == t_close
+    assert obs_1005.available_at == t_close
+
+    # 2. Delayed candle arrival: Bar covers 10:05-10:10, but observed_at is 10:11:15
+    t_open_2 = t_close
+    t_close_2 = t_open_2 + timedelta(minutes=5)
+    t_observed_2 = t_close_2 + timedelta(seconds=75)  # 10:11:15
+
+    c1 = Candle(
+        symbol=fut_sym,
+        timeframe="5m",
+        timestamp=t_open_2,
+        open=25040.0,
+        high=25100.0,
+        low=25030.0,
+        close=25090.0,
+        volume=3000,
+        oi=108000,
+        is_closed=True,
+        observed_at=t_observed_2,
+    )
+    analyzer.on_futures_candle(c1)
+
+    # At 10:10:30, scheduled bar closed but observation had not arrived yet
+    obs_1010_30 = analyzer.get_futures_analysis(symbol=fut_sym, timeframe="5m", as_of=t_close_2 + timedelta(seconds=30))
+    # Must only return c0, NOT c1!
+    assert obs_1010_30 is not None
+    assert obs_1010_30.timestamp == t_open
+
+    # At 10:11:20 (after observed_at), c1 is available
+    obs_1011_20 = analyzer.get_futures_analysis(symbol=fut_sym, timeframe="5m", as_of=t_observed_2 + timedelta(seconds=5))
+    assert obs_1011_20 is not None
+    assert obs_1011_20.timestamp == t_open_2
+    assert obs_1011_20.available_at == t_observed_2
+
+
+def test_p0_underlying_and_futures_symbol_routing():
+    """Verify P0: Derivatives assessments route correctly per underlying and synchronize active futures."""
+    oi_analyzer = OpenInterestAnalyzer()
+    pcr_engine = PCREngine()
+    deriv_engine = DerivativesIntelligenceEngine(
+        oi_analyzer=oi_analyzer,
+        pcr_engine=pcr_engine,
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+
+    # Ingest NIFTY option chain
+    snap_nifty = create_test_snapshot(api_time=t0)
+    oi_analyzer.on_option_chain(snap_nifty)
+    pcr_engine.on_option_chain(snap_nifty)
+
+    # 1. BANKNIFTY has NO option chain ingested -> Returns INSUFFICIENT_DATA
+    assessment_bank = deriv_engine.evaluate_setup(
+        direction=BreakoutDirection.BULLISH,
+        level_price=52000.0,
+        as_of=t0,
+        underlying="BANKNIFTY",
+        futures_symbol="NSE:BANKNIFTY26NOVFUT",
+    )
+    assert assessment_bank.assessment_type == DerivativesAssessmentType.INSUFFICIENT_DATA
+
+    # 2. Ingest BANKNIFTY option chain
+    snap_bank = OptionChainSnapshot(
+        underlying="BANKNIFTY",
+        spot_price=52000.0,
+        api_timestamp=t0,
+        expiry=date(2026, 11, 26),
+        strikes=[
+            OptionChainStrike(
+                strike=52000.0,
+                call={"symbol": "NSE:BANKNIFTY52000CE", "oi": 50000, "ltp": 250.0, "volume": 10000},
+                put={"symbol": "NSE:BANKNIFTY52000PE", "oi": 50000, "ltp": 250.0, "volume": 10000},
+            )
+        ],
+        total_call_oi=50000,
+        total_put_oi=50000,
+        pcr=1.0,
+    )
+    oi_analyzer.on_option_chain(snap_bank)
+    pcr_engine.on_option_chain(snap_bank)
+
+    assessment_bank_2 = deriv_engine.evaluate_setup(
+        direction=BreakoutDirection.BULLISH,
+        level_price=52000.0,
+        as_of=t0,
+        underlying="BANKNIFTY",
+        futures_symbol="NSE:BANKNIFTY26NOVFUT",
+    )
+    assert assessment_bank_2.oi_profile is not None
+    assert assessment_bank_2.oi_profile.underlying == "BANKNIFTY"
+
+    # 3. Verify set_futures_ticker synchronization
+    tech_engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+        derivatives_engine=deriv_engine,
+    )
+    tech_engine.set_futures_ticker("NSE:NIFTY26DECFUT")
+    assert deriv_engine.primary_futures == "NSE:NIFTY26DECFUT"
+
+
+def test_p1_session_rollover_resets_baselines_without_overnight_jumps():
+    """Verify P1: First observation of a new day establishes clean baseline without overnight jumps."""
+    oi_analyzer = OpenInterestAnalyzer(
+        min_oi_change_threshold_pct=1.0,
+        min_oi_change_contracts=100,
+        min_price_change_pct=0.2,
+    )
+    pcr_engine = PCREngine()
+    fut_sym = "NSE:NIFTY26NOVFUT"
+
+    # Day 1: 15:25 candle (closing at 15:30)
+    t_d1 = IST.localize(datetime(2026, 11, 23, 15, 25))
+    c_d1 = Candle(
+        symbol=fut_sym,
+        timeframe="5m",
+        timestamp=t_d1,
+        open=25000.0,
+        high=25020.0,
+        low=24990.0,
+        close=25000.0,
+        volume=2000,
+        oi=100000,
+        is_closed=True,
+    )
+    oi_analyzer.on_futures_candle(c_d1)
+
+    snap_d1 = create_test_snapshot(api_time=t_d1)
+    oi_analyzer.on_option_chain(snap_d1)
+    pcr_engine.on_option_chain(snap_d1)
+
+    # Day 2: 09:15 candle (gap up +300 points, OI +20,000)
+    t_d2 = IST.localize(datetime(2026, 11, 24, 9, 15))
+    c_d2 = Candle(
+        symbol=fut_sym,
+        timeframe="5m",
+        timestamp=t_d2,
+        open=25300.0,
+        high=25350.0,
+        low=25280.0,
+        close=25320.0,
+        volume=5000,
+        oi=120000,
+        is_closed=True,
+    )
+    res_d2 = oi_analyzer.on_futures_candle(c_d2)
+
+    # Invariant: Day 2 first candle must be a clean baseline (zero delta, NEUTRAL buildup)
+    assert res_d2.price_change == 0.0
+    assert res_d2.oi_change == 0
+    assert res_d2.buildup == BuildupType.NEUTRAL
+    assert res_d2.directional_bias == DirectionalBias.NEUTRAL
+
+    # Day 2 option chain snapshot at 09:16
+    snap_d2 = create_test_snapshot(
+        api_time=t_d2 + timedelta(minutes=1),
+        spot_price=25320.0,
+        strikes_data=[(25100.0, 150000, 150.0, 30000, 30000, 40.0, 10000)],
+    )
+    prof_d2 = oi_analyzer.on_option_chain(snap_d2)
+    pcr_d2 = pcr_engine.on_option_chain(snap_d2)
+
+    # Invariant: Day 2 first option chain snapshot must have zero delta and no overnight interval metrics
+    assert prof_d2.strikes[25100.0].call_oi_change == 0
+    assert pcr_d2.interval_volume_pcr is None
+    assert pcr_d2.delta_oi_pcr is None
+
+
+def test_p1_missing_unreported_fields_and_data_quality_score():
+    """Verify P1: Missing/unreported fields remain None, do not fabricate delta spikes, and factor into quality score."""
+    # 1. Test FyersRestClient._extract_contract_fields with missing keys
+    raw_partial = {
+        "symbol": "NSE:NIFTY26NOV25100CE",
+        "bid": 80.5,
+        "ask": 81.0,
+    }
+    extracted = FyersRestClient._extract_contract_fields(raw_partial)
+    assert extracted["ltp"] is None
+    assert extracted["oi"] is None
+    assert extracted["volume"] is None
+    assert extracted["oi_change"] is None
+    assert extracted["iv"] is None
+
+    # 2. Ingest option chain where a strike has None fields
+    oi_analyzer = OpenInterestAnalyzer()
+    pcr_engine = PCREngine()
+    engine = DerivativesIntelligenceEngine(oi_analyzer=oi_analyzer, pcr_engine=pcr_engine)
+
+    t0 = IST.localize(datetime(2026, 11, 23, 10, 0))
+    snap0 = create_test_snapshot(api_time=t0)
+    oi_analyzer.on_option_chain(snap0)
+
+    # Next snapshot has strike 25100 with None for OI
+    snap1 = OptionChainSnapshot(
+        underlying="NIFTY",
+        spot_price=25100.0,
+        api_timestamp=t0 + timedelta(minutes=3),
+        expiry=date(2026, 11, 26),
+        strikes=[
+            OptionChainStrike(
+                strike=25100.0,
+                call={"symbol": "NSE:NIFTY25100CE", "oi": None, "ltp": None, "volume": None},
+                put={"symbol": "NSE:NIFTY25100PE", "oi": None, "ltp": None, "volume": None},
+            )
+        ],
+        total_call_oi=0,
+        total_put_oi=0,
+        pcr=0.0,
+    )
+    prof1 = oi_analyzer.on_option_chain(snap1)
+    # Invariant: Does not compute false -120,000 delta drop
+    assert prof1.strikes[25100.0].call_oi_change == 0
+    assert prof1.strikes[25100.0].call_buildup == BuildupType.NEUTRAL
+
+    # 3. Data quality score drops when near-ATM strikes lack valid observations
+    pcr_engine.on_option_chain(snap1)
+    assessment = engine.evaluate_setup(
+        direction=BreakoutDirection.BULLISH,
+        level_price=25100.0,
+        as_of=t0 + timedelta(minutes=3),
+    )
+    # Because valid_strikes_count is 0, strike_coverage is 0.0, lowering data_quality_score
+    assert assessment.data_quality_score <= 0.6
+
+
+def test_p1_expired_option_chain_not_selected_returns_insufficient_data():
+    """Verify P1: Expired option chains are never selected as fallback; returns None and INSUFFICIENT_DATA."""
+    oi_analyzer = OpenInterestAnalyzer()
+    pcr_engine = PCREngine()
+    engine = DerivativesIntelligenceEngine(oi_analyzer=oi_analyzer, pcr_engine=pcr_engine)
+
+    # Ingest option chain expiring 2026-11-20
+    t_past = IST.localize(datetime(2026, 11, 20, 15, 0))
+    snap_past = create_test_snapshot(
+        api_time=t_past,
+        expiry_date=date(2026, 11, 20),
+    )
+    oi_analyzer.on_option_chain(snap_past)
+    pcr_engine.on_option_chain(snap_past)
+
+    # Current query is on 2026-11-23 (after 2026-11-20 expiry)
+    t_now = IST.localize(datetime(2026, 11, 23, 10, 0))
+
+    # Invariant: get_profile must return None, NOT fall back to expired 2026-11-20 contracts!
+    prof = oi_analyzer.get_profile(underlying="NIFTY", as_of=t_now)
+    assert prof is None
+
+    pcr_snap = pcr_engine.get_pcr(underlying="NIFTY", as_of=t_now)
+    assert pcr_snap is None
+
+    # Invariant: evaluate_setup must return INSUFFICIENT_DATA
+    assessment = engine.evaluate_setup(
+        direction=BreakoutDirection.BULLISH,
+        level_price=25100.0,
+        as_of=t_now,
+    )
+    assert assessment.assessment_type == DerivativesAssessmentType.INSUFFICIENT_DATA
+    assert assessment.is_stale is True
+

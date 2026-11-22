@@ -152,12 +152,12 @@ class FyersRestClient:
 
                 if item.get("ce"):
                     c = item["ce"]
-                    oi = int(c.get("oi", 0))
+                    oi = int(c.get("oi") or 0)
                     total_call_oi += oi
                     strike_map[strike_p]["call"] = FyersRestClient._extract_contract_fields(c)
                 if item.get("pe"):
                     p = item["pe"]
-                    oi = int(p.get("oi", 0))
+                    oi = int(p.get("oi") or 0)
                     total_put_oi += oi
                     strike_map[strike_p]["put"] = FyersRestClient._extract_contract_fields(p)
 
@@ -183,7 +183,7 @@ class FyersRestClient:
                         opt_type = "PE"
 
                 contract_dict = FyersRestClient._extract_contract_fields(item)
-                oi = int(item.get("oi", 0))
+                oi = int(item.get("oi") or 0)
 
                 if opt_type in ("CE", "CALL"):
                     total_call_oi += oi
@@ -237,7 +237,7 @@ class FyersRestClient:
 
     @staticmethod
     def _extract_contract_fields(raw: Dict[str, Any]) -> Dict[str, Any]:
-        """Extracts standard contract fields including Greeks, OI change (oich), volume, and quotes."""
+        """Extracts standard contract fields preserving None for missing/unreported broker fields."""
         greeks = raw.get("greeks", {}) or {}
 
         # Parse documented FYERS oich / oichange / oi_change
@@ -245,19 +245,30 @@ class FyersRestClient:
         if raw_oich is None:
             raw_oich = raw.get("oichange")
         if raw_oich is None:
-            raw_oich = raw.get("oi_change", 0)
+            raw_oich = raw.get("oi_change")
+
+        # Parse volume
+        raw_vol = raw.get("volume")
+        if raw_vol is None:
+            raw_vol = raw.get("vol_traded_today")
+
+        raw_iv = greeks.get("iv") if greeks.get("iv") is not None else raw.get("iv")
+        raw_delta = greeks.get("delta") if greeks.get("delta") is not None else raw.get("delta")
+        raw_gamma = greeks.get("gamma") if greeks.get("gamma") is not None else raw.get("gamma")
+        raw_theta = greeks.get("theta") if greeks.get("theta") is not None else raw.get("theta")
+        raw_vega = greeks.get("vega") if greeks.get("vega") is not None else raw.get("vega")
 
         return {
             "symbol": raw.get("symbol", ""),
-            "ltp": float(raw.get("ltp", 0.0)),
-            "oi": int(raw.get("oi", 0)),
-            "oi_change": int(raw_oich),
-            "volume": int(raw.get("volume", raw.get("vol_traded_today", 0))),
-            "bid": float(raw.get("bid", 0.0)) if raw.get("bid") is not None else None,
-            "ask": float(raw.get("ask", 0.0)) if raw.get("ask") is not None else None,
-            "iv": float(greeks.get("iv", raw.get("iv", 0.0))),
-            "delta": float(greeks.get("delta", raw.get("delta", 0.0))),
-            "gamma": float(greeks.get("gamma", raw.get("gamma", 0.0))),
-            "theta": float(greeks.get("theta", raw.get("theta", 0.0))),
-            "vega": float(greeks.get("vega", raw.get("vega", 0.0))),
+            "ltp": float(raw["ltp"]) if raw.get("ltp") is not None else None,
+            "oi": int(raw["oi"]) if raw.get("oi") is not None else None,
+            "oi_change": int(raw_oich) if raw_oich is not None else None,
+            "volume": int(raw_vol) if raw_vol is not None else None,
+            "bid": float(raw["bid"]) if raw.get("bid") is not None else None,
+            "ask": float(raw["ask"]) if raw.get("ask") is not None else None,
+            "iv": float(raw_iv) if raw_iv is not None else None,
+            "delta": float(raw_delta) if raw_delta is not None else None,
+            "gamma": float(raw_gamma) if raw_gamma is not None else None,
+            "theta": float(raw_theta) if raw_theta is not None else None,
+            "vega": float(raw_vega) if raw_vega is not None else None,
         }

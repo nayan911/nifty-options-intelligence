@@ -1,6 +1,6 @@
 """Exchange-aware trading calendar and dynamic session manager for NSE."""
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Dict, Optional, Set
 
@@ -126,3 +126,29 @@ class ExchangeCalendar:
         if is_derivative:
             return state in (SessionState.REGULAR_CASH, SessionState.DERIVATIVES_EXT, SessionState.SPECIAL_SESSION)
         return state in (SessionState.REGULAR_CASH, SessionState.SPECIAL_SESSION)
+
+
+def get_bar_duration(timeframe: str) -> timedelta:
+    """Returns exact timedelta for standard timeframe string."""
+    tf = timeframe.lower().strip()
+    if tf == "1m":
+        return timedelta(minutes=1)
+    if tf == "3m":
+        return timedelta(minutes=3)
+    if tf == "5m":
+        return timedelta(minutes=5)
+    if tf == "15m":
+        return timedelta(minutes=15)
+    if tf in ("30m", "half_hour"):
+        return timedelta(minutes=30)
+    if tf in ("60m", "1h"):
+        return timedelta(hours=1)
+    if tf in ("1d", "day", "daily"):
+        return timedelta(days=1)
+    return timedelta(minutes=1)
+
+
+def get_bar_close_time(timestamp: datetime, timeframe: str) -> datetime:
+    """Computes exact close/completion timestamp for a candle with opening timestamp."""
+    return timestamp + get_bar_duration(timeframe)
+
