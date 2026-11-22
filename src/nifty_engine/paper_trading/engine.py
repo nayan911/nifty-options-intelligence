@@ -8,14 +8,14 @@ Target 2 runner exit, technical stop-loss, and EOD 15:15 IST auto-square-off).
 import logging
 import uuid
 from datetime import date, datetime, time, timedelta
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import pytz
 
 from nifty_engine.analysis.derivatives.cost_model import PremiumCostModel
 from nifty_engine.analysis.technical.multi_timeframe import TechnicalCandidate
 from nifty_engine.core.calendar import ExchangeCalendar
-from nifty_engine.core.interfaces import Candle, IStorageEngine, Tick
+from nifty_engine.core.interfaces import Candle, IStorageEngine, SystemReadiness, Tick
 from nifty_engine.paper_trading.models import (
     ExitReason,
     OrderSide,
@@ -90,9 +90,21 @@ class PaperTradingEngine:
         self.total_realized_gross_pnl: float = 0.0
         self.total_realized_net_pnl: float = 0.0
         self.total_costs_paid: float = 0.0
+        self.system_readiness: SystemReadiness = SystemReadiness.READY
 
         # Automatic recovery from persistent DuckDB store upon process startup
         self._recover_from_store()
+
+    def set_system_readiness(self, readiness: Union[SystemReadiness, str]) -> None:
+        """Sets the system operational readiness level, gating new trade entries when NOT_READY."""
+        if isinstance(readiness, str):
+            try:
+                self.system_readiness = SystemReadiness(readiness.upper())
+            except ValueError:
+                self.system_readiness = SystemReadiness.NOT_READY
+        else:
+            self.system_readiness = readiness
+        logger.info("Paper trading system readiness updated to: %s", self.system_readiness.value)
 
     def process_technical_candidate(
         self,
@@ -103,6 +115,13 @@ class PaperTradingEngine:
 
         and executes a simulated market BUY order if all risk gates pass.
         """
+        # 0. System Readiness Gate
+        if self.system_readiness == SystemReadiness.NOT_READY:
+            logger.warning(
+                "Paper entry rejected: System readiness is NOT_READY (historical data / indicators incomplete)",
+            )
+            return None
+
         now = (
             current_time
             or getattr(candidate, "decision_at", None)

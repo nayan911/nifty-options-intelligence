@@ -9,7 +9,7 @@ import pytz
 
 from nifty_engine.analysis.technical.engine import TechnicalAnalysisEngine
 from nifty_engine.analysis.technical.support_resistance import LevelType
-from nifty_engine.core.interfaces import Candle
+from nifty_engine.core.interfaces import Candle, SystemReadiness
 from nifty_engine.core.rate_limiter import AsyncTokenBucketRateLimiter
 from nifty_engine.data.historical_manager import HistoricalCandleManager
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
@@ -594,3 +594,127 @@ def test_late_startup_at_10am_session_catchup_reconstructs_vwap_and_opening_rang
     assert snap_live.vwap is not None
     assert any(z.level_type == LevelType.ORH for z in snap_live.sr_zones)
     assert any(z.level_type == LevelType.CDO for z in snap_live.sr_zones)
+
+
+def test_sync_pre_market_data_includes_1m(store):
+    """Verify sync_pre_market_data includes 1m bars alongside Daily, 15m, and 5m."""
+    mock_rest = MagicMock()
+    mock_rest.get_historical_candles_sync.return_value = []
+    manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
+
+    sym = "NSE:NIFTY50-INDEX"
+    res = manager.sync_pre_market_data([sym], as_of_date=date(2026, 11, 23))
+
+    assert sym in res
+    assert "D" in res[sym]
+    assert "15m" in res[sym]
+    assert "5m" in res[sym]
+    assert "1m" in res[sym]
+
+
+def test_assess_readiness_states():
+    """Verify assess_readiness correctly assigns NOT_READY, DEGRADED, and READY."""
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures="NSE:NIFTY26NOVFUT",
+    )
+    mock_rest = MagicMock()
+    mock_store = MagicMock()
+    manager = HistoricalCandleManager(rest_client=mock_rest, store=mock_store)
+    sym = "NSE:NIFTY50-INDEX"
+
+    # 1. Initially NOT_READY (no daily levels, no snapshots)
+    readiness, details = manager.assess_readiness(engine, [sym])
+    assert readiness == SystemReadiness.NOT_READY
+    assert details[sym]["has_daily_levels"] is False
+    assert details[sym]["is_5m_warmed"] is False
+    assert details[sym]["is_1m_warmed"] is False
+
+    # 2. Seed daily levels but indicators unwarmed -> still NOT_READY
+    engine.prepare_session(date(2026, 11, 23))
+    engine.set_daily_references(sym, pdh=25200.0, pdl=24900.0, pdc=25100.0)
+    readiness, details = manager.assess_readiness(engine, [sym])
+    assert readiness == SystemReadiness.NOT_READY
+    assert details[sym]["has_daily_levels"] is True
+
+    # 3. Simulate 5m warmed up, but 1m not warmed up -> DEGRADED
+    state = engine.states[sym]
+    snap_5m_mock = MagicMock()
+    snap_5m_mock.is_warmed_up = True
+    state.latest_snapshots["5m"] = snap_5m_mock
+    readiness, details = manager.assess_readiness(engine, [sym])
+    assert readiness == SystemReadiness.DEGRADED
+    assert details[sym]["is_5m_warmed"] is True
+    assert details[sym]["is_1m_warmed"] is False
+
+    # 4. Simulate both 5m and 1m warmed up -> READY
+    snap_1m_mock = MagicMock()
+    snap_1m_mock.is_warmed_up = True
+    state.latest_snapshots["1m"] = snap_1m_mock
+    readiness, details = manager.assess_readiness(engine, [sym])
+    assert readiness == SystemReadiness.READY
+    assert details[sym]["is_1m_warmed"] is True
+
+
+def test_1m_warmup_and_session_catchup_at_10am(store, monkeypatch):
+    """Verify 1m candles are loaded in Stage 1 and replayed during Stage 4 catch-up on late startup."""
+    sym = "NSE:NIFTY26NOVFUT"
+
+    # Seed daily candle
+    store.insert_candle(make_candle(sym, "D", IST.localize(datetime(2026, 11, 20, 15, 30)), 25000.0, 25200.0, 24950.0, 25100.0))
+
+    # Seed 30 1m candles from Friday Nov 20 (before session cutoff)
+    t_fri = IST.localize(datetime(2026, 11, 20, 15, 0))
+    fri_1m_bars = [make_candle(sym, "1m", t_fri + timedelta(minutes=i), 25050.0 + i, 25052.0 + i, 25048.0 + i, 25051.0 + i) for i in range(30)]
+    store.insert_candles_batch(fri_1m_bars)
+
+    # Seed 25 5m candles from Friday
+    fri_5m_bars = [make_candle(sym, "5m", t_fri + timedelta(minutes=5 * i), 25050.0 + i, 25055.0 + i, 25045.0 + i, 25052.0 + i) for i in range(25)]
+    store.insert_candles_batch(fri_5m_bars)
+
+    # Seed Monday Nov 23 1m candles from 09:15 to 09:59 (45 completed 1m candles)
+    t_mon_start = IST.localize(datetime(2026, 11, 23, 9, 15))
+    mon_1m_bars = [
+        make_candle(sym, "1m", t_mon_start + timedelta(minutes=i), 25115.0 + 0.5 * i, 25117.0 + 0.5 * i, 25114.0 + 0.5 * i, 25116.0 + 0.5 * i)
+        for i in range(45)
+    ]
+    store.insert_candles_batch(mon_1m_bars)
+
+    # Seed Monday 5m candles (9 completed 5m candles)
+    mon_5m_bars = [
+        make_candle(sym, "5m", t_mon_start + timedelta(minutes=5 * i), 25115.0 + 2 * i, 25120.0 + 2 * i, 25110.0 + 2 * i, 25118.0 + 2 * i)
+        for i in range(9)
+    ]
+    store.insert_candles_batch(mon_5m_bars)
+
+    # Mock wall-clock time to 10:00 AM
+    mock_10am = IST.localize(datetime(2026, 11, 23, 10, 0))
+    monkeypatch.setattr("nifty_engine.data.historical_manager.now_ist", lambda: mock_10am)
+
+    engine = TechnicalAnalysisEngine(
+        primary_index="NSE:NIFTY50-INDEX",
+        primary_futures=sym,
+    )
+    mock_rest = MagicMock()
+    manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
+
+    summary = manager.warm_up_technical_engine(
+        engine=engine,
+        symbols=[sym],
+        as_of_date=date(2026, 11, 23),
+        candle_limit_1m=50,
+        candle_limit_5m=30,
+        candle_limit_15m=0,
+    )
+
+    assert summary[sym]["is_5m_warmed_up"] is True
+    assert summary[sym]["is_1m_warmed_up"] is True
+    assert summary["_overall_readiness"] == SystemReadiness.READY
+
+    state = engine.states[sym]
+    snap_1m = state.latest_snapshots.get("1m")
+    assert snap_1m is not None
+    assert snap_1m.is_warmed_up is True
+    assert snap_1m.ema_9 is not None
+    assert snap_1m.atr is not None
+

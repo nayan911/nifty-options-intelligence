@@ -10,13 +10,13 @@ Manages incremental caching of multi-timeframe completed candles from FYERS into
 
 import logging
 from datetime import date, datetime, time, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
 
 from nifty_engine.analysis.technical.engine import TechnicalAnalysisEngine
 from nifty_engine.core.calendar import ExchangeCalendar
-from nifty_engine.core.interfaces import Candle
+from nifty_engine.core.interfaces import Candle, SystemReadiness
 from nifty_engine.data.fyers.rest_client import FyersRestClient
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.utils.timezone import now_ist
@@ -127,7 +127,7 @@ class HistoricalCandleManager:
         symbols: List[str],
         as_of_date: Optional[date] = None,
     ) -> Dict[str, Dict[str, int]]:
-        """Backfills historical Daily, 15m, and 5m bars for all tracked assets."""
+        """Backfills historical Daily, 15m, 5m, and 1m bars for all tracked assets."""
         target_date = as_of_date or now_ist().date()
         results: Dict[str, Dict[str, int]] = {}
 
@@ -139,6 +139,8 @@ class HistoricalCandleManager:
             results[sym]["15m"] = self.sync_candles(sym, "15m", days_back=10, end_date=target_date)
             # 3. 5m candles (last 5 calendar days)
             results[sym]["5m"] = self.sync_candles(sym, "5m", days_back=5, end_date=target_date)
+            # 4. 1m candles (last 2 calendar days for fine-grained execution warmup & catch-up)
+            results[sym]["1m"] = self.sync_candles(sym, "1m", days_back=2, end_date=target_date)
 
         return results
 
@@ -206,15 +208,71 @@ class HistoricalCandleManager:
 
         return None
 
+    def assess_readiness(
+        self,
+        engine: TechnicalAnalysisEngine,
+        symbols: List[str],
+    ) -> Tuple[SystemReadiness, Dict[str, Any]]:
+        """Assesses system operational readiness across all tracked symbols.
+
+        Rules:
+        - READY: All tracked symbols have daily reference levels (PDH, PDL, PDC) and both 5m and 1m indicators are warmed up.
+        - DEGRADED: All tracked symbols have daily levels and 5m indicators are warmed up, but 1m indicators are still cold (< 21 bars).
+        - NOT_READY: Any tracked symbol is missing daily reference levels or has cold 5m indicators.
+        """
+        details: Dict[str, Any] = {}
+        all_have_daily = True
+        all_5m_warmed = True
+        all_1m_warmed = True
+
+        for sym in symbols:
+            state = engine.states.get(sym)
+            daily_refs = state.daily_reference_levels if state else {}
+            has_daily = bool(
+                daily_refs
+                and daily_refs.get("PDH") is not None
+                and daily_refs.get("PDL") is not None
+                and daily_refs.get("PDC") is not None
+            )
+
+            snap_5m = state.latest_snapshots.get("5m") if state else None
+            is_5m = snap_5m.is_warmed_up if snap_5m else False
+
+            snap_1m = state.latest_snapshots.get("1m") if state else None
+            is_1m = snap_1m.is_warmed_up if snap_1m else False
+
+            details[sym] = {
+                "has_daily_levels": has_daily,
+                "is_5m_warmed": is_5m,
+                "is_1m_warmed": is_1m,
+            }
+
+            if not has_daily:
+                all_have_daily = False
+            if not is_5m:
+                all_5m_warmed = False
+            if not is_1m:
+                all_1m_warmed = False
+
+        if not all_have_daily or not all_5m_warmed:
+            readiness = SystemReadiness.NOT_READY
+        elif not all_1m_warmed:
+            readiness = SystemReadiness.DEGRADED
+        else:
+            readiness = SystemReadiness.READY
+
+        return readiness, details
+
     def warm_up_technical_engine(
         self,
         engine: TechnicalAnalysisEngine,
         symbols: List[str],
         as_of_date: Optional[date] = None,
+        candle_limit_1m: int = 100,
         candle_limit_5m: int = 100,
         candle_limit_15m: int = 50,
     ) -> Dict[str, Any]:
-        """Pre-seeds daily references and bootstraps recent 15m & 5m historical candles into TechnicalAnalysisEngine."""
+        """Pre-seeds daily references and bootstraps recent 15m, 5m & 1m historical candles into TechnicalAnalysisEngine."""
         target_date = as_of_date or now_ist().date()
         as_of_cutoff = IST.localize(datetime.combine(target_date, datetime.min.time()))
         warmup_summary: Dict[str, Any] = {}
@@ -224,7 +282,8 @@ class HistoricalCandleManager:
         for sym in symbols:
             recent_15m = self.store.get_recent_candles(sym, "15m", limit=candle_limit_15m, as_of=as_of_cutoff)
             recent_5m = self.store.get_recent_candles(sym, "5m", limit=candle_limit_5m, as_of=as_of_cutoff)
-            combined_history = recent_15m + recent_5m
+            recent_1m = self.store.get_recent_candles(sym, "1m", limit=candle_limit_1m, as_of=as_of_cutoff)
+            combined_history = recent_15m + recent_5m + recent_1m
             bootstrapped_count = engine.bootstrap_candles(combined_history)
             warmup_summary[sym] = {
                 "bootstrapped_candles": bootstrapped_count,
@@ -255,10 +314,13 @@ class HistoricalCandleManager:
             # Verify warmup state
             state = engine.states.get(sym)
             snap_5m = state.latest_snapshots.get("5m") if state else None
-            is_warmed = snap_5m.is_warmed_up if snap_5m else False
+            snap_1m = state.latest_snapshots.get("1m") if state else None
+            is_5m_warmed = snap_5m.is_warmed_up if snap_5m else False
+            is_1m_warmed = snap_1m.is_warmed_up if snap_1m else False
 
             warmup_summary[sym]["daily_levels"] = levels
-            warmup_summary[sym]["is_5m_warmed_up"] = is_warmed
+            warmup_summary[sym]["is_5m_warmed_up"] = is_5m_warmed
+            warmup_summary[sym]["is_1m_warmed_up"] = is_1m_warmed
 
         # Stage 4: Current-Session Catch-Up Replay (Late Startup Recovery)
         # If target_date has already commenced (past date or wall clock > 09:15 IST),
@@ -288,7 +350,15 @@ class HistoricalCandleManager:
                 # Re-verify warmup state after session catch-up
                 state = engine.states.get(sym)
                 snap_5m = state.latest_snapshots.get("5m") if state else None
+                snap_1m = state.latest_snapshots.get("1m") if state else None
                 if snap_5m:
                     warmup_summary[sym]["is_5m_warmed_up"] = snap_5m.is_warmed_up
+                if snap_1m:
+                    warmup_summary[sym]["is_1m_warmed_up"] = snap_1m.is_warmed_up
+
+        # Stage 5: Evaluate system operational readiness across all tracked symbols
+        overall_readiness, readiness_details = self.assess_readiness(engine, symbols)
+        warmup_summary["_overall_readiness"] = overall_readiness
+        warmup_summary["_readiness_details"] = readiness_details
 
         return warmup_summary

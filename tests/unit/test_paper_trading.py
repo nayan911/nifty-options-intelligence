@@ -17,7 +17,7 @@ from nifty_engine.analysis.derivatives.greeks import OptionGreeks
 from nifty_engine.analysis.derivatives.oi_analysis import DirectionalBias
 from nifty_engine.analysis.technical.breakouts import BreakoutDirection
 from nifty_engine.analysis.technical.multi_timeframe import TechnicalCandidate
-from nifty_engine.core.interfaces import Candle, OptionContract, Tick
+from nifty_engine.core.interfaces import Candle, OptionContract, SystemReadiness, Tick
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.paper_trading.engine import PaperTradingEngine
 from nifty_engine.paper_trading.models import ExitReason, OrderSide, PositionStatus
@@ -1997,6 +1997,45 @@ def test_duckdb_recovery_restores_exact_exit_reason_not_target1(tmp_path):
     assert rec_pos.trades[1].reason == ExitReason.STOP_LOSS
 
     store.close()
+
+
+def test_paper_trading_system_readiness_gate():
+    """Verify that PaperTradingEngine rejects candidates when system_readiness is NOT_READY."""
+    engine = PaperTradingEngine(default_lots=1)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    # Default readiness is READY
+    assert engine.system_readiness == SystemReadiness.READY
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        target_1=25140.0,
+        entry_ltp=100.0,
+        ask=100.0,
+    )
+
+    # 1. Reject entry when NOT_READY
+    engine.set_system_readiness(SystemReadiness.NOT_READY)
+    pos_rejected = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos_rejected is None
+    assert len(engine.get_open_positions()) == 0
+
+    # 2. String conversion support
+    engine.set_system_readiness("not_ready")
+    assert engine.system_readiness == SystemReadiness.NOT_READY
+    assert engine.process_technical_candidate(cand, current_time=entry_ts) is None
+
+    # 3. Allow entry when DEGRADED
+    engine.set_system_readiness(SystemReadiness.DEGRADED)
+    assert engine.system_readiness == SystemReadiness.DEGRADED
+
+    # 4. Allow entry when READY
+    engine.set_system_readiness(SystemReadiness.READY)
+    pos_accepted = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos_accepted is not None
+    assert len(engine.get_open_positions()) == 1
+
 
 
 

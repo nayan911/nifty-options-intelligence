@@ -26,7 +26,7 @@ from nifty_engine.analysis.technical.engine import (
 from nifty_engine.analysis.technical.multi_timeframe import TechnicalCandidate
 from nifty_engine.core.calendar import ExchangeCalendar
 from nifty_engine.core.config import settings
-from nifty_engine.core.interfaces import Candle, OptionType, SessionState, Tick
+from nifty_engine.core.interfaces import Candle, OptionType, SessionState, SystemReadiness, Tick
 from nifty_engine.data.candle_builder import RealtimeCandleBuilder
 from nifty_engine.data.freshness_monitor import DataFreshnessMonitor
 from nifty_engine.data.fyers.auth import FyersAuthProvider
@@ -266,6 +266,19 @@ class MarketDataEngine:
                 self._log_technical_status(snapshot)
         except Exception as e:
             print(f"[WARN] Technical analysis error for {candle.symbol}: {e}")
+
+        # Check for system readiness upgrade if running in DEGRADED mode
+        if hasattr(self, "paper_engine") and self.paper_engine.system_readiness == SystemReadiness.DEGRADED:
+            core_tracked = [settings.PRIMARY_INDEX, self.technical_engine.primary_futures]
+            readiness, _ = self.historical_manager.assess_readiness(self.technical_engine, core_tracked)
+            if readiness == SystemReadiness.READY:
+                self.paper_engine.set_system_readiness(SystemReadiness.READY)
+                print(
+                    f"\n{'*'*78}\n"
+                    f"  [SYSTEM READINESS UPGRADE] 1-minute indicators fully warmed up (>= 21 bars).\n"
+                    f"  System readiness transitioned: DEGRADED -> READY. Paper trading entries enabled.\n"
+                    f"{'*'*78}\n"
+                )
 
     def _log_technical_status(self, snap: TechnicalSnapshot) -> None:
         """Outputs concise quantitative technical telemetry for primary tracked assets."""
@@ -598,7 +611,7 @@ class MarketDataEngine:
         print("\n[PRE-MARKET WARMUP] Initializing Historical Candle Manager...")
         try:
             core_tracked = [settings.PRIMARY_INDEX, self.technical_engine.primary_futures]
-            print(f"[PRE-MARKET WARMUP] Syncing recent Daily, 15m, and 5m bars for {core_tracked}...")
+            print(f"[PRE-MARKET WARMUP] Syncing recent Daily, 15m, 5m, and 1m bars for {core_tracked}...")
             self.historical_manager.sync_pre_market_data(core_tracked)
 
             print("[PRE-MARKET WARMUP] Seeding prior day levels and bootstrapping indicators...")
@@ -607,14 +620,33 @@ class MarketDataEngine:
                 symbols=core_tracked,
             )
             for sym, info in warmup_res.items():
+                if sym.startswith("_"):
+                    continue
                 levels = info.get("daily_levels")
                 lvl_str = f"PDH: {levels['PDH']}, PDL: {levels['PDL']}, PDC: {levels['PDC']}" if levels else "None"
                 catchup_bars = info.get("session_catchup_candles", 0)
+                is_5m_str = "READY" if info.get("is_5m_warmed_up") else "WARMING_UP"
+                is_1m_str = "READY" if info.get("is_1m_warmed_up") else "WARMING_UP"
                 print(
                     f"  - {sym}: Seeded {lvl_str} | History: {info.get('bootstrapped_candles', 0)} bars | "
                     f"Catch-up: {catchup_bars} bars | "
-                    f"5m Status: {'READY' if info.get('is_5m_warmed_up') else 'WARMING_UP'}"
+                    f"5m Status: {is_5m_str} | 1m Status: {is_1m_str}"
                 )
+
+            # Evaluate and set operational readiness on paper trading engine
+            readiness = warmup_res.get("_overall_readiness", SystemReadiness.NOT_READY)
+            if hasattr(self, "paper_engine"):
+                self.paper_engine.set_system_readiness(readiness)
+
+            banner_char = "#" if readiness == SystemReadiness.READY else ("!" if readiness == SystemReadiness.DEGRADED else "X")
+            print(
+                f"\n{banner_char * 78}\n"
+                f"  [SYSTEM OPERATIONAL READINESS: {readiness.value}]\n"
+                f"  - READY: Full history & indicators warmed (entries enabled)\n"
+                f"  - DEGRADED: 5m ready, 1m warming up (entries cautious/upgrading)\n"
+                f"  - NOT_READY: Critical levels/history missing (entries strictly disabled)\n"
+                f"{banner_char * 78}\n"
+            )
         except Exception as e:
             print(f"[WARN] Pre-market warmup encountered exception: {e}")
 

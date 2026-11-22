@@ -15,6 +15,13 @@ class OptionType(str, Enum):
     PE = "PE"
 
 
+class SystemReadiness(str, Enum):
+    """System operational readiness state based on historical indicators and data integrity."""
+    READY = "READY"          # Full history complete, 1m & 5m indicators warmed up, paper trades enabled
+    DEGRADED = "DEGRADED"    # Partial history (e.g. 5m ready, 1m warming up), live monitoring active, trades cautious
+    NOT_READY = "NOT_READY"  # Critical data missing (no daily levels or 5m cold), paper-trade entries disabled
+
+
 class SessionState(str, Enum):
     PRE_OPEN = "pre_open"           # 09:00 - 09:15 IST
     REGULAR_CASH = "regular_cash"   # 09:15 - 15:30 IST
