@@ -653,6 +653,11 @@ class MarketDataEngine:
         except KeyboardInterrupt:
             print("\nShutting down cleanly...")
         finally:
+            if hasattr(self, "paper_engine"):
+                try:
+                    self.paper_engine.checkpoint_active_positions(force=True)
+                except Exception as e:
+                    logger.warning("Error checkpointing paper positions on shutdown: %s", e)
             self.store.flush_ticks()
             self.ws_client.close()
             self.store.close()

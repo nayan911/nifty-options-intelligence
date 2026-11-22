@@ -433,8 +433,12 @@ def test_stale_option_quote_delays_spot_trigger_until_fresh_tick():
 
 
 def test_on_candle_intrabar_adverse_first_evaluation():
-    """Verify on_candle evaluates intrabar high and low with conservative adverse-first logic."""
-    engine = PaperTradingEngine(default_lots=1, slippage_points=0.5)
+    """Verify on_candle evaluates intrabar high and low with conservative adverse-first logic and fresh bid validation."""
+    engine = PaperTradingEngine(
+        default_lots=1,
+        slippage_points=0.5,
+        quote_provider=lambda sym: {"ltp": 83.0, "bid": 83.0, "ask": 83.5},
+    )
     entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
 
     cand = create_mock_candidate(
@@ -983,7 +987,11 @@ def test_market_data_engine_wires_quote_provider_and_candle_pipeline():
 
 def test_candle_timing_prevents_retroactive_trades():
     """Verify on_candle ignores higher timeframes and bars that started before position entry."""
-    engine = PaperTradingEngine(default_lots=1, slippage_points=0.5)
+    engine = PaperTradingEngine(
+        default_lots=1,
+        slippage_points=0.5,
+        quote_provider=lambda sym: {"ltp": 80.0, "bid": 80.0, "ask": 80.5},
+    )
     entry_ts = IST.localize(datetime(2026, 11, 26, 10, 10, 0))
 
     cand = create_mock_candidate(
@@ -1374,7 +1382,7 @@ def test_duckdb_stores_and_recovers_bid_ask_timestamps(tmp_path):
     pos = engine.process_technical_candidate(cand, current_time=entry_ts)
     assert pos is not None
 
-    # Option tick updates bid and ask
+    # Option tick updates bid and ask and automatically checkpoints to DuckDB
     bid_time = entry_ts + timedelta(seconds=15)
     tick = Tick(
         symbol=pos.symbol,
@@ -1387,7 +1395,7 @@ def test_duckdb_stores_and_recovers_bid_ask_timestamps(tmp_path):
     engine.on_tick(tick)
     assert pos.last_bid_time == bid_time
     assert pos.last_ask_time == bid_time
-    store.save_paper_position(pos.to_dict())
+    # Automatic controlled-interval checkpointing eliminates need for manual store.save_paper_position!
 
     # Recover in new engine instance
     engine2 = PaperTradingEngine(
@@ -1405,6 +1413,62 @@ def test_duckdb_stores_and_recovers_bid_ask_timestamps(tmp_path):
     assert rec_pos.has_fresh_bid(bid_time + timedelta(seconds=10), 30.0) is True
 
     store.close()
+
+
+def test_on_candle_stale_bid_defers_to_pending_exit():
+    """Verify on_candle detects intrabar trigger on low, but defers simulated sell if bid is stale."""
+    engine = PaperTradingEngine(default_lots=1, slippage_points=0.5, max_quote_age_seconds=30.0)
+    entry_ts = IST.localize(datetime(2026, 11, 26, 10, 0, 0))
+
+    cand = create_mock_candidate(
+        timestamp=entry_ts,
+        trigger_price=25100.0,
+        stop_loss=25070.0,
+        entry_ltp=100.0,
+        ask=100.0,
+        sl_premium=85.0,
+    )
+    pos = engine.process_technical_candidate(cand, current_time=entry_ts)
+    assert pos is not None
+
+    # Candle closes at 10:01:00 (60s after entry). Bid from candidate is 60s old (> 30s max)
+    candle_ts = entry_ts + timedelta(minutes=1)
+    bar = Candle(
+        symbol=pos.symbol,
+        timeframe="1m",
+        timestamp=candle_ts,
+        observed_at=candle_ts,
+        open=95.0,
+        high=98.0,
+        low=83.0,  # Below 85.0 SL!
+        close=86.0,
+        volume=5000,
+        is_closed=True,
+    )
+    # on_candle must NOT fill against stale bid or arbitrary candle.low
+    events = engine.on_candle(bar)
+    assert len(events) == 0
+    assert pos.status == PositionStatus.OPEN
+    assert pos.is_exit_triggered is True
+    assert pos.pending_exit_reason == ExitReason.STOP_LOSS
+
+    # When fresh option tick with authentic bid arrives, pending exit executes against fresh bid
+    fresh_tick = Tick(
+        symbol=pos.symbol,
+        ltp=84.0,
+        bid=83.5,
+        ask=84.5,
+        volume=6000,
+        local_timestamp=candle_ts + timedelta(seconds=2),
+    )
+    events2 = engine.on_tick(fresh_tick)
+    assert len(events2) == 1
+    p, reason, exit_price = events2[0]
+    assert reason == ExitReason.STOP_LOSS
+    assert exit_price == 83.0  # 83.5 bid - 0.5 slippage
+    assert p.status == PositionStatus.CLOSED
+    assert p.is_exit_triggered is False
+    assert p.pending_exit_reason is None
 
 
 
