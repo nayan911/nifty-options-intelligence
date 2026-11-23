@@ -641,7 +641,7 @@ def test_assess_readiness_states():
 
     # 2. Seed daily levels but indicators unwarmed -> still NOT_READY
     engine.prepare_session(date(2026, 11, 23))
-    engine.set_daily_references(sym, pdh=25200.0, pdl=24900.0, pdc=25100.0)
+    engine.set_daily_references(sym, pdh=25200.0, pdl=24900.0, pdc=25100.0, cdo=25105.0)
     readiness, details = manager.assess_readiness(engine, [sym])
     assert readiness == SystemReadiness.NOT_READY
     assert details[sym]["has_daily_levels"] is True
@@ -757,5 +757,75 @@ def test_reconcile_session_candles_overwrites_corrupted_candles(store):
     assert stored_after.volume == 502320
     assert stored_after.open == 25969.00
     assert stored_after.high == 26000.00
+
+
+def test_failed_reconciliation_blocks_readiness_to_not_ready(store, monkeypatch):
+    """Verify that when late-startup session reconciliation fails, system readiness is NOT_READY
+
+    even if DuckDB has enough historical bars to warm up indicators.
+    """
+    sym = "NSE:NIFTY26NOVFUT"
+    t_0915 = IST.localize(datetime(2026, 11, 23, 9, 15, 0))
+    mock_10am = IST.localize(datetime(2026, 11, 23, 10, 0))
+    monkeypatch.setattr("nifty_engine.data.historical_manager.now_ist", lambda: mock_10am)
+
+    # 1. Seed prior daily and intraday candles so indicators warm up
+    d_candle = make_candle(sym, "D", IST.localize(datetime(2026, 11, 20, 15, 30)), 25000.0, 25200.0, 24900.0, 25150.0)
+    store.insert_candle(d_candle)
+
+    # Seed 5m and 1m bars in DuckDB
+    bars_5m = [
+        make_candle(sym, "5m", t_0915 + timedelta(minutes=5 * i), 25100.0 + i, 25110.0 + i, 25090.0 + i, 25105.0 + i)
+        for i in range(9)
+    ]
+    store.insert_candles_batch(bars_5m)
+    bars_1m = [
+        make_candle(sym, "1m", t_0915 + timedelta(minutes=i), 25100.0 + i * 0.2, 25105.0, 25095.0, 25102.0)
+        for i in range(45)
+    ]
+    store.insert_candles_batch(bars_1m)
+
+    # 2. Mock broker REST client raising an exception during reconciliation
+    mock_rest = MagicMock()
+    mock_rest.get_historical_candles_sync.side_effect = RuntimeError("FYERS historical API connection timeout")
+
+    manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
+    engine = TechnicalAnalysisEngine(primary_index="NSE:NIFTY50-INDEX", primary_futures=sym)
+
+    # 3. Warm up with session reconciliation requested
+    summary = manager.warm_up_technical_engine(
+        engine=engine,
+        symbols=[sym],
+        as_of_date=date(2026, 11, 23),
+        reconcile_session=True,
+    )
+
+    # 4. CRITICAL SAFETY GUARD: Readiness MUST be NOT_READY because reconciliation failed!
+    assert manager.is_symbol_reconciled(sym) is False
+    assert summary["_overall_readiness"] == SystemReadiness.NOT_READY
+    details = summary["_readiness_details"][sym]
+    assert details["is_reconciled"] is False
+    assert details["data_complete"] is False
+    assert len(details["reconciliation_errors"]) > 0
+
+
+def test_missing_cdo_during_active_session_blocks_readiness(store, monkeypatch):
+    """Verify that during active session hours (>09:15 IST), a missing or unconfirmed CDO blocks readiness to NOT_READY."""
+    sym = "NSE:NIFTY26NOVFUT"
+    mock_10am = IST.localize(datetime(2026, 11, 23, 10, 0))
+    monkeypatch.setattr("nifty_engine.data.historical_manager.now_ist", lambda: mock_10am)
+
+    engine = TechnicalAnalysisEngine(primary_index="NSE:NIFTY50-INDEX", primary_futures=sym)
+    engine.prepare_session(date(2026, 11, 23))
+
+    # Set daily references with CDO = None
+    engine.set_daily_references(symbol=sym, pdh=25500.0, pdl=25000.0, pdc=25300.0, cdo=None)
+
+    manager = HistoricalCandleManager(rest_client=MagicMock(), store=store)
+    readiness, details = manager.assess_readiness(engine, [sym], as_of_date=date(2026, 11, 23))
+
+    assert details[sym]["has_cdo"] is False
+    assert readiness == SystemReadiness.NOT_READY
+
 
 

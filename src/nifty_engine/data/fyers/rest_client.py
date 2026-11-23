@@ -1,6 +1,7 @@
 """Rate-limited, asynchronous REST Client for FYERS Data API v3."""
 
 import asyncio
+import logging
 import time as time_mod
 from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Optional
@@ -8,6 +9,7 @@ from typing import Any, Dict, List, Optional
 import pytz
 from fyers_apiv3 import fyersModel
 
+logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
 from nifty_engine.core.interfaces import (
@@ -43,13 +45,12 @@ class FyersRestClient:
         resolution: str = "1",
         date_from: str = "",
         date_to: str = "",
+        max_retries: int = 3,
     ) -> List[Candle]:
-        """Fetch historical candles with rate limiting.
+        """Fetch historical candles with rate limiting and exponential backoff on transient throttling.
 
         resolution: '1', '5', '15', 'D'
         """
-        await self.rate_limiter.acquire()
-
         data = {
             "symbol": symbol,
             "resolution": resolution,
@@ -59,13 +60,32 @@ class FyersRestClient:
             "cont_flag": "1",
         }
 
-        # Run SDK synchronous call in async thread pool
         client = self._get_client()
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, lambda: client.history(data=data))
+        response = None
+        error_msg = ""
 
-        if not response or response.get("s") != "ok":
-            error_msg = response.get("message", "Error fetching historical data")
+        for attempt in range(max_retries):
+            await self.rate_limiter.acquire()
+            response = await loop.run_in_executor(None, lambda: client.history(data=data))
+
+            if response and response.get("s") == "ok":
+                break
+
+            error_msg = response.get("message", "Error fetching historical data") if response else "Empty response"
+            err_lower = error_msg.lower()
+            if "minute" in err_lower:
+                delay = 8.0 * (2 ** attempt)
+                logger.warning("FYERS minute rate limit hit for %s (attempt %d/%d). Sleeping %.1fs...", symbol, attempt + 1, max_retries, delay)
+                await asyncio.sleep(delay)
+                continue
+            elif "limit" in err_lower or "too many" in err_lower or "second" in err_lower:
+                delay = 1.0 * (2 ** attempt)
+                logger.warning("FYERS burst rate limit hit for %s (attempt %d/%d). Sleeping %.1fs...", symbol, attempt + 1, max_retries, delay)
+                await asyncio.sleep(delay)
+                continue
+            raise RuntimeError(f"FYERS Historical Data Error ({symbol}): {error_msg}")
+        else:
             raise RuntimeError(f"FYERS Historical Data Error ({symbol}): {error_msg}")
 
         raw_candles = response.get("candles", [])
@@ -129,10 +149,14 @@ class FyersRestClient:
             error_msg = response.get("message", "Error fetching historical data") if response else "Empty response"
             err_lower = error_msg.lower()
             if "minute" in err_lower:
-                time_mod.sleep(8.0 * (attempt + 1))
+                delay = 8.0 * (2 ** attempt)
+                logger.warning("FYERS minute rate limit hit for %s (attempt %d/%d). Sleeping %.1fs...", symbol, attempt + 1, max_retries, delay)
+                time_mod.sleep(delay)
                 continue
             elif "limit" in err_lower or "too many" in err_lower or "second" in err_lower:
-                time_mod.sleep(1.0 * (attempt + 1))
+                delay = 1.0 * (2 ** attempt)
+                logger.warning("FYERS burst rate limit hit for %s (attempt %d/%d). Sleeping %.1fs...", symbol, attempt + 1, max_retries, delay)
+                time_mod.sleep(delay)
                 continue
             raise RuntimeError(f"FYERS Historical Data Error ({symbol}): {error_msg}")
         else:

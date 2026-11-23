@@ -274,8 +274,8 @@ def test_market_data_engine_two_way_readiness_monitoring(monkeypatch):
     sym_fut = engine.technical_engine.primary_futures
 
     engine.technical_engine.prepare_session(date(2026, 11, 23))
-    engine.technical_engine.set_daily_references(sym_idx, pdh=25200.0, pdl=24900.0, pdc=25100.0)
-    engine.technical_engine.set_daily_references(sym_fut, pdh=25250.0, pdl=24950.0, pdc=25150.0)
+    engine.technical_engine.set_daily_references(sym_idx, pdh=25200.0, pdl=24900.0, pdc=25100.0, cdo=25105.0)
+    engine.technical_engine.set_daily_references(sym_fut, pdh=25250.0, pdl=24950.0, pdc=25150.0, cdo=25155.0)
 
     snap_5m_mock = MagicMock()
     snap_5m_mock.is_warmed_up = True

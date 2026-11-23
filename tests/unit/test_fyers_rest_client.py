@@ -462,3 +462,47 @@ def test_get_historical_candles_candle_completeness():
     assert candles_async[1].is_closed is False
 
 
+def test_get_historical_candles_sync_exponential_retry(monkeypatch):
+    """Verify get_historical_candles_sync uses true exponential backoff on burst and minute rate limits."""
+    mock_auth = MagicMock()
+    mock_client = MagicMock()
+    mock_auth.get_client.return_value = mock_client
+    mock_limiter = MagicMock()
+
+    rest_client = FyersRestClient(auth_provider=mock_auth, rate_limiter=mock_limiter)
+
+    sleep_calls = []
+    monkeypatch.setattr("nifty_engine.data.fyers.rest_client.time_mod.sleep", lambda s: sleep_calls.append(s))
+
+    now = now_ist()
+    ts = int((now - timedelta(minutes=15)).timestamp())
+    success_resp = {
+        "s": "ok",
+        "candles": [[ts, 25000.0, 25050.0, 24980.0, 25020.0, 5000]],
+    }
+
+    # 1. Burst rate throttling (sub-second): 1.0 * (2 ** attempt) -> 1.0s, 2.0s
+    mock_client.history.side_effect = [
+        {"s": "error", "message": "Reached limit of 5 requests/second"},
+        {"s": "error", "message": "Too many requests / second limit"},
+        success_resp,
+    ]
+
+    candles = rest_client.get_historical_candles_sync("NSE:NIFTY50-INDEX", resolution="5")
+    assert len(candles) == 1
+    assert sleep_calls == [1.0, 2.0]
+
+    # 2. Minute rate throttling: 8.0 * (2 ** attempt) -> 8.0s, 16.0s
+    sleep_calls.clear()
+    mock_client.history.side_effect = [
+        {"s": "error", "message": "Standard plan limit of 50 requests/minute"},
+        {"s": "error", "message": "requests/minute limit exceeded"},
+        success_resp,
+    ]
+
+    candles_min = rest_client.get_historical_candles_sync("NSE:NIFTY50-INDEX", resolution="5")
+    assert len(candles_min) == 1
+    assert sleep_calls == [8.0, 16.0]
+
+
+

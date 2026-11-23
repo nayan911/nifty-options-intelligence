@@ -45,6 +45,22 @@ class HistoricalCandleManager:
         self.rest_client = rest_client
         self.store = store
         self.calendar = calendar or ExchangeCalendar()
+        self.reconciliation_status: Dict[Tuple[str, str], bool] = {}
+        self.reconciliation_errors: Dict[Tuple[str, str], str] = {}
+        self.reconciliation_counts: Dict[Tuple[str, str], int] = {}
+
+    def is_symbol_reconciled(self, symbol: str, timeframes: Optional[List[str]] = None) -> bool:
+        """Returns True if reconciliation succeeded for all requested timeframes of symbol."""
+        tfs = timeframes or ["15m", "5m", "1m"]
+        return all(self.reconciliation_status.get((symbol, tf), False) for tf in tfs)
+
+    def get_reconciliation_errors(self, symbol: str) -> Dict[str, str]:
+        """Returns map of {timeframe: error_message} for any failed reconciliation calls."""
+        return {
+            tf: err
+            for (sym, tf), err in self.reconciliation_errors.items()
+            if sym == symbol
+        }
 
     def sync_candles(
         self,
@@ -201,9 +217,9 @@ class HistoricalCandleManager:
                         date_to=date_str,
                     )
                     completed = [c for c in candles if c.is_closed]
+                    count = 0
                     if completed:
                         count = self.store.insert_candles_batch(completed)
-                        results[sym][tf] = count
                         logger.info(
                             "Reconciled %d %s candles for %s on %s",
                             count,
@@ -211,11 +227,16 @@ class HistoricalCandleManager:
                             sym,
                             date_str,
                         )
-                    else:
-                        results[sym][tf] = 0
+                    results[sym][tf] = count
+                    self.reconciliation_status[(sym, tf)] = True
+                    self.reconciliation_counts[(sym, tf)] = count
+                    self.reconciliation_errors.pop((sym, tf), None)
                 except Exception as e:
                     logger.warning("Reconciliation failed for %s (%s) on %s: %s", sym, tf, date_str, e)
                     results[sym][tf] = 0
+                    self.reconciliation_status[(sym, tf)] = False
+                    self.reconciliation_counts[(sym, tf)] = 0
+                    self.reconciliation_errors[(sym, tf)] = str(e)
 
         return results
 
@@ -262,28 +283,43 @@ class HistoricalCandleManager:
         self,
         engine: TechnicalAnalysisEngine,
         symbols: List[str],
+        require_reconciliation: bool = False,
+        as_of_date: Optional[date] = None,
     ) -> Tuple[SystemReadiness, Dict[str, Any]]:
         """Assesses system operational readiness across all tracked symbols.
 
         Rules:
-        - READY: All tracked symbols have daily reference levels (PDH, PDL, PDC) and both 5m and 1m indicators are warmed up.
-        - DEGRADED: All tracked symbols have daily levels and 5m indicators are warmed up, but 1m indicators are still cold (< 21 bars).
-        - NOT_READY: Any tracked symbol is missing daily reference levels or has cold 5m indicators.
+        - READY: All tracked symbols have complete daily reference levels (PDH, PDL, PDC, and verified CDO if session active),
+          both 5m and 1m indicators are warmed up, and broker reconciliation succeeded (if required).
+        - DEGRADED: All tracked symbols have daily levels, verified data completeness/reconciliation, and 5m indicators are warmed up,
+          but 1m indicators are still cold (< 21 bars).
+        - NOT_READY: Any tracked symbol is missing daily reference levels, has cold 5m indicators, missing opening price during active session,
+          or failed broker reconciliation when required.
         """
+        target_date = as_of_date or now_ist().date()
+        now = now_ist()
+        is_active_session = target_date < now.date() or (target_date == now.date() and now.time() >= time(9, 15))
+
         details: Dict[str, Any] = {}
         all_have_daily = True
+        all_have_cdo = True
+        all_reconciled = True
         all_5m_warmed = True
         all_1m_warmed = True
 
         for sym in symbols:
             state = engine.states.get(sym)
-            daily_refs = state.daily_reference_levels if state else {}
+            daily_refs = (state.daily_reference_levels if state else {}) or {}
             has_daily = bool(
-                daily_refs
-                and daily_refs.get("PDH") is not None
+                daily_refs.get("PDH") is not None
                 and daily_refs.get("PDL") is not None
                 and daily_refs.get("PDC") is not None
             )
+
+            has_cdo = bool(daily_refs.get("CDO") is not None) if is_active_session else True
+
+            is_reconciled = self.is_symbol_reconciled(sym) if require_reconciliation else True
+            recon_errors = self.get_reconciliation_errors(sym) if require_reconciliation else {}
 
             snap_5m = state.latest_snapshots.get("5m") if state else None
             is_5m = snap_5m.is_warmed_up if snap_5m else False
@@ -294,8 +330,14 @@ class HistoricalCandleManager:
             snap_15m = state.latest_snapshots.get("15m") if state else None
             has_15m = bool(snap_15m and snap_15m.trend_bias is not None)
 
+            data_complete = has_daily and has_cdo and is_reconciled
+
             details[sym] = {
                 "has_daily_levels": has_daily,
+                "has_cdo": has_cdo,
+                "is_reconciled": is_reconciled,
+                "reconciliation_errors": recon_errors,
+                "data_complete": data_complete,
                 "is_5m_warmed": is_5m,
                 "is_1m_warmed": is_1m,
                 "has_15m_context": has_15m,
@@ -303,12 +345,16 @@ class HistoricalCandleManager:
 
             if not has_daily:
                 all_have_daily = False
+            if not has_cdo:
+                all_have_cdo = False
+            if not is_reconciled:
+                all_reconciled = False
             if not is_5m:
                 all_5m_warmed = False
             if not is_1m:
                 all_1m_warmed = False
 
-        if not all_have_daily or not all_5m_warmed:
+        if not all_have_daily or not all_have_cdo or not all_5m_warmed or (require_reconciliation and not all_reconciled):
             readiness = SystemReadiness.NOT_READY
         elif not all_1m_warmed:
             readiness = SystemReadiness.DEGRADED
@@ -418,7 +464,12 @@ class HistoricalCandleManager:
                     warmup_summary[sym]["is_1m_warmed_up"] = snap_1m.is_warmed_up
 
         # Stage 5: Evaluate system operational readiness across all tracked symbols
-        overall_readiness, readiness_details = self.assess_readiness(engine, symbols)
+        overall_readiness, readiness_details = self.assess_readiness(
+            engine,
+            symbols,
+            require_reconciliation=reconcile_session and (target_date < now.date() or (target_date == now.date() and now.time() > time(9, 15))),
+            as_of_date=target_date,
+        )
         warmup_summary["_overall_readiness"] = overall_readiness
         warmup_summary["_readiness_details"] = readiness_details
 
