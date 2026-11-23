@@ -121,7 +121,7 @@ def test_candle_closes_from_two_threads_are_serialized():
 
 def test_confluent_levels_on_same_bar_produce_one_alert(capsys):
     engine = make_engine()
-    snap = SimpleNamespace(symbol="NSE:NIFTY26NOVFUT", timeframe="5m", timestamp=at(15, 30), close=25349.5,
+    snap = SimpleNamespace(symbol="NSE:NIFTY50-INDEX", timeframe="5m", timestamp=at(14, 30), close=25349.5,
                            trend_bias="BEARISH")
     for lvl, px in (("PSYCHOLOGICAL_25350.0", 25350.0), ("SWING_LOW_CLUSTER_25360.0", 25360.0)):
         setup = SimpleNamespace(direction=SimpleNamespace(value="BEARISH"), level_id=lvl, nominal_price=px,
@@ -173,3 +173,15 @@ def test_option_chain_switches_to_next_expiry_near_expiry():
     assert engine._select_chain_expiry(at(15, 35)) == 222        # after expiry close
     engine.chain_expiries = [(date(2026, 11, 23), 111)]
     assert engine._select_chain_expiry(at(14, 0)) is None        # no next expiry known
+
+
+def test_futures_setups_print_as_context_not_trade_alerts(capsys):
+    """Futures 1m bars only confirm spot bars, so a futures setup can never become a trade."""
+    engine = make_engine()
+    snap = SimpleNamespace(symbol="NSE:NIFTY26NOVFUT", timeframe="5m", timestamp=at(15, 30), close=25349.5,
+                           trend_bias="BEARISH")
+    setup = SimpleNamespace(direction=SimpleNamespace(value="BEARISH"), level_id="PSYCHOLOGICAL_25350.0",
+                            nominal_price=25350.0, stop_loss=25355.17, target_price=25334.5)
+    engine._on_setup_candidate(setup, snap)
+    out = capsys.readouterr().out
+    assert "[TECHNICAL_SETUP_CANDIDATE" not in out and "[CONTEXT]" in out

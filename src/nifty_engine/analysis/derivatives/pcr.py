@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime
 from typing import Deque, Dict, Optional, Tuple
 
+from nifty_engine.analysis.derivatives.oi_analysis import select_tracked_expiry_key
 from nifty_engine.core.interfaces import OptionChainSnapshot
 
 
@@ -316,9 +317,10 @@ class PCREngine:
         if not active_keys:
             return None
 
-        # Select nearest active expiry
-        active_keys.sort(key=lambda k: k[1])
-        key = active_keys[0]
+        # Select the expiry actually being tracked: the one with the most recent snapshot at/before
+        # as_of (ties -> nearest expiry). The poller switches to the next expiry near expiry;
+        # "nearest expiry" alone kept reading the expiring chain's frozen, ever-staler data.
+        key = select_tracked_expiry_key(active_keys, {k: self._pcr_history[k] for k in active_keys}, as_of)
 
         history = self._pcr_history[key]
         if not history:

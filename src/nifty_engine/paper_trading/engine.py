@@ -30,6 +30,24 @@ from nifty_engine.utils.timezone import now_ist, to_ist
 
 logger = logging.getLogger(__name__)
 
+# Exact spot index symbol per option underlying. Spot-level stops/targets must be checked
+# ONLY against the position's own underlying: a substring test ("NIFTY" in symbol) also
+# matched NSE:NIFTYBANK-INDEX, so a single BANKNIFTY tick (~62,600) was compared with NIFTY
+# levels (~25,400) and instantly closed every NIFTY position (CE as TARGET_2, PE as SL).
+UNDERLYING_SPOT_SYMBOLS: Dict[str, str] = {
+    "NIFTY": "NSE:NIFTY50-INDEX",
+    "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
+    "FINNIFTY": "NSE:FINNIFTY-INDEX",
+    "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
+    "SENSEX": "BSE:SENSEX-INDEX",
+}
+
+
+def is_underlying_spot(underlying: str, symbol: str) -> bool:
+    """True only if `symbol` is exactly the spot index of `underlying`."""
+    expected = UNDERLYING_SPOT_SYMBOLS.get((underlying or "").upper())
+    return expected is not None and symbol.upper() == expected
+
 
 class PaperTradingEngine:
     """Simulated execution engine providing zero-broker-risk paper trading.
@@ -59,6 +77,10 @@ class PaperTradingEngine:
         calendar: Optional[ExchangeCalendar] = None,
         on_trade_event: Optional[Callable[[Dict[str, Any]], None]] = None,
         system_readiness: SystemReadiness = SystemReadiness.NOT_READY,
+        max_trades_per_day: int = 6,
+        max_daily_net_loss: float = 5000.0,
+        max_consecutive_losses: int = 2,
+        loss_cooldown_minutes: float = 30.0,
     ) -> None:
         self.cost_model = cost_model or PremiumCostModel()
         self.store = store
@@ -77,6 +99,12 @@ class PaperTradingEngine:
         self.clock_skew_tolerance_seconds = clock_skew_tolerance_seconds
         self.calendar = calendar or ExchangeCalendar()
         self.on_trade_event = on_trade_event
+
+        # Session-level risk limits (per-trade gates alone cannot stop a losing streak)
+        self.max_trades_per_day = max_trades_per_day
+        self.max_daily_net_loss = max_daily_net_loss
+        self.max_consecutive_losses = max_consecutive_losses
+        self.loss_cooldown_minutes = loss_cooldown_minutes
 
         # In-memory position and order storage
         self.active_positions: Dict[str, PaperPosition] = {}  # position_id -> PaperPosition
@@ -205,6 +233,26 @@ class PaperTradingEngine:
             )
             return None
 
+        # 5b. One position per underlying per direction. Two levels confirming on the same bar
+        # produce two candidates (distinct level_ids) for ONE price move; entering both
+        # silently doubles risk on the same idea.
+        same_direction = [
+            p for p in self.active_positions.values()
+            if p.underlying == underlying and p.option_type == contract.option_type and p.status != PositionStatus.CLOSED
+        ]
+        if same_direction:
+            logger.info(
+                "Paper entry rejected: %s %s position already open (%s)",
+                underlying, contract.option_type, same_direction[0].symbol,
+            )
+            return None
+
+        # 5c. Session risk limits: trade count, realized daily loss, losing-streak cooldown
+        risk_block = self._session_risk_block(now)
+        if risk_block:
+            logger.info("Paper entry rejected: %s", risk_block)
+            return None
+
         # 6. Resolve lot size & quantity
         lot_size = self.cost_model.get_lot_size(
             underlying=contract.underlying,
@@ -315,6 +363,34 @@ class PaperTradingEngine:
             })
 
         return position
+
+    def _session_risk_block(self, now: datetime) -> Optional[str]:
+        """Return a reason string if session-level risk limits forbid a new entry, else None."""
+        today = to_ist(now).date()
+        todays_closed = [
+            p for p in self.closed_positions
+            if p.exit_time is not None and to_ist(p.exit_time).date() == today
+        ]
+        entries_today = len(todays_closed) + sum(
+            1 for p in self.active_positions.values() if to_ist(p.entry_time).date() == today
+        )
+        if self.max_trades_per_day and entries_today >= self.max_trades_per_day:
+            return f"daily trade limit reached ({entries_today}/{self.max_trades_per_day})"
+
+        realized_today = sum(p.net_pnl for p in todays_closed)
+        if self.max_daily_net_loss and realized_today <= -abs(self.max_daily_net_loss):
+            return f"daily loss limit hit (net {realized_today:+.0f} <= -{abs(self.max_daily_net_loss):.0f})"
+
+        if self.max_consecutive_losses and len(todays_closed) >= self.max_consecutive_losses:
+            recent = sorted(todays_closed, key=lambda p: p.exit_time)[-self.max_consecutive_losses:]
+            if all(p.net_pnl < 0 for p in recent):
+                resume_at = recent[-1].exit_time + timedelta(minutes=self.loss_cooldown_minutes)
+                if now < resume_at:
+                    return (
+                        f"{self.max_consecutive_losses} consecutive losses; cooling down until "
+                        f"{to_ist(resume_at).strftime('%H:%M')}"
+                    )
+        return None
 
     def on_tick(self, tick: Tick) -> List[Tuple[PaperPosition, ExitReason, float]]:
         """Processes verified live tick updates for subscribed options or primary underlying spot."""
@@ -435,7 +511,7 @@ class PaperTradingEngine:
                             logger.info("Option SL hit for %s. Option bid stale (age %.1fs). Awaiting fresh bid.", pos.symbol, pos.bid_age_seconds(current_time))
 
             # 2. Underlying Spot Tick: Evaluate spot-level technical stop & target invalidation
-            elif "INDEX" in sym and pos.underlying in sym:
+            elif is_underlying_spot(pos.underlying, sym):
                 spot_price = tick.ltp
                 is_call = pos.option_type == "CE"
 
@@ -565,9 +641,11 @@ class PaperTradingEngine:
                 if candle.low <= effective_sl:
                     reason = ExitReason.TRAILING_STOP if pos.is_breakeven_sl_active else ExitReason.STOP_LOSS
                     if bid_fresh and opt_price > 0:
+                        # A stop triggered intrabar fills near the stop, not at the bid after the
+                        # bar recovered: never credit a better price than the stop level.
                         ev = self._execute_full_exit(
                             pos,
-                            opt_price,
+                            min(opt_price, effective_sl),
                             reason,
                             current_time,
                             notes=f"Intrabar SL low: {candle.low:.2f}",
@@ -633,7 +711,7 @@ class PaperTradingEngine:
                         )
 
             # Case 2: Underlying index candle (e.g. NIFTY 1m bar)
-            elif "INDEX" in sym and pos.underlying in sym:
+            elif is_underlying_spot(pos.underlying, sym):
                 is_call = pos.option_type == "CE"
                 bid_fresh = pos.has_fresh_bid(current_time, self.max_quote_age_seconds)
                 if not bid_fresh:
@@ -1102,6 +1180,8 @@ class PaperTradingEngine:
                     self._last_persisted_quote_time[pos.position_id] = pos.last_quote_time
                     self._last_persisted_candle_time[pos.position_id] = pos.last_candle_time
 
+            self._close_stale_recovered_positions()
+
             logger.info(
                 "Recovered %d active and %d closed paper positions from DuckDB. Historical Net P&L: ₹%.2f",
                 len(self.active_positions),
@@ -1110,6 +1190,32 @@ class PaperTradingEngine:
             )
         except Exception as e:
             logger.warning("Failed to recover paper trading state from DuckDB: %s", e)
+
+    def _close_stale_recovered_positions(self) -> None:
+        """Close positions recovered from an earlier session (missed EOD square-off).
+
+        Intraday positions must not survive the session. After a crash/forced stop before
+        15:15 they were reloaded as OPEN: their holding-timeout exit waited forever for a
+        fresh bid (expired contracts have none) while still counting toward the position
+        limit, blocking all new entries until the next 15:15. They are closed at the last
+        known price minus slippage, explicitly marked as an estimated fill.
+        """
+        today = now_ist().date()
+        for pos in list(self.active_positions.values()):
+            if pos.status == PositionStatus.CLOSED or to_ist(pos.entry_time).date() >= today:
+                continue
+            last = pos.current_bid if (pos.current_bid is not None and pos.current_bid > 0) else pos.current_ltp
+            fill = max(0.05, (last or 0.05) - self.slippage_points)
+            exit_time = pos.last_quote_time or pos.entry_time
+            self._execute_full_exit(
+                pos,
+                fill,
+                ExitReason.EOD_SQUARE_OFF,
+                exit_time,
+                notes=f"Recovered stale position from {to_ist(pos.entry_time).date()}: missed EOD square-off, estimated fill",
+                is_estimated_fill=True,
+            )
+            logger.warning("Closed stale recovered paper position %s (%s) at estimated %.2f", pos.position_id, pos.symbol, fill)
 
     def _row_to_position(self, row: Dict[str, Any], orders: Optional[List[PaperOrder]] = None) -> PaperPosition:
         """Constructs PaperPosition instance from DuckDB dictionary row and order history."""

@@ -19,6 +19,25 @@ from nifty_engine.core.interfaces import Candle, OptionChainSnapshot
 IST = pytz.timezone("Asia/Kolkata")
 
 
+def select_tracked_expiry_key(keys, histories, as_of):
+    """Among (underlying, expiry) keys, pick the one whose latest snapshot at/before `as_of` is
+    most recent; ties (or no timestamps) fall back to the nearest expiry."""
+
+    def latest_ts(k):
+        for item in reversed(histories.get(k) or []):
+            ts = getattr(item, "timestamp", None)
+            if ts is not None and (as_of is None or ts <= as_of):
+                return ts
+        return None
+
+    def sort_key(k):
+        ts = latest_ts(k)
+        # most recent first; missing timestamps last; then nearest expiry
+        return (0 if ts is not None else 1, -(ts.timestamp()) if ts is not None else 0.0, k[1])
+
+    return sorted(keys, key=sort_key)[0]
+
+
 class BuildupType(str, Enum):
     """Positioning heuristic based on price and OI change."""
 
@@ -835,9 +854,10 @@ class OpenInterestAnalyzer:
         if not active_keys:
             return None
 
-        # Select nearest active expiry
-        active_keys.sort(key=lambda k: k[1])
-        key = active_keys[0]
+        # Select the expiry actually being tracked: the one with the most recent snapshot at/before
+        # as_of (ties -> nearest expiry). The poller switches to the next expiry near expiry;
+        # "nearest expiry" alone kept reading the expiring chain's frozen, ever-staler data.
+        key = select_tracked_expiry_key(active_keys, {k: self._profile_history[k] for k in active_keys}, as_of)
 
         history = self._profile_history[key]
         if not history:

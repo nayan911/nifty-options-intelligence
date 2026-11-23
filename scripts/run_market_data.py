@@ -7,6 +7,7 @@ and out-of-order quarantine, builds 1m/5m/15m OHLCV bars, and persists data into
 
 import asyncio
 import logging
+import signal
 import sys
 import threading
 import time
@@ -84,6 +85,10 @@ class MarketDataEngine:
             instrument_master=self.master,
             quote_provider=self._get_live_quote,
             on_trade_event=self._on_paper_trade_event,
+            max_trades_per_day=settings.PAPER_MAX_TRADES_PER_DAY,
+            max_daily_net_loss=settings.PAPER_MAX_DAILY_NET_LOSS,
+            max_consecutive_losses=settings.PAPER_MAX_CONSECUTIVE_LOSSES,
+            loss_cooldown_minutes=settings.PAPER_LOSS_COOLDOWN_MINUTES,
         )
         self.ws_client = FyersWebSocketClient(
             auth_provider=self.auth,
@@ -446,6 +451,15 @@ class MarketDataEngine:
         Several levels can confirm on the same bar (e.g. a psychological round number and a
         swing-low cluster 10 pts apart). That is ONE setup with confluence, not two.
         """
+        # Only NIFTY spot setups can become trades: futures 1m bars are used solely to confirm
+        # spot bars, so a futures setup can never reach entry. Show it as context, not a signal.
+        if snap.symbol != settings.PRIMARY_INDEX:
+            print(
+                f"[CONTEXT] {snap.symbol} {snap.timeframe} {setup.direction.value} structure at "
+                f"{setup.level_id} ({setup.nominal_price:.1f}) @ {snap.timestamp.strftime('%H:%M')} "
+                f"(confirmation only; trades come from NIFTY spot setups)"
+            )
+            return
         key = (snap.symbol, snap.timeframe, snap.timestamp, setup.direction.value)
         if key in self._alerted_setups:
             self._alerted_setups[key].append(setup.level_id)
@@ -816,8 +830,27 @@ class MarketDataEngine:
                 )
         print(line)
 
+    @staticmethod
+    def _install_shutdown_signals() -> None:
+        """Make SIGTERM (and SIGINT when inherited as ignored) run the clean shutdown path.
+
+        A pipeline started in the background ignores Ctrl-C (SIGINT inherited as SIG_IGN),
+        and SIGTERM's default action kills the process without closing DuckDB or
+        checkpointing positions. Both now raise KeyboardInterrupt -> _shutdown().
+        """
+        def _raise(signum, frame):
+            raise KeyboardInterrupt(f"signal {signum}")
+
+        try:
+            signal.signal(signal.SIGTERM, _raise)
+            if signal.getsignal(signal.SIGINT) in (signal.SIG_IGN, None):
+                signal.signal(signal.SIGINT, signal.default_int_handler)
+        except ValueError:
+            pass  # not on the main thread (e.g. embedded in tests)
+
     def start(self):
         """Starts streaming and monitoring pipeline."""
+        self._install_shutdown_signals()
         print("=" * 72)
         print("  NIFTY Options Trading Intelligence - Market Data Pipeline")
         print("=" * 72)

@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     # ATM option rotation only when spot is this many points beyond the strike midpoint
     ATM_ROTATION_HYSTERESIS_POINTS: float = 10.0
 
+    # Paper-trading session risk limits (per-trade gates cannot stop a losing streak).
+    # MAX_DAILY_NET_LOSS is in rupees: set it to your own daily risk budget.
+    PAPER_MAX_TRADES_PER_DAY: int = 6
+    PAPER_MAX_DAILY_NET_LOSS: float = 5000.0
+    PAPER_MAX_CONSECUTIVE_LOSSES: int = 2
+    PAPER_LOSS_COOLDOWN_MINUTES: float = 30.0
+
     # Feed gap handling: if the primary index stops ticking for this long during the
     # cash session, missed bars are backfilled from FYERS history after it resumes.
     FEED_GAP_SECONDS: float = 15.0
