@@ -49,6 +49,10 @@ class HistoricalCandleManager:
         self.reconciliation_errors: Dict[Tuple[str, str, date], str] = {}
         self.reconciliation_counts: Dict[Tuple[str, str, date], int] = {}
         self.reconciliation_required_sessions: Set[date] = set()
+        # Bar start timestamps FYERS actually returned in the most recent reconcile call.
+        # Timestamp coverage in DuckDB alone can be satisfied by a stale/partial live bar,
+        # so feed-gap repair checks the affected intervals against this authoritative set.
+        self.last_broker_returned: Dict[Tuple[str, str, date], Set[datetime]] = {}
 
     @classmethod
     def get_expected_closed_intervals(
@@ -269,6 +273,7 @@ class HistoricalCandleManager:
                         date_to=date_str,
                     )
                     completed = [c for c in candles if c.is_closed]
+                    self.last_broker_returned[(sym, tf, t_date)] = {c.timestamp for c in completed}
                     count = 0
                     if completed:
                         count = self.store.insert_candles_batch(completed)
@@ -314,6 +319,7 @@ class HistoricalCandleManager:
 
                 except Exception as e:
                     logger.warning("Reconciliation failed for %s (%s) on %s: %s", sym, tf, date_str, e)
+                    self.last_broker_returned[(sym, tf, t_date)] = set()
                     results[sym][tf] = 0
                     self.reconciliation_status[(sym, tf, t_date)] = False
                     self.reconciliation_counts[(sym, tf, t_date)] = 0

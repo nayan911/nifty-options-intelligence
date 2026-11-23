@@ -237,13 +237,19 @@ class MarketDataEngine:
         self.ticks_persisted += 1
 
         # 2. Track NIFTY spot price and telemetry
-        if tick.symbol in self._signal_symbols():
-            self.last_signal_tick_times[tick.symbol] = now_ist()
         if tick.symbol == settings.PRIMARY_INDEX:
             self.current_spot_price = tick.ltp
-            self.last_primary_tick_time = now_ist()
-            if tick.exchange_timestamp:
-                self.last_primary_network_latency = (tick.local_timestamp - tick.exchange_timestamp).total_seconds()
+
+        # Feed freshness advances ONLY on ticks that passed live-market validation. A
+        # VALID_SNAPSHOT (e.g. the stale last-quote FYERS replays on resubscribe) or an
+        # UNVERIFIED quote must not make a dead feed look alive.
+        if res.status == TickStatus.VALID_LIVE:
+            if tick.symbol in self._signal_symbols():
+                self.last_signal_tick_times[tick.symbol] = now_ist()
+            if tick.symbol == settings.PRIMARY_INDEX:
+                self.last_primary_tick_time = now_ist()
+                if tick.exchange_timestamp:
+                    self.last_primary_network_latency = (tick.local_timestamp - tick.exchange_timestamp).total_seconds()
 
         # 3. Only pass verified live trading ticks to CandleBuilder and PaperTradingEngine
         if res.status == TickStatus.VALID_LIVE:

@@ -514,3 +514,25 @@ def test_open_feed_gap_holds_signal_candles_and_forces_not_ready(monkeypatch):
     )
     engine.ws_client._is_connected = True
     assert engine.evaluate_and_update_readiness() == SystemReadiness.NOT_READY
+
+
+def test_only_valid_live_ticks_refresh_signal_feed_freshness():
+    """A stale replayed quote (VALID_SNAPSHOT, e.g. on resubscribe) must not make a dead feed look alive."""
+    store = DuckDBStore(db_path=":memory:")
+    engine = MarketDataEngine(store=store)
+    fut = engine.technical_engine.primary_futures
+    now = IST.localize(datetime(2026, 11, 23, 11, 0, 0))
+
+    stale_quote = Tick(
+        symbol=fut, exchange_timestamp=now - timedelta(minutes=10), local_timestamp=now,
+        ltp=25400.0, cumulative_volume=5000, incremental_volume=0,
+    )
+    engine._on_tick_received(stale_quote, current_time=now)
+    assert fut not in engine.last_signal_tick_times
+
+    live = Tick(
+        symbol=fut, exchange_timestamp=now, local_timestamp=now,
+        ltp=25401.0, cumulative_volume=5100, incremental_volume=0,
+    )
+    engine._on_tick_received(live, current_time=now)
+    assert fut in engine.last_signal_tick_times

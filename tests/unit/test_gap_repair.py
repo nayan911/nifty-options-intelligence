@@ -11,7 +11,7 @@ import pytz
 
 from nifty_engine.analysis.technical.engine import TechnicalAnalysisEngine
 from nifty_engine.core.interfaces import Candle
-from nifty_engine.data.gap_backfill import FeedGapBackfiller
+from nifty_engine.data.gap_backfill import FeedGapBackfiller, affected_intervals
 from nifty_engine.data.historical_manager import HistoricalCandleManager
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 
@@ -95,19 +95,23 @@ def test_repaired_engine_matches_clean_restart_after_mid_candle_outage(store, mo
 
     # FYERS history after the outage: corrected 13:42 bar + bars through 13:47
     def fake_reconcile(symbols, target_date, timeframes, as_of):
-        store.insert_candles_batch(
-            series("1m", t(13, 42), t(13, 47)) + [bar("5m", t(13, 40))] + [bar("15m", t(13, 30))]
-        )
+        broker = {
+            "1m": series("1m", t(9, 15), t(13, 47)),
+            "5m": series("5m", t(9, 15), t(13, 40)),
+            "15m": series("15m", t(9, 15), t(13, 30)),
+        }
         for tf in timeframes:
+            store.insert_candles_batch(broker[tf])
+            hm.last_broker_returned[(FUT, tf, target_date)] = {c.timestamp for c in broker[tf]}
             hm.reconciliation_status[(FUT, tf, target_date)] = True
 
     monkeypatch.setattr(hm, "reconcile_session_candles", fake_reconcile)
     bf = FeedGapBackfiller(hm, live, store, symbols_provider=lambda: [FUT], gap_seconds=15)
 
     assert "gap detected" in bf.observe(t(13, 43, 0), {FUT: t(13, 42, 44)}, True).lower()
-    assert "resumed" in bf.observe(t(13, 47, 20), {FUT: t(13, 47, 20)}, True).lower()
+    assert "live again" in bf.observe(t(13, 47, 20), {FUT: t(13, 47, 20)}, True).lower()
     clock["now"] = t(13, 48, 6)
-    assert "reconciling" in bf.observe(clock["now"], {FUT: clock["now"]}, True).lower()
+    assert "repairing" in bf.observe(clock["now"], {FUT: clock["now"]}, True).lower()
     bf._worker.join(timeout=5)
     msg = bf.observe(clock["now"], {FUT: clock["now"]}, True)
     assert "repaired" in msg.lower() and not bf.active
@@ -125,6 +129,34 @@ def test_repaired_engine_matches_clean_restart_after_mid_candle_outage(store, mo
     live.on_setup_candidate.assert_not_called()
 
 
+class _Everything:
+    def __contains__(self, item):
+        return True
+
+
+class _AllReturned(dict):
+    """Mock broker that returned every requested bar."""
+
+    def get(self, key, default=None):
+        return _Everything()
+
+
+def mock_hm(**kw):
+    hm = MagicMock()
+    hm.is_symbol_reconciled.return_value = True
+    hm.last_broker_returned = _AllReturned()
+    hm.warm_up_technical_engine.return_value = {}
+    for k, v in kw.items():
+        setattr(hm, k, v)
+    return hm
+
+
+def drive_to_repair(bf, sym=FUT):
+    bf.observe(t(10, 1), {sym: t(10, 0, 30)}, True)       # gap
+    bf.observe(t(10, 2, 10), {sym: t(10, 2, 10)}, True)   # resumed -> 10:03:05
+    return bf.observe(t(10, 3, 6), {sym: t(10, 3, 6)}, True)  # worker started
+
+
 def test_futures_only_stall_opens_gap_while_spot_is_healthy():
     bf = FeedGapBackfiller(MagicMock(), MagicMock(), MagicMock(), lambda: ["SPOT", FUT], gap_seconds=15)
     now = t(11, 0, 30)
@@ -132,12 +164,29 @@ def test_futures_only_stall_opens_gap_while_spot_is_healthy():
     assert msg and FUT in msg and bf.active
     # Spot alone recovering is not enough: both must be fresh to resume
     assert bf.observe(t(11, 0, 40), {"SPOT": t(11, 0, 40), FUT: t(11, 0, 0)}, True) is None
-    assert "resumed" in bf.observe(t(11, 0, 50), {"SPOT": t(11, 0, 50), FUT: t(11, 0, 49)}, True).lower()
+    assert "live again" in bf.observe(t(11, 0, 50), {"SPOT": t(11, 0, 50), FUT: t(11, 0, 49)}, True).lower()
 
 
-def test_reconcile_runs_off_the_maintenance_loop_and_retries_on_failure():
+def test_instrument_that_never_ticked_counts_as_stale_once_others_are_live():
+    """Finding A2: futures with no valid tick at all must not let the system look healthy."""
+    bf = FeedGapBackfiller(MagicMock(), MagicMock(), MagicMock(), lambda: ["SPOT", FUT], gap_seconds=15)
+    assert bf.observe(t(9, 15, 5), {"SPOT": t(9, 15, 5), FUT: None}, True) is None  # grace period
+    msg = bf.observe(t(9, 15, 25), {"SPOT": t(9, 15, 25), FUT: None}, True)
+    assert msg and FUT in msg and bf.active
+    # Spot fresh, futures still never seen -> cannot resume
+    assert bf.observe(t(9, 16), {"SPOT": t(9, 16), FUT: None}, True) is None
+    assert bf.state == bf.GAP_OPEN
+    assert "live again" in bf.observe(t(9, 16, 5), {"SPOT": t(9, 16, 5), FUT: t(9, 16, 4)}, True).lower()
+
+
+def test_nothing_is_stale_before_any_feed_is_live():
+    bf = FeedGapBackfiller(MagicMock(), MagicMock(), MagicMock(), lambda: ["SPOT", FUT], gap_seconds=15)
+    assert bf.observe(t(9, 20), {"SPOT": None, FUT: None}, True) is None and not bf.active
+
+
+def test_entire_repair_runs_off_the_maintenance_loop_and_retries_on_failure():
+    """Finding B: broker fetch AND indicator rebuild happen in the worker; loop stays responsive."""
     release = threading.Event()
-    hm = MagicMock()
     calls = {"n": 0}
 
     def slow_reconcile(*a, **k):
@@ -146,70 +195,122 @@ def test_reconcile_runs_off_the_maintenance_loop_and_retries_on_failure():
         if calls["n"] == 1:
             raise RuntimeError("FYERS timeout")
 
+    def slow_warmup(**k):
+        import time as _t
+        _t.sleep(0.3)  # rebuild cost must not land on the maintenance thread
+        return {}
+
+    hm = mock_hm()
     hm.reconcile_session_candles.side_effect = slow_reconcile
-    hm.is_symbol_reconciled.return_value = True
-    hm.warm_up_technical_engine.return_value = {FUT: {"session_catchup_candles": 10}}
+    hm.warm_up_technical_engine.side_effect = slow_warmup
     engine = MagicMock()
     bf = FeedGapBackfiller(hm, engine, MagicMock(), lambda: [FUT], gap_seconds=15, retry_seconds=30)
+    drive_to_repair(bf)
+    assert bf.state == bf.REPAIRING
 
-    bf.observe(t(10, 1), {FUT: t(10, 0, 30)}, True)
-    bf.observe(t(10, 2, 10), {FUT: t(10, 2, 10)}, True)
-    bf.observe(t(10, 3, 6), {FUT: t(10, 3, 6)}, True)  # worker started
-    assert bf.state == bf.RECONCILING
-
-    # Maintenance loop keeps ticking while the broker call hangs
     import time as _t
     start = _t.monotonic()
     for s in range(7, 12):
         assert bf.observe(t(10, 3, s), {FUT: t(10, 3, s)}, True) is None
-    assert _t.monotonic() - start < 0.5
+    assert _t.monotonic() - start < 0.2
 
     release.set()
     bf._worker.join(timeout=5)
     msg = bf.observe(t(10, 3, 12), {FUT: t(10, 3, 12)}, True)
     assert "failed" in msg and bf.active
-    engine.reset_symbols.assert_not_called()  # never rebuild from unverified data
+    engine.adopt_states.assert_not_called()  # never touch live state on failure
 
-    bf.observe(t(10, 3, 43), {FUT: t(10, 3, 43)}, True)  # retry starts
+    bf.observe(t(10, 3, 43), {FUT: t(10, 3, 43)}, True)  # retry: worker does fetch + 0.3s rebuild
+    start = _t.monotonic()
+    while bf.state == bf.REPAIRING and not bf._worker_done.is_set():
+        assert bf.observe(t(10, 3, 44), {FUT: t(10, 3, 44)}, True) is None
+        _t.sleep(0.01)
+    assert _t.monotonic() - start >= 0.25  # rebuild ran while the loop kept polling
+    t_swap = _t.monotonic()
+    assert "repaired" in bf.observe(t(10, 3, 45), {FUT: t(10, 3, 45)}, True).lower()
+    assert _t.monotonic() - t_swap < 0.05  # main-thread part is just the swap
+    engine.adopt_states.assert_called_once()
+
+
+def test_rebuild_exception_does_not_crash_and_leaves_live_state_untouched():
+    """Finding B: an error while rebuilding must fail closed and retry, not kill the runner."""
+    hm = mock_hm()
+    hm.warm_up_technical_engine.side_effect = KeyError("daily levels missing")
+    engine = MagicMock()
+    bf = FeedGapBackfiller(hm, engine, MagicMock(), lambda: [FUT], gap_seconds=15)
+    drive_to_repair(bf)
     bf._worker.join(timeout=5)
-    assert "repaired" in bf.observe(t(10, 3, 44), {FUT: t(10, 3, 44)}, True).lower()
-    engine.reset_symbols.assert_called_once_with([FUT])
+    msg = bf.observe(t(10, 3, 7), {FUT: t(10, 3, 7)}, True)
+    assert "failed" in msg and "daily levels missing" in msg
+    assert bf.active and bf.state == bf.AWAITING_SETTLE
+    engine.adopt_states.assert_not_called()
 
 
-def test_candle_closing_during_rebuild_waits_then_flows_live():
-    """A bar that closes while the rebuild runs must not be silently dropped."""
-    hm = MagicMock()
-    hm.is_symbol_reconciled.return_value = True
-    results = {}
-
-    bf = FeedGapBackfiller(hm, MagicMock(), MagicMock(), lambda: [FUT], gap_seconds=15)
-
-    def warm_up(**kwargs):
-        th = threading.Thread(target=lambda: results.setdefault("held", bf.hold(bar("1m", t(10, 4)))))
-        th.start()
-        th.join(timeout=0.2)
-        results["blocked_during_rebuild"] = th.is_alive()
-        results["thread"] = th
-        return {}
-
-    hm.warm_up_technical_engine.side_effect = warm_up
-    bf.observe(t(10, 1), {FUT: t(10, 0, 30)}, True)
-    bf.observe(t(10, 2, 10), {FUT: t(10, 2, 10)}, True)
-    bf.observe(t(10, 3, 6), {FUT: t(10, 3, 6)}, True)
+def test_swap_failure_and_state_machine_errors_never_raise():
+    hm = mock_hm()
+    engine = MagicMock()
+    engine.adopt_states.side_effect = RuntimeError("boom")
+    bf = FeedGapBackfiller(hm, engine, MagicMock(), lambda: [FUT], gap_seconds=15)
+    drive_to_repair(bf)
     bf._worker.join(timeout=5)
-    bf.observe(t(10, 3, 7), {FUT: t(10, 3, 7)}, True)
+    msg = bf.observe(t(10, 3, 7), {FUT: t(10, 3, 7)}, True)
+    assert "swap failed" in msg and bf.active
 
-    results["thread"].join(timeout=5)
-    assert results["blocked_during_rebuild"] is True
-    assert results["held"] is False  # released after rebuild -> goes through live path
+    broken = FeedGapBackfiller(hm, engine, MagicMock(), lambda: [FUT], gap_seconds=15)
+    msg = broken.observe(t(10, 0), {FUT: "not-a-datetime"}, True)  # garbage input
+    assert "error" in msg.lower() and broken.active  # fail closed
+
+
+def test_repair_rejected_when_fyers_did_not_return_outage_bars():
+    """Finding C: a stored partial live bar must not satisfy coverage for the outage window."""
+    hm = mock_hm()
+    day = t(10, 0).date()
+    full = {ts for ts in affected_intervals("1m", t(10, 0, 30), t(10, 3, 6))}
+    missing_one = full - {t(10, 0)}  # the bar that was open when the outage began
+    hm.last_broker_returned = {
+        (FUT, "1m", day): missing_one,
+        (FUT, "5m", day): {t(10, 0)},
+        (FUT, "15m", day): {t(9, 45)},
+    }
+    engine = MagicMock()
+    bf = FeedGapBackfiller(hm, engine, MagicMock(), lambda: [FUT], gap_seconds=15)
+    drive_to_repair(bf)
+    bf._worker.join(timeout=5)
+    msg = bf.observe(t(10, 3, 7), {FUT: t(10, 3, 7)}, True)
+    assert "did not return" in msg and "10:00" in msg and bf.active
+    engine.adopt_states.assert_not_called()
+
+
+def test_affected_intervals_cover_partial_bar_through_last_closed_bar():
+    gap, as_of = t(13, 42, 44), t(13, 48, 6)
+    assert affected_intervals("1m", gap, as_of) == [t(13, m) for m in range(42, 48)]
+    assert affected_intervals("5m", gap, as_of) == [t(13, 40)]
+    assert affected_intervals("15m", gap, as_of) == [t(13, 30)]  # 13:30 bar closed at 13:45
+    assert affected_intervals("15m", gap, t(13, 44)) == []  # ...but still open at 13:44
+
+
+def test_bar_closing_during_rebuild_is_replayed_not_lost():
+    release = threading.Event()
+    hm = mock_hm()
+    hm.reconcile_session_candles.side_effect = lambda *a, **k: release.wait(5)
+    shadow = MagicMock()
+    shadow.states = {}
+    engine = MagicMock()
+    engine.make_shadow.return_value = shadow
+    bf = FeedGapBackfiller(hm, engine, MagicMock(), lambda: [FUT], gap_seconds=15)
+    drive_to_repair(bf)
+
+    late = bar("1m", t(10, 3))
+    assert bf.hold(late) is True  # closes while the worker is busy
+    release.set()
+    bf._worker.join(timeout=5)
+    assert "repaired" in bf.observe(t(10, 3, 7), {FUT: t(10, 3, 7)}, True).lower()
+    shadow.bootstrap_candles.assert_called_once_with([late])
+    engine.adopt_states.assert_called_once_with(shadow, [FUT])
+    assert bf.hold(bar("1m", t(10, 4))) is False  # live path resumes
 
 
 def test_no_gap_detection_outside_cash_session():
     bf = FeedGapBackfiller(MagicMock(), MagicMock(), MagicMock(), lambda: [FUT], gap_seconds=15)
     assert bf.observe(t(15, 35), {FUT: t(15, 30)}, session_live=False) is None
     assert not bf.active
-
-
-def test_symbol_never_seen_is_not_treated_as_stale():
-    bf = FeedGapBackfiller(MagicMock(), MagicMock(), MagicMock(), lambda: ["SPOT", FUT], gap_seconds=15)
-    assert bf.observe(t(9, 20), {"SPOT": t(9, 20), FUT: None}, True) is None

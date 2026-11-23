@@ -1316,8 +1316,20 @@ class TechnicalAnalysisEngine:
                     state.latest_candle_timestamps.clear()
                     state._pending_breakout_eval.clear()
 
-    def reset_symbols(self, symbols: List[str]) -> None:
-        """Discard all technical state for `symbols` so it can be rebuilt from verified bars.
+    def make_shadow(self) -> "TechnicalAnalysisEngine":
+        """A callback-free engine with the same instrument pairing, for off-thread rebuilds.
+
+        It has no setup/candidate callbacks and no derivatives engine, so warming it up
+        can never emit a signal or mutate shared derivatives state.
+        """
+        with self._lock:
+            shadow = TechnicalAnalysisEngine(primary_index=self.primary_index, primary_futures=self.primary_futures)
+            for idx, fut in self.index_futures_map.items():
+                shadow.set_index_futures_mapping(idx, fut)
+            return shadow
+
+    def adopt_states(self, source: "TechnicalAnalysisEngine", symbols: List[str]) -> None:
+        """Atomically replace `symbols`' technical state with states rebuilt in `source`.
 
         Used after a feed gap: a partially observed bar may already be baked into EMAs,
         ATR, VWAP, swings and breakout machines, and appending corrected bars cannot undo
@@ -1326,9 +1338,8 @@ class TechnicalAnalysisEngine:
         """
         with self._lock:
             for sym in symbols:
-                old = self.states.get(sym)
-                is_index = old.is_index if old is not None else ("INDEX" in sym)
-                self.states[sym] = SymbolTechnicalState(symbol=sym, is_index=is_index)
+                if sym in source.states:
+                    self.states[sym] = source.states[sym]
                 self._pending_1m_entry.pop(sym, None)
             if self.multi_timeframe_analyzer is not None:
                 self.multi_timeframe_analyzer.active_setups.clear()
