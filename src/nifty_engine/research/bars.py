@@ -106,3 +106,45 @@ def daily_candles(df_d: pd.DataFrame, symbol: str) -> List[Candle]:
 
 def trading_days(cal: ExchangeCalendar, start: date, end: date) -> List[date]:
     return [d for d in (start + timedelta(days=i) for i in range((end - start).days + 1)) if cal.is_trading_day(d)]
+
+
+def bar_build_report(df1m: pd.DataFrame, cal: ExchangeCalendar, kind: str) -> Dict[date, Dict[str, int]]:
+    """Per day: why bars were excluded (so fewer signals on a day can be explained).
+
+    raw_1m, out_of_session (pre-open/after-close prints dropped), expected_1m, missing_1m,
+    and for 5m/15m the buckets that had data vs were emitted (dropped_late_start = buckets the
+    live builder would not emit because their first minute started too late).
+    """
+    if df1m.empty:
+        return {}
+    ts_all = pd.to_datetime(df1m["ts"]).dt.tz_convert("Asia/Kolkata")
+    clean = in_session_1m(df1m, cal, kind)
+    clean_ts = pd.to_datetime(clean["ts"])
+    out: Dict[date, Dict[str, int]] = {}
+    for d in sorted(set(ts_all.dt.date)):
+        day_clean = clean.loc[clean_ts.dt.date == d]
+        exp = expected_minutes(cal, d, kind)
+        rec = {
+            "raw_1m": int((ts_all.dt.date == d).sum()),
+            "in_session_1m": len(day_clean),
+            "expected_1m": len(exp),
+            "special_session": int(d in cal.special_sessions),
+        }
+        rec["out_of_session"] = rec["raw_1m"] - rec["in_session_1m"]
+        rec["missing_1m"] = rec["expected_1m"] - rec["in_session_1m"]
+        for tf in ("5m", "15m"):
+            with_data = len(resample(day_clean, tf, drop_late_start=False)) if len(day_clean) else 0
+            emitted = len(resample(day_clean, tf)) if len(day_clean) else 0
+            rec[f"{tf}_with_data"] = with_data
+            rec[f"{tf}_dropped_late_start"] = with_data - emitted
+        out[d] = rec
+    return out
+
+
+def summarize_build_report(report: Dict[date, Dict[str, int]]) -> Dict[str, int]:
+    keys = ("out_of_session", "missing_1m", "5m_dropped_late_start", "15m_dropped_late_start")
+    summary = {k: sum(r[k] for r in report.values()) for k in keys}
+    summary["days"] = len(report)
+    summary["special_session_days"] = sum(r["special_session"] for r in report.values())
+    summary["days_with_exclusions"] = sum(1 for r in report.values() if any(r[k] for k in keys))
+    return summary

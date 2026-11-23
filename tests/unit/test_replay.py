@@ -193,3 +193,82 @@ def test_replay_fails_closed_without_a_valid_manifest(tmp_path):
     store = _synthetic_store(days)
     with pytest.raises(ManifestError, match="No dataset manifest"):
         ReplayDriver(store).run(days[-1], days[-1], warmup_days=5, manifest_path=tmp_path / "none.json")
+
+
+def _live_builder_sequence(df1m, symbol, is_index, mode):
+    """Ordered (timeframe, timestamp, OHLC, volume, observed_at) from the real builder, driven like
+    the live loop: the 1s flush runs at EVERY minute boundary whether or not ticks arrive.
+    mode='tick': the boundary's first tick is processed before the flush (bars close by tick);
+    mode='flush': the flush runs first (bars close by the clock)."""
+    out = []
+    b = RealtimeCandleBuilder(on_candle_close=out.append)
+    rows = {r.ts.to_pydatetime(): r for r in df1m.itertuples(index=False)}
+    first, last = min(rows), max(rows)
+    cum = 0
+
+    def ticks_for(t):
+        nonlocal cum
+        r = rows.get(t)
+        if r is None:
+            return
+        for sec, px, vol in ((0, r.open, 0), (15, r.high, 0), (30, r.low, 0), (45, r.close, int(r.volume))):
+            cum += vol
+            ts = t + timedelta(seconds=sec)
+            b.process_tick(Tick(symbol=symbol, exchange_timestamp=ts, local_timestamp=ts, ltp=float(px),
+                                cumulative_volume=0 if is_index else cum, incremental_volume=0 if is_index else vol,
+                                is_index=is_index))
+
+    t = first
+    while t <= last + timedelta(minutes=30):  # keep flushing after the close (partial 15m bars)
+        if mode == "tick":
+            ticks_for(t)
+            b.flush_closed_bars(t)
+        else:
+            b.flush_closed_bars(t)
+            ticks_for(t)
+        t += timedelta(minutes=1)
+    return [(c.timeframe, c.timestamp, c.open, c.high, c.low, c.close, c.volume, c.observed_at) for c in out]
+
+
+def _replay_sequence(df1m, kind, is_index, mode):
+    clean = in_session_1m(df1m, CAL, kind)
+    rows = []
+    for tf in ("1m", "5m", "15m"):
+        n = {"1m": 1, "5m": 5, "15m": 15}[tf]
+        for r in resample(clean, tf).itertuples(index=False):
+            ts = r.ts.to_pydatetime()
+            rows.append((tf, ts, float(r.open), float(r.high), float(r.low), float(r.close),
+                         0 if is_index else int(r.volume), ts + timedelta(minutes=n)))
+    # Builder emission order = order bars were (re)created in its dict: next-tick closes replace bars
+    # in place (1m -> 5m -> 15m); clock flushes delete and re-create them (15m -> 5m -> 1m).
+    rank = {"1m": 0, "5m": 1, "15m": 2} if mode == "tick" else {"15m": 0, "5m": 1, "1m": 2}
+    return sorted(rows, key=lambda x: (x[7], rank[x[0]]))
+
+
+@pytest.mark.parametrize("mode", ["tick", "flush"])
+@pytest.mark.parametrize("label,day,kind,is_index,drop", [
+    ("regular cash session", date(2026, 6, 10), CASH, True, ()),
+    ("Muhurat futures", date(2026, 11, 8), FNO, False, ()),
+    ("futures closing window", date(2026, 10, 15), FNO, False, ()),
+    ("late-start buckets", date(2026, 6, 10), FNO, False, (45, 60, 61)),
+])
+def test_replay_bar_sequence_and_timing_equal_the_live_builder(mode, label, day, kind, is_index, drop):
+    df = _ohlc_rows(day, kind, drop_minutes=drop)
+    live = _live_builder_sequence(df, "NSE:NIFTY50-INDEX" if is_index else "NSE:NIFTY-FUT-NEAR", is_index, mode)
+    replay = _replay_sequence(df, kind, is_index, mode)
+    assert len(live) == len(set(live)), "live builder emitted a duplicate bar"
+    assert replay == live, f"{label}/{mode}: first difference at " + str(
+        next((i, a, b) for i, (a, b) in enumerate(zip(replay, live)) if a != b) if replay[:len(live)] != live[:len(replay)]
+        else ("length", len(replay), len(live)))
+
+
+def test_replay_reports_why_bars_were_excluded():
+    from nifty_engine.research.bars import bar_build_report, summarize_build_report
+
+    day = date(2026, 9, 8)
+    df = _ohlc_rows(day, CASH, drop_minutes=(45,))  # one missing minute -> its 5m bucket starts late
+    pre = df.iloc[:5].copy()
+    pre["ts"] = [df["ts"].iloc[0] - pd.Timedelta(minutes=k) for k in range(5, 0, -1)]  # 5 pre-open prints
+    rep = bar_build_report(pd.concat([pre, df]), CAL, CASH)[day]
+    assert rep["out_of_session"] == 5 and rep["missing_1m"] == 1 and rep["5m_dropped_late_start"] == 1
+    assert summarize_build_report({day: rep})["days_with_exclusions"] == 1

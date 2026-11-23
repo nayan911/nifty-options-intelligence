@@ -29,7 +29,13 @@ from nifty_engine.core.calendar import ExchangeCalendar
 from nifty_engine.core.interfaces import Candle
 from nifty_engine.data.historical_manager import HistoricalCandleManager
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
-from nifty_engine.research.bars import build_intraday_candles, daily_candles, trading_days
+from nifty_engine.research.bars import (
+    bar_build_report,
+    build_intraday_candles,
+    daily_candles,
+    summarize_build_report,
+    trading_days,
+)
 from nifty_engine.research.history_store import ResearchHistoryStore
 from nifty_engine.research.manifest import DEFAULT_MANIFEST, dataset_fingerprint, require_valid_manifest
 from nifty_engine.research.sessions import CASH, FNO
@@ -66,6 +72,8 @@ class ReplayResult:
     signals: List[ReplaySignal]
     provenance: Dict[str, Any]
     skipped_days: List[Tuple[date, str]] = field(default_factory=list)
+    # Why bars were excluded, per series: {"NSE:NIFTY50-INDEX": {"summary": {...}, "days": {date: {...}}}}
+    validation: Dict[str, Any] = field(default_factory=dict)
 
     def candidates(self) -> List[ReplaySignal]:
         return [s for s in self.signals if s.kind == "CANDIDATE"]
@@ -83,13 +91,19 @@ class ReplayDriver:
     def __init__(self, research: ResearchHistoryStore, calendar: Optional[ExchangeCalendar] = None,
                  spot_instrument: str = "NIFTY_SPOT", fut_instrument: str = "NIFTY_FUT",
                  fut_store_symbol: str = "CONT:NIFTY:NEAR",
-                 engine_factory: Optional[Callable[..., TechnicalAnalysisEngine]] = None) -> None:
+                 engine_factory: Optional[Callable[..., TechnicalAnalysisEngine]] = None,
+                 delivery_order: str = "tick") -> None:
         self.research = research
         self.cal = calendar or ExchangeCalendar()
         self.spot_instrument = spot_instrument
         self.fut_instrument = fut_instrument
         self.fut_store_symbol = fut_store_symbol
         self.engine_factory = engine_factory or (lambda **kw: TechnicalAnalysisEngine(**kw))
+        # Live emission order at a boundary depends on what closes the bars first: the next tick
+        # (1m -> 5m -> 15m) or the 1-second clock flush (15m -> 5m -> 1m). Both occur live.
+        if delivery_order not in ("tick", "flush"):
+            raise ValueError("delivery_order must be 'tick' or 'flush'")
+        self.delivery_order = delivery_order
         self._store: Optional[DuckDBStore] = None
         self._intraday: Dict[str, Dict[str, List[Candle]]] = {}
 
@@ -111,6 +125,8 @@ class ReplayDriver:
             SPOT: build_intraday_candles(spot1, self.cal, CASH, SPOT),
             FUT: build_intraday_candles(fut1, self.cal, FNO, FUT),
         }
+        self._build_reports = {SPOT: bar_build_report(spot1, self.cal, CASH),
+                               FUT: bar_build_report(fut1, self.cal, FNO)}
         for sym, tfs in self._intraday.items():
             for candles in tfs.values():
                 store.insert_candles_batch(candles)
@@ -131,7 +147,8 @@ class ReplayDriver:
                             # bars carry volume 0 (FYERS *history* reports one; warmup keeps it, as live).
                             c = c.model_copy(update={"volume": 0})
                         by_close.setdefault(c.observed_at, []).append(c)
-        order = {(SPOT, "1m"): 0, (SPOT, "5m"): 1, (SPOT, "15m"): 2, (FUT, "1m"): 3, (FUT, "5m"): 4, (FUT, "15m"): 5}
+        tf_rank = {"1m": 0, "5m": 1, "15m": 2} if self.delivery_order == "tick" else {"15m": 0, "5m": 1, "1m": 2}
+        order = {(sym, tf): i * 3 + tf_rank[tf] for i, sym in enumerate((SPOT, FUT)) for tf in tf_rank}
         return [(t, sorted(cs, key=lambda c: order[(c.symbol, c.timeframe)])) for t, cs in sorted(by_close.items())]
 
     # ------------------------------------------------------------------ replay
@@ -196,7 +213,16 @@ class ReplayDriver:
             {"validated": True, "generated_at": manifest.get("generated_at"),
              "fingerprint": manifest.get("dataset_fingerprint")} if manifest else {"validated": False}
         )
-        return ReplayResult(start, end, days, signals, prov, skipped)
+        validation = {}
+        for sym, rep in self._build_reports.items():
+            in_range = {d: r for d, r in rep.items() if d in set(days)}
+            validation[sym] = {
+                "summary": summarize_build_report(in_range),
+                "days_with_exclusions": {d.isoformat(): r for d, r in in_range.items()
+                                         if r["out_of_session"] or r["missing_1m"] or r["5m_dropped_late_start"]
+                                         or r["15m_dropped_late_start"]},
+            }
+        return ReplayResult(start, end, days, signals, prov, skipped, validation)
 
     def provenance(self, start: date, end: date) -> Dict[str, Any]:
         return {
