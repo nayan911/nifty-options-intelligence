@@ -38,6 +38,7 @@ strategies:
       # separately per tier (Phase 3).
       contract_confidence: [VERIFIED, PARTIALLY_VERIFIED, INFERRED]
       warmup_trading_days: 10
+      contract_confidence_scope: signal_and_warmup   # the signal day and its warmup days
 
     params:
       levels:
@@ -104,6 +105,20 @@ strategies:
       spot_futures_pairing_tolerance_seconds: 5.0
       trend_bias: "EMA9 vs EMA21 with close vs EMA9; provisional structural fallback (opening range, daily references, swings) during warmup"
 
-    evidence: null          # Phase 3 attaches the baseline backtest report for this version
+    evidence:               # not part of the locked fingerprint
+      baseline_report: reports/baseline/S000_v1.md
+      generated: 2026-11-24
+      range: [2025-12-29, 2026-11-23]
+      dataset_fingerprint: e4aa37159f650e97fe67fd3b
+      days_replayed: 214
+      candidates: 143
+      opportunities: 104
+      contract_tiers_days: {VERIFIED: 19, INFERRED: 195}
+      # NIFTY spot, next-1m-open entry, 60 min; hit = target before stop (95% Wilson); avg = NIFTY pts gross of costs
+      plus30_s000_stop: {hit_pct: 35.6, ci95: [27.0, 45.1], avg_points: 4.2}
+      plus30_stop20: {hit_pct: 45.2, ci95: [36.0, 54.8], avg_points: 5.7}
+      plus40_stop20: {hit_pct: 35.6, ci95: [27.0, 45.1], avg_points: 5.6}
+      note: "Not option P&L. Small positive edge before costs; S000 stop (median 13 pts) too tight for +30."
     changelog:
       - {version: 1, date: 2026-11-24, change: "Registered: parameters moved from code unchanged (identical signals verified over the full history)."}
+      - {version: 1, date: 2026-11-24, change: "Lock fingerprint widened to instruments + data requirements (confidence policy applies to signal and warmup days). No behaviour change for the accepted tiers."}

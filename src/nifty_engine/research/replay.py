@@ -258,7 +258,9 @@ class ReplayDriver:
         self._prepare()
         all_days = trading_days(self.cal, first, end)
         accepted = set(self.strategy.data_requirements.contract_confidence)
-        tiers = self.contract_tiers(trading_days(self.cal, start, end))
+        scope = self.strategy.data_requirements.contract_confidence_scope
+        tiers = self.contract_tiers(all_days)
+        day_pos = {d: i for i, d in enumerate(all_days)}
         tier_mix: Dict[str, int] = {}
         min_day = all_days[warmup_days] if len(all_days) > warmup_days else end + timedelta(days=1)
         signals: List[ReplaySignal] = []
@@ -273,6 +275,13 @@ class ReplayDriver:
             if tier is not None and tier not in accepted:
                 skipped.append((d, f"futures contract confidence {tier} not accepted by {self.strategy.id}"))
                 continue
+            if scope == "signal_and_warmup" and tier is not None:
+                i = day_pos[d]
+                bad = [(w, tiers[w]) for w in all_days[max(0, i - warmup_days):i] if tiers[w] not in accepted]
+                if bad:
+                    skipped.append((d, f"warmup day {bad[0][0].isoformat()} has futures contract confidence "
+                                       f"{bad[0][1]}, not accepted by {self.strategy.id}"))
+                    continue
             self.replay_day(d, signals)
             days.append(d)
             key = tier or "UNVALIDATED"

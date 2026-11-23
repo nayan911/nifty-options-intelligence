@@ -1,0 +1,119 @@
+"""Phase 3A outcome labelling: entry, target/stop order, ambiguity, timeouts, grouping, Wilson CI."""
+
+from datetime import date, datetime, timedelta
+
+import pandas as pd
+import pytz
+
+from nifty_engine.research.outcomes import (
+    group_opportunities,
+    label,
+    one_position_at_a_time,
+    summarize,
+    wilson,
+)
+from nifty_engine.research.replay import ReplaySignal
+
+IST = pytz.timezone("Asia/Kolkata")
+D = date(2026, 6, 10)
+T0 = IST.localize(datetime(2026, 6, 10, 10, 0))
+
+
+def bars(path):
+    """path: list of (open, high, low, close) per minute starting 10:00."""
+    return pd.DataFrame([{"ts": pd.Timestamp(T0 + timedelta(minutes=i)), "open": o, "high": h, "low": l, "close": c}
+                         for i, (o, h, l, c) in enumerate(path)])
+
+
+def cand(direction="BULLISH", stop=25080.0, decision=T0, conf=65.0, cid="a"):
+    return ReplaySignal("CANDIDATE", D, decision - timedelta(minutes=1), "NSE:NIFTY50-INDEX", "1m", direction,
+                        {"candidate_id": cid, "decision_at": decision.isoformat(), "entry": 25100.0,
+                         "stop_loss": stop, "confluence": conf, "level_id": cid})
+
+
+def op_for(c):
+    return group_opportunities([c])[0]
+
+
+def test_entry_is_the_next_bar_open_and_target_first_wins():
+    b = bars([(25100, 25110, 25095, 25108), (25108, 25131, 25105, 25130)])
+    r = label(op_for(cand()), b, 30, 20.0, 60)
+    assert r["entry"] == 25100 and r["outcome"] == "TARGET" and r["minutes"] == 1 and r["mfe"] == 31
+
+
+def test_stop_first_and_bearish_direction():
+    b = bars([(25100, 25104, 25090, 25092), (25092, 25125, 25060, 25070)])
+    assert label(op_for(cand()), b, 30, 15.0, 60)["outcome"] == "STOP"       # bar 2: +25 < 30 but -40
+    assert label(op_for(cand()), b, 20, 15.0, 60)["outcome"] == "AMBIGUOUS"  # both inside bar 2
+    assert label(op_for(cand()), b, 30, 10.0, 60)["outcome"] == "STOP"       # -10 hit in bar 1
+    bear = bars([(25100, 25102, 25069, 25071)])
+    r = label(op_for(cand("BEARISH", stop=25120.0)), bear, 30, "S000", 60)
+    assert r["outcome"] == "TARGET" and r["stop_points"] == 20.0
+
+
+def test_ambiguous_bar_is_never_a_win():
+    b = bars([(25100, 25135, 25075, 25110)])
+    r = label(op_for(cand()), b, 30, 20.0, 60)
+    assert r["outcome"] == "AMBIGUOUS"
+    s = summarize([_with(op_for(cand()), "K", r)], "K")
+    assert s["TARGET"] == 0 and s["hit_rate"] == 0.0
+
+
+def test_timeout_respects_horizon_and_session_end():
+    b = bars([(25100, 25110, 25095, 25105)] * 50 + [(25105, 25140, 25100, 25138)])
+    r = label(op_for(cand()), b, 30, 20.0, 45)
+    assert r["outcome"] == "TIMEOUT" and r["minutes"] == 44 and r["close_points"] == 5
+    assert label(op_for(cand()), b, 30, 20.0, 60)["outcome"] == "TARGET"
+    short = bars([(25100, 25110, 25095, 25105)] * 3)
+    assert label(op_for(cand()), short, 30, 20.0, 60)["outcome"] == "TIMEOUT"
+    assert label(op_for(cand(decision=T0 + timedelta(minutes=10))), short, 30, 20.0, 60)["outcome"] == "NO_ENTRY"
+
+
+def test_open_beyond_s000_stop_is_an_immediate_stop():
+    b = bars([(25075, 25140, 25070, 25130)])
+    r = label(op_for(cand(stop=25080.0)), b, 30, "S000", 60)
+    assert r["outcome"] == "STOP" and r["minutes"] == 0
+
+
+def test_same_bar_candidates_are_one_opportunity_with_highest_confluence_rep():
+    ops = group_opportunities([cand(conf=65, cid="b", stop=25090), cand(conf=80, cid="a", stop=25070),
+                               cand("BEARISH", cid="c"), cand(decision=T0 + timedelta(minutes=1), cid="d")])
+    assert len(ops) == 3
+    first = [o for o in ops if o.direction == "BULLISH" and o.decision_at == T0][0]
+    assert len(first.candidates) == 2 and first.rep["candidate_id"] == "a" and first.rep["stop_loss"] == 25070
+
+
+def _with(op, key, res):
+    op.outcomes[key] = res
+    return op
+
+
+def test_one_position_at_a_time_skips_overlapping_entries():
+    a = _with(op_for(cand(cid="a")), "K", {"outcome": "STOP", "entry_at": T0.isoformat(),
+                                           "exit_at": (T0 + timedelta(minutes=5)).isoformat(), "minutes": 5})
+    b = _with(op_for(cand(decision=T0 + timedelta(minutes=3), cid="b")), "K",
+              {"outcome": "TARGET", "entry_at": (T0 + timedelta(minutes=3)).isoformat(),
+               "exit_at": (T0 + timedelta(minutes=9)).isoformat(), "minutes": 6})
+    c = _with(op_for(cand(decision=T0 + timedelta(minutes=6), cid="c")), "K",
+              {"outcome": "TARGET", "entry_at": (T0 + timedelta(minutes=6)).isoformat(),
+               "exit_at": (T0 + timedelta(minutes=8)).isoformat(), "minutes": 2})
+    assert [o.rep["candidate_id"] for o in one_position_at_a_time([a, b, c], "K")] == ["a", "c"]
+
+
+def test_wilson_interval():
+    assert wilson(0, 0) == (None, None)
+    lo, hi = wilson(50, 100)
+    assert lo == 40.4 and hi == 59.6
+    lo, hi = wilson(9, 10)
+    assert lo < 90 < hi and hi <= 100
+
+
+def test_expectancy_counts_ambiguous_as_a_stop_and_timeouts_at_close():
+    k = "T30_S20_H60"
+    ops = [_with(op_for(cand(cid=c)), k, r) for c, r in (
+        ("a", {"outcome": "TARGET", "minutes": 3, "mfe": 31, "mae": 2, "stop_points": 20.0}),
+        ("b", {"outcome": "STOP", "minutes": 3, "mfe": 1, "mae": 20, "stop_points": 20.0}),
+        ("c", {"outcome": "AMBIGUOUS", "minutes": 1, "mfe": 30, "mae": 20, "stop_points": 20.0}),
+        ("d", {"outcome": "TIMEOUT", "minutes": 59, "mfe": 9, "mae": 5, "stop_points": 20.0, "close_points": 6.0}))]
+    s = summarize(ops, k)
+    assert s["expectancy_points"] == round((30 - 20 - 20 + 6) / 4, 2) and s["TARGET"] == 1 and s["hit_rate"] == 25.0

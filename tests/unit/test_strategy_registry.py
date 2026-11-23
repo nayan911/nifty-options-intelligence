@@ -59,7 +59,8 @@ def test_registry_s000_equals_the_pre_registry_engine_values():
     assert e.version == 1 and e.status == "baseline"
     assert e.fixed == S000_FIXED
     assert "CONFLICT" not in e.data_requirements.contract_confidence
-    assert len(e.params_hash()) == 16 and e.params_hash() == load_registry().get("S000").params_hash()
+    assert len(e.fingerprint()) == 16 and e.fingerprint() == load_registry().get("S000").fingerprint()
+    assert e.params_hash() == "1f615431ffcea0ea"  # engine parameters unchanged since registration
 
 
 @pytest.mark.parametrize("label,mutate,match", [
@@ -268,7 +269,7 @@ def test_new_version_must_be_locked_before_it_becomes_baseline(tmp_path):
         _load_modified(tmp_path, lambda r: bump(r, "baseline"))
     e = _load_modified(tmp_path, lambda r: bump(r, "research")).get("S000")   # research may iterate unlocked
     assert e.version == 2 and e.params.entry.rsi_overbought == 72.0
-    locks = {"S000": {"1": "1f615431ffcea0ea", "2": e.params_hash()}}
+    locks = {"S000": {"1": "431a35bf64947b56", "2": e.fingerprint()}}
     assert _load_modified(tmp_path, lambda r: bump(r, "baseline"), locks=locks).get("S000").version == 2
 
 
@@ -281,7 +282,7 @@ def test_lock_file_is_required(tmp_path):
 
 def test_committed_lock_matches_s000_v1():
     locks = json.loads(REGISTRY.with_name("registry.lock.json").read_text())
-    assert locks["S000"]["1"] == load_registry().get("S000").params_hash() == "1f615431ffcea0ea"
+    assert locks["S000"]["1"] == load_registry().get("S000").fingerprint() == "431a35bf64947b56"
 
 
 # ------------------------------------------------------------------ strategy data requirements
@@ -298,8 +299,11 @@ def test_replay_refuses_inputs_the_strategy_does_not_declare(tmp_path):
     from nifty_engine.research.replay import ReplayDriver
 
     T, days, store = _synthetic()
-    no_fut_daily = _load_modified(tmp_path, lambda r: r["strategies"]["S000"]["data_requirements"]["series"][1]
-                                  .update(resolutions=["1"])).get("S000")
+    def drop_fut_daily(r):
+        r["strategies"]["S000"]["data_requirements"]["series"][1].update(resolutions=["1"])
+        r["strategies"]["S000"]["status"] = "research"
+
+    no_fut_daily = _load_modified(tmp_path, drop_fut_daily, locks={"S000": {}}).get("S000")
     with pytest.raises(ManifestError, match=r"NIFTY_FUT/CONT \['D'\] not declared"):
         ReplayDriver(store, strategy=no_fut_daily).run(days[-1], days[-1], require_manifest=False)
     drv = ReplayDriver(store)
@@ -322,10 +326,32 @@ def test_replay_skips_days_whose_contract_confidence_is_not_accepted(tmp_path):
                  [days[0], days[-2]])
     store._write("INSERT INTO cont_segments VALUES ('NIFTY_FUT','CONT',2,?,?,NULL,NULL,'INFERRED',0,0,0,0.0)",
                  [days[-1], days[-1]])
-    verified_only = _load_modified(tmp_path, lambda r: r["strategies"]["S000"]["data_requirements"]
-                                   .update(contract_confidence=["VERIFIED"])).get("S000")
-    res = ReplayDriver(store, strategy=verified_only).run(days[-2], days[-1], require_manifest=False)
+    with pytest.raises(RegistryError, match="locked"):  # the confidence policy is part of the locked identity
+        _load_modified(tmp_path, lambda r: r["strategies"]["S000"]["data_requirements"]
+                       .update(contract_confidence=["VERIFIED"]))
+    unlocked = {"S000": {}}
+
+    def verified_only(r, scope="signal_and_warmup"):
+        r["strategies"]["S000"]["data_requirements"].update(contract_confidence=["VERIFIED"],
+                                                            contract_confidence_scope=scope)
+        r["strategies"]["S000"]["status"] = "research"
+
+    strat = _load_modified(tmp_path, verified_only, locks=unlocked).get("S000")
+    res = ReplayDriver(store, strategy=strat).run(days[-2], days[-1], require_manifest=False)
     assert res.days == [days[-2]]
     assert res.skipped_days == [(days[-1], "futures contract confidence INFERRED not accepted by S000")]
     assert res.provenance["contract_confidence_days"] == {"VERIFIED": 1}
     assert res.provenance["warmup_trading_days"] == 10
+
+    # an INFERRED day inside the warmup window also disqualifies the signal day (signal_and_warmup) ...
+    store._write("UPDATE cont_segments SET end_day = ? WHERE segment_id = 1", [days[-4]])
+    store._write("INSERT INTO cont_segments VALUES ('NIFTY_FUT','CONT',3,?,?,NULL,NULL,'INFERRED',0,0,0,0.0)",
+                 [days[-3], days[-3]])
+    store._write("INSERT INTO cont_segments VALUES ('NIFTY_FUT','CONT',4,?,?,NULL,NULL,'VERIFIED',0,0,0,1.0)",
+                 [days[-2], days[-2]])
+    res = ReplayDriver(store, strategy=strat).run(days[-2], days[-2], require_manifest=False)
+    assert res.days == [] and res.skipped_days == [
+        (days[-2], f"warmup day {days[-3].isoformat()} has futures contract confidence INFERRED, not accepted by S000")]
+    # ... but not when the policy is scoped to the signal day only
+    strat_day = _load_modified(tmp_path, lambda r: verified_only(r, "signal_day"), locks=unlocked).get("S000")
+    assert ReplayDriver(store, strategy=strat_day).run(days[-2], days[-2], require_manifest=False).days == [days[-2]]

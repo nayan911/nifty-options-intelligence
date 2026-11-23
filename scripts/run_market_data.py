@@ -77,8 +77,8 @@ class MarketDataEngine:
         # Strategy parameters come ONLY from the validated registry; an invalid registry stops
         # startup (RegistryError) rather than trading with unintended parameters.
         self.strategy = load_registry().get("S000")
-        logger.info("Strategy %s v%s (%s), params %s", self.strategy.id, self.strategy.version,
-                    self.strategy.status, self.strategy.params_hash())
+        logger.info("Strategy %s v%s (%s), fingerprint %s", self.strategy.id, self.strategy.version,
+                    self.strategy.status, self.strategy.fingerprint())
         self.technical_engine = TechnicalAnalysisEngine(
             primary_index=settings.PRIMARY_INDEX,
             primary_futures="NSE:NIFTY26NOVFUT",

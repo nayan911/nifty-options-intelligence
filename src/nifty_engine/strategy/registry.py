@@ -17,8 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from nifty_engine.strategy.params import S000_FIXED, S000Params
 
 DEFAULT_REGISTRY = Path(__file__).resolve().parents[3] / "strategies" / "registry.yaml"
-# Version locks: {strategy_id: {version: params_hash}}. Once a version is established its parameters
-# are frozen; any behavioural change needs a new version (or strategy id) and a new lock entry.
+# Version locks: {strategy_id: {version: fingerprint}}. The fingerprint covers everything that changes
+# behaviour or which data a result may come from (instruments, data requirements incl. contract
+# confidence policy and warmup, params, fixed definitions) - not name/description/evidence/changelog.
+# Once a version is established it is frozen; any such change needs a new version or strategy id.
 DEFAULT_LOCK = DEFAULT_REGISTRY.with_name("registry.lock.json")
 LOCK_REQUIRED_STATUSES = ("baseline", "observe", "live")
 SCHEMA_VERSION = 1
@@ -46,6 +48,10 @@ class DataRequirements(_Strict):
     series: List[SeriesRequirement] = Field(min_length=1)
     contract_confidence: List[str] = Field(min_length=1)
     warmup_trading_days: int = Field(ge=1, le=60)
+    # signal_and_warmup: the signal day AND the warmup days before it must all be accepted tiers
+    # (an input from a rejected tier can reach the signal through warmup indicators/levels).
+    # signal_day: only the signal day is checked.
+    contract_confidence_scope: Literal["signal_and_warmup", "signal_day"]
 
     @field_validator("contract_confidence")
     @classmethod
@@ -89,12 +95,24 @@ class StrategyEntry(_Strict):
         return self
 
     def params_hash(self) -> str:
-        """Stable hash of the effective parameters + fixed definitions (for provenance)."""
+        """Hash of the engine parameters + fixed definitions only (what the technical engine runs)."""
         payload = {"params": self.params.canonical(), "fixed": self.fixed}
         return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
+    def fingerprint(self) -> str:
+        """Immutable identity of this strategy version (what registry.lock.json locks): instruments,
+        data requirements (series, contract-confidence policy and scope, warmup), params, fixed."""
+        payload = {
+            "instruments": self.instruments.model_dump(mode="json"),
+            "data_requirements": self.data_requirements.model_dump(mode="json"),
+            "params": self.params.canonical(),
+            "fixed": self.fixed,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
     def provenance(self) -> Dict[str, Any]:
-        return {"id": self.id, "version": self.version, "status": self.status, "params_hash": self.params_hash()}
+        return {"id": self.id, "version": self.version, "status": self.status,
+                "fingerprint": self.fingerprint(), "params_hash": self.params_hash()}
 
 
 class Registry(_Strict):
@@ -170,11 +188,11 @@ def _check_locks(entries: Dict[str, StrategyEntry], lock_path: Path) -> None:
         raise RegistryError(f"strategy version lock file {lock_path} is not valid JSON: {e}") from None
     for sid, e in entries.items():
         locked = locks.get(sid, {}).get(str(e.version))
-        h = e.params_hash()
+        h = e.fingerprint()
         if locked is not None and locked != h:
             raise RegistryError(
-                f"{sid} v{e.version} is locked to params hash {locked}, but the registry now hashes to {h}. "
-                f"Behavioural parameters changed: give it a new version (or a new strategy id) with a "
+                f"{sid} v{e.version} is locked to fingerprint {locked}, but the registry now fingerprints to {h}. "
+                f"Behaviour or data policy changed: give it a new version (or a new strategy id) with a "
                 f"changelog entry, and lock that version instead of editing v{e.version}."
             )
         if locked is None and e.status in LOCK_REQUIRED_STATUSES:
