@@ -66,9 +66,9 @@ def test_session_state_after_derivatives_close(calendar):
 
 
 def test_muhurat_trading_session(calendar):
-    # Official NSE Muhurat trading 2026: 2026-11-08 between 18:15 and 19:15
-    dt_during = IST.localize(datetime(2026, 11, 8, 18, 30, 0))
-    dt_before = IST.localize(datetime(2026, 11, 8, 15, 0, 0))
+    # NSE Muhurat trading 2026 (8-Nov): 14:15-15:30, per FYERS history (bars 14:20-15:29)
+    dt_during = IST.localize(datetime(2026, 11, 8, 14, 45, 0))
+    dt_before = IST.localize(datetime(2026, 11, 8, 13, 0, 0))
 
     assert calendar.get_session_state(dt_during) == SessionState.SPECIAL_SESSION
     assert calendar.is_market_open(dt_during) is True
@@ -100,3 +100,38 @@ def test_get_prior_trading_date(calendar):
     fri_jan23 = calendar.get_prior_trading_date(tue_jan27, trading_days_back=1)
     assert fri_jan23 == date(2026, 1, 23)
 
+
+
+def test_2026_holiday_calendar_matches_observed_exchange_closures():
+    """Holiday list cross-checked against FYERS history (no bars in any series on closures).
+
+    The old list treated three real trading days as holidays (live system would sit out the
+    session) and missed six closures.
+    """
+    from datetime import date
+
+    from nifty_engine.core.calendar import ExchangeCalendar
+
+    cal = ExchangeCalendar()
+    traded = [date(2026, 3, 20), date(2026, 5, 27), date(2026, 8, 26)]
+    closed = [date(2026, 1, 15), date(2026, 3, 26), date(2026, 3, 31), date(2026, 5, 28),
+              date(2026, 6, 26), date(2026, 9, 14), date(2026, 11, 24)]
+    assert all(cal.is_trading_day(d) for d in traded)
+    assert not any(cal.is_trading_day(d) for d in closed)
+
+
+def test_2026_special_sessions_match_observed_data():
+    """Budget Sunday (1-Feb) was a full session; Muhurat (8-Nov) ran in the afternoon, not 18:15."""
+    from datetime import date, datetime
+
+    import pytz
+
+    from nifty_engine.core.calendar import ExchangeCalendar
+    from nifty_engine.core.interfaces import SessionState
+
+    ist = pytz.timezone("Asia/Kolkata")
+    cal = ExchangeCalendar()
+    assert cal.is_trading_day(date(2026, 2, 1))
+    assert cal.get_session_state(ist.localize(datetime(2026, 2, 1, 11, 0))) == SessionState.SPECIAL_SESSION
+    assert cal.get_session_state(ist.localize(datetime(2026, 11, 8, 14, 45))) == SessionState.SPECIAL_SESSION
+    assert cal.get_session_state(ist.localize(datetime(2026, 11, 8, 18, 30))) == SessionState.CLOSED

@@ -20,9 +20,18 @@ future_revisions:
 
 # Special Sessions (Muhurat Trading, DR Drills)
 special_sessions:
-  # Official NSE Muhurat Trading 2026 (Diwali Laxmi Pujan: Nov 8, 2026)
+  # Union Budget day (Sunday): full regular session. Verified in FYERS history: 375 1m bars
+  # 09:15-15:29 for NIFTY, India VIX and NIFTY futures.
+  "2026-02-01":
+    name: "Union Budget Session 2026 (Sunday)"
+    session_start: "09:15:00"
+    session_end: "15:30:00"
+    derivatives_close: "15:40:00"
+  # NSE Muhurat Trading 2026 (Diwali Laxmi Pujan, Sunday Nov 8). Previously configured as
+  # 18:15-19:15; FYERS history shows the actual session ran 14:20-15:29 (index) and to 15:39
+  # (futures).
   "2026-11-08":
     name: "Muhurat Trading 2026"
-    session_start: "18:15:00"
-    session_end: "19:15:00"
-    derivatives_close: "19:15:00"
+    session_start: "14:15:00"
+    session_end: "15:30:00"
+    derivatives_close: "15:40:00"

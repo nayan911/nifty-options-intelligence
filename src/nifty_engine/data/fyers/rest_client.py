@@ -197,8 +197,16 @@ class FyersRestClient:
         date_from: str = "",
         date_to: str = "",
         max_retries: int = 3,
+        continuous: bool = True,
+        include_oi: bool = False,
     ) -> List[Candle]:
-        """Synchronously fetch historical candles via FYERS SDK with rate limiting and exponential backoff on transient throttling."""
+        """Synchronously fetch historical candles via FYERS SDK with rate limiting and backoff.
+
+        continuous=True asks FYERS to stitch futures across expiries (cont_flag=1); the stitched
+        series switches contracts at expiry, so OI and price jump at those boundaries.
+        include_oi=True requests open interest (oi_flag=1); FYERS then returns a 7th column
+        for derivatives (indices/equities still return 6).
+        """
         response = None
         error_msg = ""
         for attempt in range(max_retries):
@@ -210,8 +218,10 @@ class FyersRestClient:
                 "date_format": "1",
                 "range_from": date_from,
                 "range_to": date_to,
-                "cont_flag": "1",
+                "cont_flag": "1" if continuous else "0",
             }
+            if include_oi:
+                data["oi_flag"] = "1"
 
             client = self._get_client()
             response = client.history(data=data)
@@ -251,6 +261,7 @@ class FyersRestClient:
                     low=float(c[3]),
                     close=float(c[4]),
                     volume=int(c[5]),
+                    oi=int(c[6]) if (include_oi and len(c) > 6 and c[6] is not None) else None,
                     is_closed=is_closed,
                 )
             )

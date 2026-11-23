@@ -1,25 +1,35 @@
-# NSE Trading Holidays Calendar (2026)
-# Verified against official NSE gazetted holiday schedule
+# NSE Trading Holidays Calendar (2026) - Equity and Equity Derivatives segments
+#
+# Corrected 2026-11-23. The previous list had three wrong dates (20-Mar, 27-May, 26-Aug: the
+# market traded a full session on each) and was missing six real closures. Every past date below
+# was cross-checked against FYERS 1m history: zero bars in NIFTY, BANKNIFTY, India VIX, NIFTY
+# futures and five NIFTY heavyweights on each listed day, and full sessions on all others.
+# Weekend holidays (Mahashivratri, Id-Ul-Fitr, Independence Day, Diwali Laxmi Pujan) are omitted:
+# they don't remove a trading day. Muhurat trading (Sun 8-Nov) is in market_sessions.yaml.
 year: 2026
 holidays:
+  - date: "2026-01-15"
+    description: "Municipal Corporation Election, Maharashtra"
   - date: "2026-01-26"
     description: "Republic Day"
   - date: "2026-03-03"
     description: "Holi"
-  - date: "2026-03-20"
-    description: "Id-Ul-Fitr (Ramzan Id)"
+  - date: "2026-03-26"
+    description: "Shri Ram Navami"
+  - date: "2026-03-31"
+    description: "Shri Mahavir Jayanti"
   - date: "2026-04-03"
     description: "Good Friday"
   - date: "2026-04-14"
     description: "Dr. Baba Saheb Ambedkar Jayanti"
   - date: "2026-05-01"
     description: "Maharashtra Day"
-  - date: "2026-05-27"
+  - date: "2026-05-28"
     description: "Bakri Id"
-  - date: "2026-08-15"
-    description: "Independence Day"
-  - date: "2026-08-26"
-    description: "Milad-Un-Nabi"
+  - date: "2026-06-26"
+    description: "Muharram"
+  - date: "2026-09-14"
+    description: "Ganesh Chaturthi"
   - date: "2026-10-02"
     description: "Mahatma Gandhi Jayanti"
   - date: "2026-10-20"
@@ -27,6 +37,6 @@ holidays:
   - date: "2026-11-10"
     description: "Diwali Balipratipada"
   - date: "2026-11-24"
-    description: "Guru Nanak Jayanti"
+    description: "Prakash Gurpurb Sri Guru Nanak Dev"
   - date: "2026-12-25"
     description: "Christmas"

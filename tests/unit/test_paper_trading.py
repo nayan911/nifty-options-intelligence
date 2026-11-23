@@ -1686,29 +1686,28 @@ def test_weekend_and_holiday_guards_prevent_eod_square_off():
 
 
 def test_special_session_uses_custom_square_off_time():
-    """Verify special session (e.g. Muhurat Trading 18:15-19:15) uses its own closing time."""
+    """Verify special session (Muhurat Trading 8-Nov, 14:15-15:30) uses its own closing time."""
     engine = PaperTradingEngine(default_lots=1, slippage_points=0.5)
-    # Muhurat trading date: 2026-11-08, session 18:15 - 19:15
-    entry_ts = IST.localize(datetime(2026, 11, 8, 18, 20, 0))
+    entry_ts = IST.localize(datetime(2026, 11, 8, 14, 20, 0))
 
     cand = create_mock_candidate(timestamp=entry_ts, entry_ltp=100.0, ask=100.0)
     pos = engine.process_technical_candidate(cand, current_time=entry_ts)
     assert pos is not None
 
-    # During afternoon (15:15 IST) market is closed for Muhurat day
-    afternoon_ts = IST.localize(datetime(2026, 11, 8, 15, 15, 0))
-    events = engine.check_time_events(afternoon_ts)
+    # Morning (11:00 IST): market is closed on Muhurat Sunday outside the session
+    morning_ts = IST.localize(datetime(2026, 11, 8, 11, 0, 0))
+    events = engine.check_time_events(morning_ts)
     assert len(events) == 0
     assert pos.status == PositionStatus.OPEN
 
-    # Mid-session (18:30 IST) - 15m before 19:15 close is 19:00, so 18:30 should not square off
-    mid_ts = IST.localize(datetime(2026, 11, 8, 18, 30, 0))
+    # Mid-session (14:50 IST): before the special cutoff (15:30 close - 15m = 15:15)
+    mid_ts = IST.localize(datetime(2026, 11, 8, 14, 50, 0))
     events = engine.check_time_events(mid_ts)
     assert len(events) == 0
     assert pos.status == PositionStatus.OPEN
 
-    # Cutoff time (19:01 IST) - should square off
-    cutoff_ts = IST.localize(datetime(2026, 11, 8, 19, 1, 0))
+    # Cutoff (15:16 IST): should square off
+    cutoff_ts = IST.localize(datetime(2026, 11, 8, 15, 16, 0))
     events = engine.check_time_events(cutoff_ts)
     assert len(events) == 1
     p, reason, exit_price = events[0]
