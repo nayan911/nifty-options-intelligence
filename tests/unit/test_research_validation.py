@@ -302,3 +302,81 @@ def test_stitched_series_are_append_only():
     old_px = store.conn.execute(
         "SELECT DISTINCT close FROM hist_bars WHERE CAST(ts AS DATE) <= ?", [old[-1]]).fetchall()
     assert old_px == [(25150.0,)]  # untouched
+
+
+# ------------------------------------------------------------------ review round: loopholes
+def _partial_day_store(px_stored):
+    days = _tdays(date(2026, 9, 1), 6)
+    store = ResearchHistoryStore(":memory:")
+    full = [c for d in days[:-1] for c in bars_for("x", d, FNO, px=px_stored, oi=3)]
+    partial = bars_for("x", days[-1], FNO, px=px_stored, oi=3)[:200]  # latest day only half stored
+    store.upsert_bars("NIFTY_FUT", "CONT:NIFTY:NEXT", "CONT_NEXT", "1", full + partial)
+    return store, days
+
+
+def test_partial_latest_day_is_not_overwritten_when_fyers_serves_a_different_contract():
+    store, days = _partial_day_store(px_stored=25150.0)
+    served = [c for d in days for c in bars_for("x", d, FNO, px=25000.0, oi=9)]  # stitching changed meaning
+    spec = SeriesSpec("NIFTY_FUT", "NSE:NIFTY26DECFUT", "CONT_NEXT", resolutions=("1",), underlying="NIFTY")
+    r = HistoryLoader(FakeRest(served), store, calendar=CAL).load(spec, days[0], days[-1], "1")
+    assert any("different contract" in e for e in r.errors)
+    rows = store.conn.execute("SELECT count(*), min(close), max(close) FROM hist_bars WHERE CAST(ts AS DATE) = ?",
+                              [days[-1]]).fetchall()[0]
+    assert rows == (200, 25150.0, 25150.0)  # untouched, and gaps NOT filled from the other contract
+
+
+def test_partial_latest_day_is_completed_when_fyers_serves_the_same_contract():
+    store, days = _partial_day_store(px_stored=25150.0)
+    served = [c for d in days for c in bars_for("x", d, FNO, px=25150.0, oi=3)]
+    spec = SeriesSpec("NIFTY_FUT", "NSE:NIFTY26DECFUT", "CONT_NEXT", resolutions=("1",), underlying="NIFTY")
+    r = HistoryLoader(FakeRest(served), store, calendar=CAL).load(spec, days[0], days[-1], "1")
+    assert not r.errors
+    n = store.conn.execute("SELECT count(*) FROM hist_bars WHERE CAST(ts AS DATE) = ?", [days[-1]]).fetchall()[0][0]
+    assert n == len(expected_minutes(CAL, days[-1], FNO))
+
+
+def test_fingerprint_changes_when_any_single_value_changes(tmp_path):
+    from nifty_engine.research.contracts import write_segment_table
+    from nifty_engine.research.manifest import dataset_fingerprint
+
+    days = _tdays(date(2026, 9, 1), 5)
+    store = _complete_store(days)
+    write_segment_table(store, [{"instrument": "NIFTY_FUT", "source": "CONT", "segment_id": 0,
+                                 "start_day": days[0], "end_day": days[-1], "contract_expiry": date(2026, 9, 29),
+                                 "contract_symbol": None, "confidence": "INFERRED", "checked_bars": 0,
+                                 "matched_bars": 0, "segment_bars": 1, "coverage": 0.0}])
+    m = build_manifest(store, CAL, days[0], days[-1])
+    path = write_manifest(m, tmp_path / "m.json")
+    assert require_valid_manifest(days[0], days[-1], store, path)["ok"]
+
+    base = dataset_fingerprint(store)
+    one = expected_minutes(CAL, days[2], CASH)[42]
+    store._write("UPDATE hist_bars SET high = high + 0.05 WHERE symbol = 'NSE:NIFTY50-INDEX' AND ts = ?", [one])
+    assert dataset_fingerprint(store) != base  # a single candle's HIGH (aggregate sums unchanged)
+    with pytest.raises(ManifestError, match="changed since validation"):
+        require_valid_manifest(days[0], days[-1], store, path)
+    store._write("UPDATE hist_bars SET high = high - 0.05 WHERE symbol = 'NSE:NIFTY50-INDEX' AND ts = ?", [one])
+    assert dataset_fingerprint(store) == base
+
+    a, b = expected_minutes(CAL, days[1], CASH)[10], expected_minutes(CAL, days[1], CASH)[11]
+    store._write("UPDATE hist_bars SET close = close + 1 WHERE symbol = 'NSE:NIFTY50-INDEX' AND ts = ?", [a])
+    store._write("UPDATE hist_bars SET close = close - 1 WHERE symbol = 'NSE:NIFTY50-INDEX' AND ts = ?", [b])
+    assert dataset_fingerprint(store) != base  # offsetting changes (sum(close) unchanged)
+    store._write("UPDATE hist_bars SET close = close - 1 WHERE symbol = 'NSE:NIFTY50-INDEX' AND ts = ?", [a])
+    store._write("UPDATE hist_bars SET close = close + 1 WHERE symbol = 'NSE:NIFTY50-INDEX' AND ts = ?", [b])
+
+    store._write("UPDATE cont_segments SET confidence = 'VERIFIED'")
+    assert dataset_fingerprint(store) != base  # contract-identity metadata is covered
+
+
+def test_small_matching_overlap_is_only_partially_verified():
+    store = ResearchHistoryStore(":memory:")
+    days = _tdays(date(2026, 10, 1), 10)
+    store.upsert_bars("NIFTY_FUT", "CONT:NIFTY:NEXT", "CONT_NEXT", "1",
+                      [c for d in days for c in bars_for("n", d, FNO, px=25150.0, oi=3)])
+    store._write("UPDATE hist_bars SET segment_id = 0")
+    _own(store, "NIFTY_FUT", "NSE:NIFTY26NOVFUT", date(2026, 11, 23), days[:1], 25150.0, 3)  # 1 of 10 sessions
+    row = segment_contract_table(store, CAL, "NIFTY_FUT", "CONT_NEXT", "NIFTY")[0]
+    assert row["confidence"] == "PARTIALLY_VERIFIED" and row["coverage"] < 0.9
+    _own(store, "NIFTY_FUT", "NSE:NIFTY26NOVFUT", date(2026, 11, 23), days, 25150.0, 3)
+    assert segment_contract_table(store, CAL, "NIFTY_FUT", "CONT_NEXT", "NIFTY")[0]["confidence"] == "VERIFIED"

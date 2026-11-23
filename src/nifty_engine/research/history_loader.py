@@ -122,7 +122,12 @@ class HistoryLoader:
         return True
 
     def _append_start(self, spec: SeriesSpec, resolution: str, start: date, end: date) -> Optional[date]:
-        """Stitched series are APPEND-ONLY: return the first day after the last complete stored day.
+        """Stitched series are APPEND-ONLY: return the first day to request.
+
+        That is the day after the last complete stored day, or the last stored day itself if it is
+        only partially stored (its missing minutes may be filled, but only via `_stitched_safe_bars`,
+        which never overwrites a stored bar and rejects the day if FYERS now serves a different
+        contract for it).
 
         FYERS stitches by the requested contract's position at request time, and that meaning shifts
         around each rollover (a refresh on 23-Nov via DEC returned near-month bars and overwrote the
@@ -144,9 +149,27 @@ class HistoryLoader:
             if missing <= allowed:
                 last_complete = d
                 break
-        if last_complete is None:
-            return None
+        last_stored = max(stored)
+        if last_complete is None or last_complete < last_stored:
+            return last_stored  # resume a partial day (insert-only, identity-checked)
         return last_complete + timedelta(days=1)
+
+    def _stitched_safe_bars(self, spec: SeriesSpec, resolution: str, candles, res: "LoadResult"):
+        """Drop every bar on a day where FYERS' answer disagrees with what is already stored.
+
+        If any already-stored minute comes back with a different close or OI, the stitching now
+        points at a different contract: the whole day is rejected (filling its gaps from another
+        contract would mix contracts within a session).
+        """
+        stored = self.store.stored_bars_at(spec.store_symbol, spec.source, resolution, [c.timestamp for c in candles])
+        bad_days = set()
+        for c in candles:
+            prev = stored.get(c.timestamp)
+            if prev is not None and (abs(float(prev[0]) - float(c.close)) > 0.01 or prev[1] != c.oi):
+                bad_days.add(c.timestamp.date())
+        for d in sorted(bad_days):
+            res.errors.append(f"{d}: FYERS returned a different contract than the stored bars; day not updated")
+        return [c for c in candles if c.timestamp.date() not in bad_days]
 
     def load(self, spec: SeriesSpec, start: date, end: date, resolution: str,
              resume: bool = True) -> LoadResult:
@@ -179,9 +202,12 @@ class HistoryLoader:
                 res.errors.append(f"{lo}..{hi}: {e}")
                 logger.warning("History load failed for %s %s %s..%s: %s", spec.symbol, resolution, lo, hi, e)
                 continue
+            stitched = spec.kind in ("CONT", "CONT_NEXT")
+            if stitched:
+                candles = self._stitched_safe_bars(spec, resolution, candles, res)
             res.bars += self.store.upsert_bars(
                 spec.instrument, spec.store_symbol, spec.source, resolution, candles,
-                contract_expiry=spec.contract_expiry,
+                contract_expiry=spec.contract_expiry, insert_only=stitched,
             )
         return res
 

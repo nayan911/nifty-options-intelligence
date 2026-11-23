@@ -9,9 +9,11 @@ For a day d:   near contract = 1st monthly expiry >= d,   next contract = 2nd mo
 
 `segment_contract_table` records, per stitched segment, the inferred contract expiry and a
 confidence:
-  VERIFIED   >= 99% of overlapping bars equal the stored real (OWN) contract (close and OI)
-  CONFLICT   overlap exists but bars do not match -> data error
-  INFERRED   no stored real contract overlaps (older history); identity from the calendar only
+  VERIFIED            >= 99% of compared bars equal the stored real (OWN) contract (close and OI),
+                      AND the comparison covers >= 90% of the segment's bars and >= 300 bars
+  PARTIALLY_VERIFIED  matches, but on too small a share of the segment to vouch for all of it
+  CONFLICT            compared bars do not match -> data error
+  INFERRED            no stored real contract overlaps (older history); identity from calendar only
 `identical_days` flags days where NEAR and NEXT are the same series (must never happen).
 `repair_next_from_own` rebuilds NEXT days from stored real contracts where possible and deletes
 NEXT days that duplicate NEAR and cannot be repaired.
@@ -54,46 +56,55 @@ def _match_stats(store: ResearchHistoryStore, instrument: str, cont_symbol: str,
     return {"checked": int(r[0] or 0), "matched": int(r[1] or 0), "own_symbol": r[2]}
 
 
+MIN_VERIFIED_COVERAGE = 0.90
+MIN_VERIFIED_BARS = 300
+
+
 def segment_contract_table(store: ResearchHistoryStore, cal: ExchangeCalendar, instrument: str,
                            source: str, underlying: str) -> List[Dict]:
     sym = _cont_symbol(underlying, source)
     segs = store.conn.execute(
-        """SELECT segment_id, min(CAST(ts AS DATE)), max(CAST(ts AS DATE)) FROM hist_bars
+        """SELECT segment_id, min(CAST(ts AS DATE)), max(CAST(ts AS DATE)), count(*) FROM hist_bars
            WHERE symbol = ? AND source = ? AND resolution = '1' AND segment_id IS NOT NULL
            GROUP BY 1 ORDER BY 1""",
         [sym, source],
     ).fetchall()
     rows = []
-    for sid, lo, hi in segs:
+    for sid, lo, hi, seg_bars in segs:
         expiry = contract_expiry_for(cal, lo, source)
         stats = _match_stats(store, instrument, sym, source, expiry, lo, hi) if expiry else {"checked": 0, "matched": 0,
                                                                                  "own_symbol": None}
+        coverage = stats["checked"] / seg_bars if seg_bars else 0.0
         if stats["checked"] == 0:
             conf = "INFERRED"
-        elif stats["matched"] >= 0.99 * stats["checked"]:
+        elif stats["matched"] < 0.99 * stats["checked"]:
+            conf = "CONFLICT"
+        elif coverage >= MIN_VERIFIED_COVERAGE and stats["checked"] >= MIN_VERIFIED_BARS:
             conf = "VERIFIED"
         else:
-            conf = "CONFLICT"
+            conf = "PARTIALLY_VERIFIED"
         rows.append({
             "instrument": instrument, "source": source, "segment_id": int(sid), "start_day": lo, "end_day": hi,
             "contract_expiry": expiry, "contract_symbol": stats["own_symbol"] if conf == "VERIFIED" else None,
             "confidence": conf, "checked_bars": stats["checked"], "matched_bars": stats["matched"],
+            "segment_bars": int(seg_bars), "coverage": round(coverage, 4),
         })
     return rows
 
 
 def write_segment_table(store: ResearchHistoryStore, rows: List[Dict]) -> None:
-    store._write("""CREATE TABLE IF NOT EXISTS cont_segments (
+    # Derived table: rebuilt from scratch each time (schema may evolve).
+    store._write("DROP TABLE IF EXISTS cont_segments")
+    store._write("""CREATE TABLE cont_segments (
         instrument VARCHAR, source VARCHAR, segment_id INTEGER, start_day DATE, end_day DATE,
         contract_expiry DATE, contract_symbol VARCHAR, confidence VARCHAR,
-        checked_bars INTEGER, matched_bars INTEGER, PRIMARY KEY (instrument, source, segment_id))""")
+        checked_bars INTEGER, matched_bars INTEGER, segment_bars INTEGER, coverage DOUBLE,
+        PRIMARY KEY (instrument, source, segment_id))""")
     if not rows:
         return
-    keys = {(r["instrument"], r["source"]) for r in rows}
-    for inst, src in keys:
-        store._write("DELETE FROM cont_segments WHERE instrument = ? AND source = ?", [inst, src])
     df = pd.DataFrame(rows)[["instrument", "source", "segment_id", "start_day", "end_day", "contract_expiry",
-                             "contract_symbol", "confidence", "checked_bars", "matched_bars"]]
+                             "contract_symbol", "confidence", "checked_bars", "matched_bars", "segment_bars",
+                             "coverage"]]
     store.conn.register("segrows", df)
     try:
         store._write("INSERT INTO cont_segments SELECT * FROM segrows")

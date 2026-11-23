@@ -67,17 +67,31 @@ def _git_commit() -> str:
 
 
 def dataset_fingerprint(store: ResearchHistoryStore) -> str:
-    """Content fingerprint of the research dataset plus the calendar config it was validated with.
+    """Deterministic content hash of the whole research dataset.
 
-    Any added/removed/changed bar (count, time range, price or OI totals per series) or any change
-    to the holiday/session config yields a different fingerprint.
+    Every bar's identity and contents (instrument, source, symbol, resolution, timestamp, OHLC,
+    volume, OI, contract expiry, segment id) in primary-key order, plus the contract-segment
+    identity table and the holiday/session configs. Changing any single value (e.g. one candle's
+    high) changes the fingerprint.
     """
-    rows = store.conn.execute(
-        """SELECT instrument, source, symbol, resolution, count(*), min(ts)::VARCHAR, max(ts)::VARCHAR,
-                  round(sum(close), 4), sum(coalesce(oi, 0)), sum(volume), sum(coalesce(segment_id, -1))
-           FROM hist_bars GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4"""
-    ).fetchall()
-    h = hashlib.sha256(repr(rows).encode())
+    h = hashlib.sha256()
+    cur = store.conn.execute(
+        """SELECT md5(concat_ws('|', instrument, source, symbol, resolution, epoch_us(ts)::VARCHAR,
+                                open::VARCHAR, high::VARCHAR, low::VARCHAR, close::VARCHAR, volume::VARCHAR,
+                                coalesce(oi::VARCHAR, '-'), coalesce(contract_expiry::VARCHAR, '-'),
+                                coalesce(segment_id::VARCHAR, '-')))
+           FROM hist_bars ORDER BY symbol, source, resolution, ts"""
+    )
+    while True:
+        chunk = cur.fetchmany(200_000)
+        if not chunk:
+            break
+        h.update("".join(r[0] for r in chunk).encode())
+    has_table = store.conn.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'cont_segments'").fetchall()[0][0]
+    if has_table:
+        seg_rows = store.conn.execute("SELECT * FROM cont_segments ORDER BY instrument, source, segment_id").fetchall()
+        h.update(repr(seg_rows).encode())
     from nifty_engine.core.config import settings
     for cfg in (settings.HOLIDAYS_CONFIG_PATH, settings.SESSIONS_CONFIG_PATH):
         p = Path(cfg)
@@ -230,11 +244,13 @@ def build_manifest(
     if has_table:
         for r in store.conn.execute(
             """SELECT instrument, source, segment_id, start_day, end_day, contract_expiry, contract_symbol,
-                      confidence, matched_bars, checked_bars FROM cont_segments ORDER BY 1, 2, 3"""
+                      confidence, matched_bars, checked_bars, segment_bars, coverage
+               FROM cont_segments ORDER BY 1, 2, 3"""
         ).fetchall():
             contract_ids.append({"instrument": r[0], "source": r[1], "segment_id": r[2], "start": str(r[3]),
                                  "end": str(r[4]), "contract_expiry": str(r[5]), "contract_symbol": r[6],
-                                 "confidence": r[7], "matched_bars": r[8], "checked_bars": r[9]})
+                                 "confidence": r[7], "matched_bars": r[8], "checked_bars": r[9],
+                                 "segment_bars": r[10], "coverage": r[11]})
 
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),

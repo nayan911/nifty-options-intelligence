@@ -87,7 +87,10 @@ class ResearchHistoryStore:
         resolution: str,
         candles: Sequence[Candle],
         contract_expiry: Optional[date] = None,
+        insert_only: bool = False,
     ) -> int:
+        """Store bars. insert_only=True never replaces an existing (symbol, source, resolution, ts) row
+        (used for stitched series, whose stored history must not be rewritten)."""
         rows = [
             (instrument, symbol, source, resolution, c.timestamp, float(c.open), float(c.high), float(c.low),
              float(c.close), int(c.volume or 0), c.oi, contract_expiry, None)
@@ -102,10 +105,30 @@ class ResearchHistoryStore:
         ])
         self.conn.register("incoming", df)
         try:
+            if insert_only:
+                before = self.conn.execute("SELECT count(*) FROM hist_bars").fetchall()[0][0]
+                self._write("INSERT OR IGNORE INTO hist_bars SELECT * FROM incoming")
+                return self.conn.execute("SELECT count(*) FROM hist_bars").fetchall()[0][0] - before
             self._write("INSERT OR REPLACE INTO hist_bars SELECT * FROM incoming")
         finally:
             self.conn.unregister("incoming")
         return len(rows)
+
+    def stored_bars_at(self, symbol: str, source: str, resolution: str, ts_list: Sequence[datetime]) -> Dict:
+        """{ts: (close, oi)} for stored bars at the given timestamps."""
+        if not ts_list:
+            return {}
+        df = pd.DataFrame({"ts": list(ts_list)})
+        self.conn.register("probe", df)
+        try:
+            rows = self.conn.execute(
+                """SELECT h.ts, h.close, h.oi FROM hist_bars h JOIN probe p ON p.ts = h.ts
+                   WHERE h.symbol = ? AND h.source = ? AND h.resolution = ?""",
+                [symbol, source, resolution],
+            ).fetchall()
+        finally:
+            self.conn.unregister("probe")
+        return {r[0]: (r[1], r[2]) for r in rows}
 
     def assign_cont_segments(
         self,
