@@ -287,10 +287,14 @@ class FyersRestClient:
             raise RuntimeError(f"FYERS Option Chain Error ({symbol}): {error_msg}")
 
         chain_data = response.get("data", {})
-        return self.parse_option_chain_payload(chain_data, underlying_symbol=symbol)
+        return self.parse_option_chain_payload(chain_data, underlying_symbol=symbol, requested_expiry_epoch=expiry_epoch)
 
     @staticmethod
-    def parse_option_chain_payload(chain_data: Dict[str, Any], underlying_symbol: str) -> OptionChainSnapshot:
+    def parse_option_chain_payload(
+        chain_data: Dict[str, Any],
+        underlying_symbol: str,
+        requested_expiry_epoch: Optional[int] = None,
+    ) -> OptionChainSnapshot:
         """Parses FYERS optionchain API response payload into normalized OptionChainSnapshot.
 
         Supports both:
@@ -306,9 +310,19 @@ class FyersRestClient:
         total_put_oi = 0
         detected_expiry: Optional[date] = None
 
+        # When a specific expiry was requested, FYERS returns that expiry's contracts but still
+        # lists ALL expiries in expiryData with the nearest first (verified live: a 01-Dec request
+        # returned NIFTY26D01... contracts with expiryData[0] = 23-Nov). Contracts carry no expiry
+        # field, so the requested expiry is the only reliable label.
+        if requested_expiry_epoch:
+            try:
+                detected_expiry = datetime.fromtimestamp(int(requested_expiry_epoch), tz=IST).date()
+            except (TypeError, ValueError, OSError):
+                detected_expiry = None
+
         # Check top-level expiryData (official FYERS v3 specification)
         expiry_data = chain_data.get("expiryData", [])
-        if expiry_data and isinstance(expiry_data, list):
+        if detected_expiry is None and expiry_data and isinstance(expiry_data, list):
             first_exp = expiry_data[0]
             if isinstance(first_exp, dict):
                 raw_exp_ts = first_exp.get("expiry") or first_exp.get("timestamp")

@@ -377,9 +377,16 @@ class PaperTradingEngine:
         if self.max_trades_per_day and entries_today >= self.max_trades_per_day:
             return f"daily trade limit reached ({entries_today}/{self.max_trades_per_day})"
 
+        # Realized losses today PLUS open mark-to-market losses: five open losers must block
+        # a sixth entry even though none of them has been closed yet.
         realized_today = sum(p.net_pnl for p in todays_closed)
-        if self.max_daily_net_loss and realized_today <= -abs(self.max_daily_net_loss):
-            return f"daily loss limit hit (net {realized_today:+.0f} <= -{abs(self.max_daily_net_loss):.0f})"
+        open_net = sum(p.net_pnl for p in self.active_positions.values() if p.status != PositionStatus.CLOSED)
+        session_net = realized_today + min(0.0, open_net)
+        if self.max_daily_net_loss and session_net <= -abs(self.max_daily_net_loss):
+            return (
+                f"daily loss limit hit (realized {realized_today:+.0f}, open {open_net:+.0f} "
+                f"<= -{abs(self.max_daily_net_loss):.0f})"
+            )
 
         if self.max_consecutive_losses and len(todays_closed) >= self.max_consecutive_losses:
             recent = sorted(todays_closed, key=lambda p: p.exit_time)[-self.max_consecutive_losses:]
@@ -642,13 +649,17 @@ class PaperTradingEngine:
                     reason = ExitReason.TRAILING_STOP if pos.is_breakeven_sl_active else ExitReason.STOP_LOSS
                     if bid_fresh and opt_price > 0:
                         # A stop triggered intrabar fills near the stop, not at the bid after the
-                        # bar recovered: never credit a better price than the stop level.
+                        # bar recovered: never credit a better price than the stop level. When the
+                        # stop caps the bid, the price at the actual stop event is unknown, so the
+                        # fill is modelled -> marked estimated and excluded from verified stats.
+                        capped = effective_sl < opt_price
                         ev = self._execute_full_exit(
                             pos,
                             min(opt_price, effective_sl),
                             reason,
                             current_time,
-                            notes=f"Intrabar SL low: {candle.low:.2f}",
+                            notes=f"Intrabar SL low: {candle.low:.2f}" + (" (modelled fill at stop level)" if capped else ""),
+                            is_estimated_fill=capped,
                         )
                         if ev:
                             events.append(ev)

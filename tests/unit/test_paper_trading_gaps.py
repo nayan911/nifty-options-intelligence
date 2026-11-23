@@ -198,3 +198,90 @@ def test_sigterm_routes_to_clean_shutdown():
         assert raised
     finally:
         signal.signal(signal.SIGTERM, prev)
+
+
+# ------------------------------------------------------------------ review round 2
+def test_requested_expiry_labels_snapshot_even_when_expirydata_lists_nearest_first():
+    """Verified live: a 01-Dec request returns 01-Dec contracts but expiryData[0] is 23-Nov."""
+    from nifty_engine.data.fyers.rest_client import FyersRestClient
+
+    near_epoch = int(IST.localize(datetime(2026, 11, 23, 14, 30)).timestamp())
+    next_epoch = int(IST.localize(datetime(2026, 12, 1, 14, 30)).timestamp())
+    payload = {
+        "callOi": 91_000_000, "putOi": 61_000_000,
+        "expiryData": [{"date": "23-11-2026", "expiry": near_epoch}, {"date": "01-12-2026", "expiry": next_epoch}],
+        "optionsChain": [
+            {"symbol": "NSE:NIFTY50-INDEX", "strike_price": -1, "ltp": 25380.0},
+            {"symbol": "NSE:NIFTY26D0125400CE", "strike_price": 25400, "option_type": "CE", "ltp": 240.0, "oi": 10},
+            {"symbol": "NSE:NIFTY26D0125400PE", "strike_price": 25400, "option_type": "PE", "ltp": 260.0, "oi": 12},
+        ],
+    }
+    assert FyersRestClient.parse_option_chain_payload(payload, "NSE:NIFTY50-INDEX").expiry == date(2026, 11, 23)
+    snap = FyersRestClient.parse_option_chain_payload(payload, "NSE:NIFTY50-INDEX", requested_expiry_epoch=next_epoch)
+    assert snap.expiry == date(2026, 12, 1)
+    assert [e[0] for e in snap.available_expiries] == [date(2026, 11, 23), date(2026, 12, 1)]
+
+
+def test_capped_intrabar_stop_is_estimated_but_real_bid_fill_is_verified():
+    for bid, expect_estimated in ((99.0, True), (88.0, False)):
+        eng = make_engine()
+        pos = make_position(bid=bid)
+        pos.last_bid_time = at(11, 2)
+        eng.active_positions["p1"] = pos
+        bar = Candle(symbol=pos.symbol, timeframe="1m", timestamp=at(11, 1), open=98, high=100, low=85,
+                     close=bid, volume=100, is_closed=True, observed_at=at(11, 2))
+        events = eng.on_candle(bar)
+        assert events and pos.is_estimated_exit is expect_estimated
+        assert events[0][2] == round(min(bid, 90.0) - eng.slippage_points, 2)  # sell slippage applies
+
+
+def test_open_mark_to_market_losses_count_toward_daily_loss_limit():
+    eng = make_engine(max_daily_net_loss=1000, max_consecutive_losses=0)
+    loser = make_position(opt="PE", entry=at(10, 0))
+    loser.net_pnl = -1100.0  # still open, not yet realized
+    eng.active_positions["open-loser"] = loser
+    assert eng.process_technical_candidate(make_candidate("CE", when=at(11, 0))) is None
+    loser.net_pnl = -200.0
+    assert eng.process_technical_candidate(make_candidate("CE", cid="c2", when=at(11, 0))) is not None
+
+
+def test_sigterm_during_startup_warmup_still_runs_clean_shutdown(tmp_path):
+    """Real subprocess: SIGTERM while 'warming up' must close DuckDB and print the stop line."""
+    import subprocess
+    import sys
+    import textwrap
+    import time as _t
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    child = tmp_path / "child.py"
+    child.write_text(textwrap.dedent(f"""
+        import sys, time
+        sys.path[:0] = [{str(root / 'src')!r}, {str(root / 'scripts')!r}]
+        from run_market_data import MarketDataEngine
+        from nifty_engine.data.storage.duckdb_store import DuckDBStore
+        eng = MarketDataEngine(store=DuckDBStore(db_path={str(tmp_path / 'm.duckdb')!r}))
+        real_close = eng.store.close
+        def close():
+            real_close(); print("DB_CLOSED", flush=True)
+        eng.store.close = close
+        def slow_warmup():
+            print("WARMING_UP", flush=True)
+            time.sleep(30)
+        eng._run = slow_warmup
+        eng.start()
+    """))
+    proc = subprocess.Popen([sys.executable, str(child)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        deadline = _t.monotonic() + 30
+        line = ""
+        while _t.monotonic() < deadline and "WARMING_UP" not in line:
+            line = proc.stdout.readline()
+        assert "WARMING_UP" in line
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 0, out
+    assert "DB_CLOSED" in out and "Pipeline stopped." in out, out

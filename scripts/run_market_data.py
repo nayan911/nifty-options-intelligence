@@ -849,8 +849,21 @@ class MarketDataEngine:
             pass  # not on the main thread (e.g. embedded in tests)
 
     def start(self):
-        """Starts streaming and monitoring pipeline."""
+        """Run the pipeline. The clean-shutdown guard covers the WHOLE lifecycle.
+
+        Previously only the main loop was inside try/finally, so SIGTERM/Ctrl-C during
+        token check, warmup or socket connect skipped _shutdown() and left DuckDB unclosed.
+        """
         self._install_shutdown_signals()
+        try:
+            self._run()
+        except KeyboardInterrupt:
+            print("\nShutting down cleanly...")
+        finally:
+            self._shutdown()
+
+    def _run(self):
+        """Startup (token, warmup, subscribe, connect) followed by the maintenance loop."""
         print("=" * 72)
         print("  NIFTY Options Trading Intelligence - Market Data Pipeline")
         print("=" * 72)
@@ -938,112 +951,107 @@ class MarketDataEngine:
             print(f"[ERROR] Connection failed: {e}")
             sys.exit(1)
 
-        try:
-            loop_ticks = 0
-            while self.running:
-                time.sleep(1)
-                loop_ticks += 1
+        loop_ticks = 0
+        while self.running:
+            time.sleep(1)
+            loop_ticks += 1
 
-                # 1. Clock-driven candle finalization & timeout expiry check every 1 second
-                current_ist = now_ist()
+            # 1. Clock-driven candle finalization & timeout expiry check every 1 second
+            current_ist = now_ist()
 
-                # Feed watchdog: during market hours, a silent or dropped stream triggers
-                # a non-blocking reconnect with backoff (e.g. after Wi-Fi drops and returns).
-                # Cash session only: the NIFTY index stops ticking at 15:30, so silence in the
-                # 15:30-15:40 window is expected and must not trigger reconnects or gap repair.
-                cash_live = self.calendar.get_session_state(is_derivative=True) in (
-                    SessionState.REGULAR_CASH, SessionState.SPECIAL_SESSION
+            # Feed watchdog: during market hours, a silent or dropped stream triggers
+            # a non-blocking reconnect with backoff (e.g. after Wi-Fi drops and returns).
+            # Cash session only: the NIFTY index stops ticking at 15:30, so silence in the
+            # 15:30-15:40 window is expected and must not trigger reconnects or gap repair.
+            cash_live = self.calendar.get_session_state(is_derivative=True) in (
+                SessionState.REGULAR_CASH, SessionState.SPECIAL_SESSION
+            )
+            if cash_live:
+                action = self.ws_client.ensure_alive(stale_after=settings.FEED_GAP_SECONDS)
+                if action:
+                    print(f"[WS WATCHDOG] {action}")
+
+            gap_msg = self.gap_backfiller.observe(current_ist, self._signal_tick_times(), cash_live)
+            if gap_msg:
+                print(f"[FEED GAP] {gap_msg}")
+
+            with self._event_lock:
+                self.builder.flush_closed_bars(current_ist)
+                self.technical_engine.expire_pending_evaluations(current_ist)
+                self.paper_engine.check_time_events(current_ist)
+
+            # Periodic 10-second maintenance operations
+            if loop_ticks % 10 != 0:
+                continue
+
+            # 2. Flush DuckDB buffer periodically
+            self.store.flush_ticks()
+
+            # 3. Dynamic option rotation if ATM shifted
+            with self._event_lock:
+                self.check_and_rotate_options()
+
+            # 4. Session evaluation & status reporting
+            curr_state = self.calendar.get_session_state(is_derivative=True)
+            is_open = curr_state in (SessionState.REGULAR_CASH, SessionState.DERIVATIVES_EXT, SessionState.SPECIAL_SESSION)
+
+            # 5. Scheduled Option Chain Snapshot
+            self._poll_option_chain_if_due(is_open)
+
+            ws_status = "CONNECTED" if self.ws_client.is_connected else "DISCONNECTED"
+            quote_count = len(self.ws_client.quote_observed_symbols)
+            sub_count = len(watchlist)
+
+            # Differentiate Feed Age from Exchange Network Latency
+            now = now_ist()
+            feed_age = (now - self.last_primary_tick_time).total_seconds() if self.last_primary_tick_time else None
+            net_latency = self.last_primary_network_latency
+
+            feed_age_str = f"{feed_age:.2f}s" if feed_age is not None else "N/A"
+            fut_ts = self.last_signal_tick_times.get(self.technical_engine.primary_futures)
+            feed_age_str += f" | FUT Feed Age: {(now - fut_ts).total_seconds():.2f}s" if fut_ts else " | FUT Feed Age: N/A"
+            net_lat_str = f"{net_latency:.3f}s" if net_latency is not None else "N/A"
+
+            pcr_str = f" | PCR(expiry): {self.latest_option_chain_pcr:.3f}" if self.latest_option_chain_pcr is not None else ""
+            api = self.rate_limiter.get_status()
+            pcr_str += f" | API: {api['daily_requests_used']}/{self.rate_limiter.max_daily_requests}"
+            if api["rate_limit_hits_today"]:
+                pcr_str += f" (429s: {api['rate_limit_hits_today']})"
+
+            # Paper Trading active telemetry
+            with self._event_lock:
+                open_pos = list(self.paper_engine.get_open_positions())
+                summary = self.paper_engine.get_account_summary()
+            if open_pos:
+                for p in open_pos:
+                    print(
+                        f"  [ACTIVE PAPER POSITION: {p.symbol}] Entry: ₹{p.entry_price:.2f} | LTP: ₹{p.current_ltp:.2f} | "
+                        f"Target: ₹{p.target_premium_t1:.2f} | SL: ₹{p.stop_loss_premium:.2f} | M2M Gross: ₹{p.gross_pnl:+.2f} | Net: ₹{p.net_pnl:+.2f}"
+                    )
+            if summary["total_trades"] > 0:
+                print(
+                    f"  [PAPER JOURNAL] Closed: {summary['total_trades']} (Win: {summary['win_rate_pct']}%) | "
+                    f"Realized Gross: ₹{summary['total_realized_gross_pnl']:+.2f} | Realized Net: ₹{summary['total_realized_net_pnl']:+.2f} | "
+                    f"Statutory Costs: ₹{summary['total_costs_paid']:.2f}"
                 )
-                if cash_live:
-                    action = self.ws_client.ensure_alive(stale_after=settings.FEED_GAP_SECONDS)
-                    if action:
-                        print(f"[WS WATCHDOG] {action}")
 
-                gap_msg = self.gap_backfiller.observe(current_ist, self._signal_tick_times(), cash_live)
-                if gap_msg:
-                    print(f"[FEED GAP] {gap_msg}")
+            # 6. Continuous Operational Readiness Evaluation
+            with self._event_lock:
+                readiness = self.evaluate_and_update_readiness()
 
-                with self._event_lock:
-                    self.builder.flush_closed_bars(current_ist)
-                    self.technical_engine.expire_pending_evaluations(current_ist)
-                    self.paper_engine.check_time_events(current_ist)
-
-                # Periodic 10-second maintenance operations
-                if loop_ticks % 10 != 0:
-                    continue
-
-                # 2. Flush DuckDB buffer periodically
-                self.store.flush_ticks()
-
-                # 3. Dynamic option rotation if ATM shifted
-                with self._event_lock:
-                    self.check_and_rotate_options()
-
-                # 4. Session evaluation & status reporting
-                curr_state = self.calendar.get_session_state(is_derivative=True)
-                is_open = curr_state in (SessionState.REGULAR_CASH, SessionState.DERIVATIVES_EXT, SessionState.SPECIAL_SESSION)
-
-                # 5. Scheduled Option Chain Snapshot
-                self._poll_option_chain_if_due(is_open)
-
-                ws_status = "CONNECTED" if self.ws_client.is_connected else "DISCONNECTED"
-                quote_count = len(self.ws_client.quote_observed_symbols)
-                sub_count = len(watchlist)
-
-                # Differentiate Feed Age from Exchange Network Latency
-                now = now_ist()
-                feed_age = (now - self.last_primary_tick_time).total_seconds() if self.last_primary_tick_time else None
-                net_latency = self.last_primary_network_latency
-
-                feed_age_str = f"{feed_age:.2f}s" if feed_age is not None else "N/A"
-                fut_ts = self.last_signal_tick_times.get(self.technical_engine.primary_futures)
-                feed_age_str += f" | FUT Feed Age: {(now - fut_ts).total_seconds():.2f}s" if fut_ts else " | FUT Feed Age: N/A"
-                net_lat_str = f"{net_latency:.3f}s" if net_latency is not None else "N/A"
-
-                pcr_str = f" | PCR(expiry): {self.latest_option_chain_pcr:.3f}" if self.latest_option_chain_pcr is not None else ""
-                api = self.rate_limiter.get_status()
-                pcr_str += f" | API: {api['daily_requests_used']}/{self.rate_limiter.max_daily_requests}"
-                if api["rate_limit_hits_today"]:
-                    pcr_str += f" (429s: {api['rate_limit_hits_today']})"
-
-                # Paper Trading active telemetry
-                with self._event_lock:
-                    open_pos = list(self.paper_engine.get_open_positions())
-                    summary = self.paper_engine.get_account_summary()
-                if open_pos:
-                    for p in open_pos:
-                        print(
-                            f"  [ACTIVE PAPER POSITION: {p.symbol}] Entry: ₹{p.entry_price:.2f} | LTP: ₹{p.current_ltp:.2f} | "
-                            f"Target: ₹{p.target_premium_t1:.2f} | SL: ₹{p.stop_loss_premium:.2f} | M2M Gross: ₹{p.gross_pnl:+.2f} | Net: ₹{p.net_pnl:+.2f}"
-                        )
-                if summary["total_trades"] > 0:
-                    print(
-                        f"  [PAPER JOURNAL] Closed: {summary['total_trades']} (Win: {summary['win_rate_pct']}%) | "
-                        f"Realized Gross: ₹{summary['total_realized_gross_pnl']:+.2f} | Realized Net: ₹{summary['total_realized_net_pnl']:+.2f} | "
-                        f"Statutory Costs: ₹{summary['total_costs_paid']:.2f}"
-                    )
-
-                # 6. Continuous Operational Readiness Evaluation
-                with self._event_lock:
-                    readiness = self.evaluate_and_update_readiness()
-
-                if not is_open:
-                    print(
-                        f"[HOLIDAY / OFFLINE STATUS] Session: {curr_state.value.upper()} | Entries: DISABLED (market closed) | "
-                        f"WS: {ws_status} | Subscribed: {sub_count} | Broker Acks: {self.ws_client.subscription_acks} | "
-                        f"Quotes Seen: {quote_count}/{sub_count} | Snapshots: {self.snapshots_accepted} | "
-                        f"Duplicates: {self.duplicates_dropped} | Trading Signals: DISABLED{pcr_str}"
-                    )
-                else:
-                    print(
-                        f"[LIVE STATUS] Session: {curr_state.value.upper()} | Readiness: {readiness.value} | "
-                        f"WS: {ws_status} | Live Ticks: {self.live_ticks_accepted} | Candles: {self.candle_count} | "
-                        f"NIFTY Feed Age: {feed_age_str} | Network Latency: {net_lat_str} | Quotes Seen: {quote_count}/{sub_count}{pcr_str}"
-                    )
-        except KeyboardInterrupt:
-            print("\nShutting down cleanly...")
-        finally:
-            self._shutdown()
+            if not is_open:
+                print(
+                    f"[HOLIDAY / OFFLINE STATUS] Session: {curr_state.value.upper()} | Entries: DISABLED (market closed) | "
+                    f"WS: {ws_status} | Subscribed: {sub_count} | Broker Acks: {self.ws_client.subscription_acks} | "
+                    f"Quotes Seen: {quote_count}/{sub_count} | Snapshots: {self.snapshots_accepted} | "
+                    f"Duplicates: {self.duplicates_dropped} | Trading Signals: DISABLED{pcr_str}"
+                )
+            else:
+                print(
+                    f"[LIVE STATUS] Session: {curr_state.value.upper()} | Readiness: {readiness.value} | "
+                    f"WS: {ws_status} | Live Ticks: {self.live_ticks_accepted} | Candles: {self.candle_count} | "
+                    f"NIFTY Feed Age: {feed_age_str} | Network Latency: {net_lat_str} | Quotes Seen: {quote_count}/{sub_count}{pcr_str}"
+                )
 
     def _shutdown(self) -> None:
         """Persist state FIRST, then drop the socket. A second Ctrl-C must not skip the DB close.
@@ -1051,6 +1059,9 @@ class MarketDataEngine:
         Previously the websocket close (bounded 5s wait) ran before store.close(); pressing
         Ctrl-C again during that wait aborted cleanup and left DuckDB unclosed.
         """
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
         self._shutting_down = True  # tick/candle callbacks from the socket thread become no-ops
         self.running = False
         steps = [
