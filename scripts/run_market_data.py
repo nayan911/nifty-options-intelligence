@@ -115,6 +115,9 @@ class MarketDataEngine:
         self.option_chain_failure_count: int = 0
         self.option_chain_last_error: Optional[str] = None
 
+        # Readiness override de-duplication (log on change, not every evaluation)
+        self._last_readiness_override: Optional[str] = None
+
     def _get_live_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Provides on-demand authentic broker quote snapshot for paper engine."""
         try:
@@ -259,16 +262,31 @@ class MarketDataEngine:
             except Exception as e:
                 logger.warning("Paper engine candle processing error for %s: %s", candle.symbol, e)
 
-        # Real-time quantitative technical analysis
-        try:
-            snapshot = self.technical_engine.on_candle(candle)
-            if snapshot and candle.symbol in (settings.PRIMARY_INDEX, self.technical_engine.primary_futures):
-                self._log_technical_status(snapshot)
-        except Exception as e:
-            print(f"[WARN] Technical analysis error for {candle.symbol}: {e}")
+        # Real-time technical analysis runs ONLY on the NIFTY spot index and NIFTY futures.
+        # Direction is decided from the underlying; option premiums carry theta/IV noise
+        # and must never generate their own breakout signals. Options are chosen later by
+        # the contract selector based on the underlying's signal.
+        if candle.symbol in self._signal_symbols():
+            try:
+                snapshot = self.technical_engine.on_candle(candle)
+                if snapshot:
+                    self._log_technical_status(snapshot)
+            except Exception as e:
+                print(f"[WARN] Technical analysis error for {candle.symbol}: {e}")
 
         # Continuous two-way operational readiness assessment
         self.evaluate_and_update_readiness()
+
+    def _signal_symbols(self) -> Set[str]:
+        """Instruments allowed to drive direction/setup detection (NIFTY spot + futures only)."""
+        return {settings.PRIMARY_INDEX, self.technical_engine.primary_futures}
+
+    def _log_readiness_override(self, reason: str) -> None:
+        """Log a readiness override once per distinct reason instead of on every evaluation."""
+        if reason != self._last_readiness_override:
+            logger.warning("Readiness override: %s", reason)
+            print(f"[READINESS] {reason}")
+            self._last_readiness_override = reason
 
     def evaluate_and_update_readiness(self) -> SystemReadiness:
         """Continuously re-evaluates operational readiness across data feed, indicators, and market state,
@@ -293,19 +311,25 @@ class MarketDataEngine:
         effective_readiness = assessed_readiness
 
         # 2. Live feed health & connection gating during active market hours
+        override_reason: Optional[str] = None
         if is_live:
             if not getattr(self.ws_client, "is_connected", False):
                 effective_readiness = SystemReadiness.NOT_READY
-                logger.warning("Readiness override: WebSocket disconnected during live market -> NOT_READY")
+                override_reason = "WebSocket disconnected during live market -> NOT_READY"
             elif self.last_primary_tick_time is not None:
                 feed_age = (now_ist() - self.last_primary_tick_time).total_seconds()
                 if feed_age > 120.0:
                     effective_readiness = SystemReadiness.NOT_READY
-                    logger.warning("Readiness override: Primary feed age %.1fs > 120s -> NOT_READY", feed_age)
+                    override_reason = "Primary feed stale > 120s -> NOT_READY"
                 elif feed_age > 60.0:
                     if effective_readiness == SystemReadiness.READY:
                         effective_readiness = SystemReadiness.DEGRADED
-                        logger.warning("Readiness override: Primary feed age %.1fs > 60s -> DEGRADED", feed_age)
+                        override_reason = "Primary feed stale > 60s -> DEGRADED"
+        if override_reason:
+            self._log_readiness_override(override_reason)
+        elif self._last_readiness_override is not None:
+            print("[READINESS] Feed override cleared")
+            self._last_readiness_override = None
 
         # 3. Two-way state transitions (Upgrade or Downgrade)
         if effective_readiness != prev_readiness:
@@ -726,6 +750,17 @@ class MarketDataEngine:
 
                 # 1. Clock-driven candle finalization & timeout expiry check every 1 second
                 current_ist = now_ist()
+
+                # Feed watchdog: during market hours, a silent or dropped stream triggers
+                # a non-blocking reconnect with backoff (e.g. after Wi-Fi drops and returns).
+                live_now = self.calendar.get_session_state(is_derivative=True) in (
+                    SessionState.REGULAR_CASH, SessionState.DERIVATIVES_EXT, SessionState.SPECIAL_SESSION
+                )
+                if live_now:
+                    action = self.ws_client.ensure_alive(stale_after=15.0)
+                    if action:
+                        print(f"[WS WATCHDOG] {action}")
+
                 self.builder.flush_closed_bars(current_ist)
                 self.technical_engine.expire_pending_evaluations(current_ist)
                 self.paper_engine.check_time_events(current_ist)

@@ -442,3 +442,37 @@ def test_runner_continuous_checks_preserve_failed_reconciliation_not_ready(monke
 
 
 
+
+
+def test_only_nifty_spot_and_futures_drive_technical_signals():
+    """Option, stock, and other-index candles must never reach the technical/setup engine.
+
+    Direction is derived from NIFTY spot/futures only; option premiums are not charted for signals.
+    """
+    store = DuckDBStore(db_path=":memory:")
+    engine = MarketDataEngine(store=store)
+
+    seen = []
+    original = engine.technical_engine.on_candle
+    engine.technical_engine.on_candle = lambda c, **kw: (seen.append(c.symbol), original(c, **kw))[1]
+
+    ts = IST.localize(datetime(2026, 11, 23, 13, 40, 0))
+    symbols = [
+        "NSE:NIFTY26NOV25450CE",
+        "NSE:NIFTY26NOV25400PE",
+        "NSE:NIFTYBANK-INDEX",
+        "NSE:HDFCBANK-EQ",
+        "NSE:NIFTY50-INDEX",
+        engine.technical_engine.primary_futures,
+    ]
+    for sym in symbols:
+        engine._on_candle_closed(
+            Candle(
+                symbol=sym, timeframe="1m", timestamp=ts,
+                open=100.0, high=101.0, low=99.0, close=100.5, volume=10, is_closed=True,
+            )
+        )
+
+    assert set(seen) == {"NSE:NIFTY50-INDEX", engine.technical_engine.primary_futures}
+    # All candles are still persisted/counted regardless of signal eligibility
+    assert engine.candle_count == len(symbols)
