@@ -9,6 +9,19 @@ from nifty_engine.core.interfaces import OptionType
 from nifty_engine.data.fyers.instrument_master import NSE_FO_COLUMNS, FyersInstrumentMaster
 
 
+@pytest.fixture(autouse=True)
+def _frozen_ist_clock(monkeypatch):
+    """Fixture contracts expire 2026-11-26; pin 'now' so these tests don't start failing
+    once the real calendar passes that date (expiry filtering is clock-dependent)."""
+    from datetime import datetime as _dt
+
+    import pytz as _pytz
+
+    import nifty_engine.data.fyers.instrument_master as _im
+
+    monkeypatch.setattr(_im, "now_ist", lambda: _pytz.timezone("Asia/Kolkata").localize(_dt(2026, 11, 20, 10, 0)))
+
+
 @pytest.fixture
 def mock_instrument_master():
     master = FyersInstrumentMaster()

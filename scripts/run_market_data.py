@@ -150,6 +150,7 @@ class MarketDataEngine:
         )
         self.option_chain_rate_limited_until: Optional[datetime] = None
         self.chain_expiries: List[tuple] = []  # [(date, fyers_epoch)] from the last chain response
+        self.banknifty_futures: Optional[str] = None
         self._chain_expiry_note: Optional[str] = None
 
     def _get_live_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -588,6 +589,28 @@ class MarketDataEngine:
 
         raise RuntimeError("Could not resolve valid reference NIFTY spot price. Check network/instrument master.")
 
+    def _resolve_futures(self) -> bool:
+        """Point the engines at the current (unexpired, IST-aware) NIFTY/BANKNIFTY futures.
+
+        Returns False if the NIFTY futures contract cannot be resolved.
+        """
+        try:
+            nifty_fut = self.master.resolve_future("NIFTY")
+        except Exception as e:
+            print(f"[WARN] NIFTY futures resolution: {e}")
+            return False
+        if nifty_fut != self.technical_engine.primary_futures:
+            print(f"[OK] Active NIFTY futures: {nifty_fut} (was {self.technical_engine.primary_futures})")
+        self.technical_engine.set_futures_ticker(nifty_fut)
+        self.technical_engine.set_index_futures_mapping(settings.PRIMARY_INDEX, nifty_fut)
+        try:
+            self.banknifty_futures = self.master.resolve_future("BANKNIFTY")
+            self.technical_engine.set_index_futures_mapping(settings.BANKNIFTY_INDEX, self.banknifty_futures)
+        except Exception as e:
+            self.banknifty_futures = None
+            print(f"[WARN] BANKNIFTY futures resolution: {e}")
+        return True
+
     def _build_watchlist(self) -> List[str]:
         """Constructs 21-25 symbol watchlist within 100-symbol quota."""
         watchlist = [
@@ -602,16 +625,11 @@ class MarketDataEngine:
             "NSE:BHARTIARTL-EQ",
         ]
 
-        # Futures
-        try:
-            nifty_fut = self.master.resolve_future("NIFTY")
-            bnf_fut = self.master.resolve_future("BANKNIFTY")
-            watchlist.extend([nifty_fut, bnf_fut])
-            self.technical_engine.set_futures_ticker(nifty_fut)
-            self.technical_engine.set_index_futures_mapping(settings.PRIMARY_INDEX, nifty_fut)
-            self.technical_engine.set_index_futures_mapping(settings.BANKNIFTY_INDEX, bnf_fut)
-        except Exception as e:
-            print(f"[WARN] Futures resolution: {e}")
+        # Futures (resolved before warmup; re-resolved here so the watchlist always matches)
+        if self._resolve_futures():
+            watchlist.append(self.technical_engine.primary_futures)
+            if self.banknifty_futures:
+                watchlist.append(self.banknifty_futures)
 
         # Dynamic Options: nearest expiry + next weekly expiry
         spot = self.current_spot_price or self._get_initial_spot()
@@ -746,6 +764,20 @@ class MarketDataEngine:
                         expiry_epoch=expiry_epoch,
                     )
                 )
+                # The expiry list is only known after the first response. If that default
+                # (nearest) expiry is expired or inside the switch window, fetch the right one
+                # now instead of analysing a dead chain until the next poll (1 extra call, once).
+                if expiry_epoch is None and chain.available_expiries:
+                    self.chain_expiries = list(chain.available_expiries)
+                    better = self._select_chain_expiry(now)
+                    if better is not None:
+                        chain = loop.run_until_complete(
+                            self.rest_client.get_option_chain(
+                                symbol=settings.PRIMARY_INDEX,
+                                strikecount=settings.OPTION_CHAIN_STRIKECOUNT,
+                                expiry_epoch=better,
+                            )
+                        )
             finally:
                 loop.close()
 
@@ -885,10 +917,19 @@ class MarketDataEngine:
             print(f"[OK] Purged {purged} synthetic post-15:30 index/equity bars from history")
 
         try:
-            self.master.load_master(auto_download=False)
+            # Refreshes the cached NSE_FO.csv when it predates today (falls back to cache on failure)
+            self.master.load_master(auto_download=True)
             print("[OK] Instrument Master loaded (NSE_FO.csv).")
         except Exception as e:
             print(f"[WARN] Master load: {e}")
+
+        # Resolve the live futures contracts BEFORE warmup. Warmup previously ran on the
+        # hard-coded constructor default (NIFTY26NOVFUT); after the monthly rollover the engine
+        # then switched to a futures contract with no history -> cold indicators, NOT_READY.
+        if not self._resolve_futures():
+            print("[ERROR] Could not resolve the active NIFTY futures contract from the instrument master. "
+                  "Futures confirmation is required for signals; refusing to start.")
+            return
 
         # Pre-Market Historical Backfill & Technical Warmup
         print("\n[PRE-MARKET WARMUP] Initializing Historical Candle Manager...")

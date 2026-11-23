@@ -6,7 +6,7 @@ without relying on synthetic string concatenation.
 
 import ssl
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import List, Optional
 
@@ -16,6 +16,21 @@ import pytz
 
 from nifty_engine.core.config import settings
 from nifty_engine.core.interfaces import IInstrumentMaster, OptionContract, OptionType
+from nifty_engine.utils.timezone import now_ist
+
+# Contracts expiring today stop trading at the 15:30 close; after that they are dead and
+# must not be subscribed, analysed or used as the primary futures contract.
+EXPIRY_CUTOFF = time(15, 30)
+
+
+def min_active_expiry(now: Optional[datetime] = None) -> date:
+    """Earliest expiry date still tradable, in IST: today before 15:30, else tomorrow.
+
+    Uses IST explicitly; `date.today()` follows the host clock and is wrong on non-IST hosts.
+    """
+    now = now or now_ist()
+    today = now.date()
+    return today + timedelta(days=1) if now.time() >= EXPIRY_CUTOFF else today
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -66,7 +81,7 @@ class FyersInstrumentMaster(IInstrumentMaster):
         """
         if self.fo_cache_file.exists() and not force:
             file_mtime = datetime.fromtimestamp(self.fo_cache_file.stat().st_mtime, tz=IST).date()
-            if file_mtime >= date.today():
+            if file_mtime >= now_ist().date():
                 return self.fo_cache_file
 
         url = "https://public.fyers.in/sym_details/NSE_FO.csv"
@@ -99,7 +114,10 @@ class FyersInstrumentMaster(IInstrumentMaster):
 
     def load_master(self, fo_csv_path: Optional[str] = None, auto_download: bool = False) -> None:
         """Load instrument master into memory from a local CSV file."""
-        if auto_download and not fo_csv_path and not self.fo_cache_file.exists():
+        # Refresh when missing OR older than today: NSE lists new strikes as the market moves,
+        # so a cached master goes stale within days. download_master() returns the cached file
+        # when it is already from today, and falls back to it if the download fails.
+        if auto_download and not fo_csv_path:
             self.download_master()
 
         path_to_load = Path(fo_csv_path) if fo_csv_path else self.fo_cache_file
@@ -192,11 +210,10 @@ class FyersInstrumentMaster(IInstrumentMaster):
         if self._df is None:
             raise RuntimeError("Instrument master not loaded. Call load_master() first.")
 
-        today = date.today()
         futs = self._df[
             (self._df["short_sym"] == underlying) &
             (self._df["opt"] == "XX") &
-            (self._df["expiry_date"] >= today)
+            (self._df["expiry_date"] >= min_active_expiry())
         ].sort_values("expiry_date")
 
         if futs.empty:
@@ -227,11 +244,9 @@ class FyersInstrumentMaster(IInstrumentMaster):
             raise RuntimeError("Instrument master not loaded. Call load_master() first.")
 
         source_df = self._nifty_options_cache if underlying == "NIFTY" else self._df
-        today = date.today()
-
         future_expiries = source_df[
             (source_df["short_sym"] == underlying) &
-            (source_df["expiry_date"] >= today)
+            (source_df["expiry_date"] >= min_active_expiry())
         ]["expiry_date"].unique()
 
         return sorted(list(future_expiries))
