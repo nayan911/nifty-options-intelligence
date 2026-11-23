@@ -141,6 +141,12 @@ class OIProfile:
     observation_interval_seconds: float = 0.0
     is_stale: bool = False
     is_synchronized_snapshot: bool = False
+    # Near-ATM flow summary (changes are vs the previous snapshot of the same expiry)
+    atm_strike: Optional[float] = None
+    atm_iv: Optional[float] = None  # avg of ATM CE/PE IV as reported by broker (percent)
+    atm_iv_change: Optional[float] = None  # IV points vs previous snapshot
+    near_atm_call_oi_change: int = 0  # >0: call writing near ATM (resistance building)
+    near_atm_put_oi_change: int = 0  # >0: put writing near ATM (support building)
 
 
 class OpenInterestAnalyzer:
@@ -662,6 +668,26 @@ class OpenInterestAnalyzer:
         # Optional Max Pain calculation
         max_pain = self._calculate_max_pain(snapshot)
 
+        # ATM IV and near-ATM OI flow summary
+        atm_strike: Optional[float] = None
+        atm_iv: Optional[float] = None
+        atm_iv_change: Optional[float] = None
+        if sorted_strikes:
+            atm_strike = min(sorted_strikes, key=lambda k: abs(k - snapshot.spot_price))
+            atm = strikes_analysis[atm_strike]
+            ivs = [v for v in (atm.call_iv, atm.put_iv) if v is not None and v > 0]
+            atm_iv = round(sum(ivs) / len(ivs), 2) if ivs else None
+            prev_profile = self._profile_history[key][-1] if (self._profile_history[key] and not is_new_session) else None
+            # Compare IV at the SAME strike as the previous ATM: when spot crosses a strike the
+            # ATM label moves, and the IV smile (steep near expiry) would masquerade as an IV move.
+            if prev_profile is not None and prev_profile.atm_iv is not None and prev_profile.atm_strike in strikes_analysis:
+                ref = strikes_analysis[prev_profile.atm_strike]
+                ref_ivs = [v for v in (ref.call_iv, ref.put_iv) if v is not None and v > 0]
+                if ref_ivs:
+                    atm_iv_change = round(sum(ref_ivs) / len(ref_ivs) - prev_profile.atm_iv, 2)
+        near_call_chg = sum(s.call_oi_change for s in near_atm)
+        near_put_chg = sum(s.put_oi_change for s in near_atm)
+
         profile = OIProfile(
             underlying=underlying,
             timestamp=snapshot.api_timestamp,
@@ -678,6 +704,11 @@ class OpenInterestAnalyzer:
             observation_interval_seconds=interval_seconds,
             is_stale=is_stale,
             is_synchronized_snapshot=is_synced,
+            atm_strike=atm_strike,
+            atm_iv=atm_iv,
+            atm_iv_change=atm_iv_change,
+            near_atm_call_oi_change=near_call_chg,
+            near_atm_put_oi_change=near_put_chg,
         )
         self._profile_history[key].append(profile)
         self.latest_profiles[key] = profile

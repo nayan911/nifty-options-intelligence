@@ -462,12 +462,24 @@ def test_get_historical_candles_candle_completeness():
     assert candles_async[1].is_closed is False
 
 
-def test_get_historical_candles_sync_exponential_retry(monkeypatch):
-    """Verify get_historical_candles_sync uses true exponential backoff on burst and minute rate limits."""
+def test_get_historical_candles_sync_rate_limit_backoff(monkeypatch):
+    """Broker limit responses: per-second waits ~1.1s; per-minute waits out the full 61s window,
+    and a repeated per-minute violation aborts instead of risking FYERS' >3/day account block."""
+    import pytest
+
+    from nifty_engine.data.fyers.rest_client import FyersRateLimitError
+
     mock_auth = MagicMock()
     mock_client = MagicMock()
     mock_auth.get_client.return_value = mock_client
     mock_limiter = MagicMock()
+    hits = {"n": 0}
+
+    def _hit():
+        hits["n"] += 1
+        return hits["n"]
+
+    mock_limiter.record_rate_limit_hit.side_effect = _hit
 
     rest_client = FyersRestClient(auth_provider=mock_auth, rate_limiter=mock_limiter)
 
@@ -481,28 +493,38 @@ def test_get_historical_candles_sync_exponential_retry(monkeypatch):
         "candles": [[ts, 25000.0, 25050.0, 24980.0, 25020.0, 5000]],
     }
 
-    # 1. Burst rate throttling (sub-second): 1.0 * (2 ** attempt) -> 1.0s, 2.0s
+    # 1. Per-second throttling: short fixed wait, retried
     mock_client.history.side_effect = [
-        {"s": "error", "message": "Reached limit of 5 requests/second"},
+        {"s": "error", "code": -429, "message": "Reached limit of 5 requests/second"},
         {"s": "error", "message": "Too many requests / second limit"},
         success_resp,
     ]
-
     candles = rest_client.get_historical_candles_sync("NSE:NIFTY50-INDEX", resolution="5")
     assert len(candles) == 1
-    assert sleep_calls == [1.0, 2.0]
+    assert sleep_calls == [1.1, 1.1]
 
-    # 2. Minute rate throttling: 8.0 * (2 ** attempt) -> 8.0s, 16.0s
+    # 2. First per-minute violation of the day: wait out the full rolling minute, then retry
     sleep_calls.clear()
+    hits["n"] = 0
     mock_client.history.side_effect = [
-        {"s": "error", "message": "Standard plan limit of 50 requests/minute"},
-        {"s": "error", "message": "requests/minute limit exceeded"},
+        {"s": "error", "code": -429, "message": "Standard plan limit of 50 requests/minute"},
         success_resp,
     ]
-
     candles_min = rest_client.get_historical_candles_sync("NSE:NIFTY50-INDEX", resolution="5")
     assert len(candles_min) == 1
-    assert sleep_calls == [8.0, 16.0]
+    assert sleep_calls == [61.0]
 
+    # 3. Second per-minute violation today: refuse to retry
+    sleep_calls.clear()
+    mock_client.history.side_effect = [
+        {"s": "error", "code": -429, "message": "requests/minute limit exceeded"},
+        success_resp,
+    ]
+    with pytest.raises(FyersRateLimitError):
+        rest_client.get_historical_candles_sync("NSE:NIFTY50-INDEX", resolution="5")
+    assert sleep_calls == []
 
-
+    # 4. Non-limit errors are not mistaken for rate limits
+    mock_client.history.side_effect = [{"s": "error", "message": "Invalid symbol"}]
+    with pytest.raises(RuntimeError, match="Invalid symbol"):
+        rest_client.get_historical_candles_sync("NSE:BAD", resolution="5")

@@ -476,3 +476,31 @@ def test_only_nifty_spot_and_futures_drive_technical_signals():
     assert set(seen) == {"NSE:NIFTY50-INDEX", engine.technical_engine.primary_futures}
     # All candles are still persisted/counted regardless of signal eligibility
     assert engine.candle_count == len(symbols)
+
+
+def test_open_feed_gap_holds_signal_candles_and_forces_not_ready(monkeypatch):
+    """While a feed gap is unrepaired, NIFTY candles must not reach indicators and entries stay disabled."""
+    store = DuckDBStore(db_path=":memory:")
+    engine = MarketDataEngine(store=store)
+
+    seen = []
+    engine.technical_engine.on_candle = lambda c, **kw: seen.append(c.symbol)
+
+    ts = IST.localize(datetime(2026, 11, 23, 13, 45, 0))
+    engine.gap_backfiller.gap_started_at = ts - timedelta(minutes=5)
+
+    engine._on_candle_closed(
+        Candle(symbol="NSE:NIFTY50-INDEX", timeframe="1m", timestamp=ts,
+               open=1.0, high=1.0, low=1.0, close=1.0, volume=0, is_closed=True)
+    )
+    assert seen == []
+    assert len(engine.gap_backfiller.held) == 1
+    assert engine.candle_count == 1  # still persisted
+
+    monkeypatch.setattr(engine.calendar, "get_session_state", lambda is_derivative=True: SessionState.REGULAR_CASH)
+    monkeypatch.setattr(
+        engine.historical_manager, "assess_readiness",
+        lambda *a, **k: (SystemReadiness.READY, {}),
+    )
+    engine.ws_client._is_connected = True
+    assert engine.evaluate_and_update_readiness() == SystemReadiness.NOT_READY

@@ -9,7 +9,7 @@ import asyncio
 import logging
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 
 import pytz
@@ -27,12 +27,14 @@ from nifty_engine.analysis.technical.multi_timeframe import TechnicalCandidate
 from nifty_engine.core.calendar import ExchangeCalendar
 from nifty_engine.core.config import settings
 from nifty_engine.core.interfaces import Candle, OptionType, SessionState, SystemReadiness, Tick
+from nifty_engine.core.rate_limiter import AsyncTokenBucketRateLimiter
 from nifty_engine.data.candle_builder import RealtimeCandleBuilder
 from nifty_engine.data.freshness_monitor import DataFreshnessMonitor
 from nifty_engine.data.fyers.auth import FyersAuthProvider
 from nifty_engine.data.fyers.instrument_master import FyersInstrumentMaster
-from nifty_engine.data.fyers.rest_client import FyersRestClient
+from nifty_engine.data.fyers.rest_client import FyersRateLimitError, FyersRestClient
 from nifty_engine.data.fyers.websocket_client import FyersWebSocketClient
+from nifty_engine.data.gap_backfill import FeedGapBackfiller
 from nifty_engine.data.historical_manager import HistoricalCandleManager
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.data.tick_normalizer import TickNormalizer, TickStatus
@@ -53,7 +55,9 @@ class MarketDataEngine:
         self.freshness = DataFreshnessMonitor()
         self.master = FyersInstrumentMaster()
         self.normalizer = TickNormalizer(self.calendar)
-        self.rest_client = FyersRestClient(self.auth)
+        # ONE limiter for every REST call (history, option chain, quotes); usage persists per IST day
+        self.rate_limiter = AsyncTokenBucketRateLimiter(usage_file=settings.API_USAGE_FILE)
+        self.rest_client = FyersRestClient(self.auth, rate_limiter=self.rate_limiter)
         self.historical_manager = HistoricalCandleManager(
             rest_client=self.rest_client,
             store=self.store,
@@ -118,11 +122,20 @@ class MarketDataEngine:
         # Readiness override de-duplication (log on change, not every evaluation)
         self._last_readiness_override: Optional[str] = None
 
+        # Feed-gap detection + historical backfill for the signal instruments
+        self.gap_backfiller = FeedGapBackfiller(
+            historical_manager=self.historical_manager,
+            technical_engine=self.technical_engine,
+            store=self.store,
+            symbols_provider=lambda: sorted(self._signal_symbols()),
+            gap_seconds=settings.FEED_GAP_SECONDS,
+        )
+        self.option_chain_rate_limited_until: Optional[datetime] = None
+
     def _get_live_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Provides on-demand authentic broker quote snapshot for paper engine."""
         try:
-            client = self.auth.get_client()
-            q_res = client.quotes(data={"symbols": symbol})
+            q_res = self.rest_client.get_quote(symbol, blocking=False)
             if q_res and q_res.get("s") == "ok" and q_res.get("d"):
                 val = q_res["d"][0].get("v", {})
                 ltp = float(val.get("lp", 0.0))
@@ -266,7 +279,9 @@ class MarketDataEngine:
         # Direction is decided from the underlying; option premiums carry theta/IV noise
         # and must never generate their own breakout signals. Options are chosen later by
         # the contract selector based on the underlying's signal.
-        if candle.symbol in self._signal_symbols():
+        if candle.symbol in self._signal_symbols() and self.gap_backfiller.hold(candle):
+            pass  # feed gap open: indicators resume after historical backfill repairs the series
+        elif candle.symbol in self._signal_symbols():
             try:
                 snapshot = self.technical_engine.on_candle(candle)
                 if snapshot:
@@ -313,7 +328,10 @@ class MarketDataEngine:
         # 2. Live feed health & connection gating during active market hours
         override_reason: Optional[str] = None
         if is_live:
-            if not getattr(self.ws_client, "is_connected", False):
+            if self.gap_backfiller.active:
+                effective_readiness = SystemReadiness.NOT_READY
+                override_reason = "Feed gap: waiting for historical backfill -> NOT_READY"
+            elif not getattr(self.ws_client, "is_connected", False):
                 effective_readiness = SystemReadiness.NOT_READY
                 override_reason = "WebSocket disconnected during live market -> NOT_READY"
             elif self.last_primary_tick_time is not None:
@@ -475,8 +493,7 @@ class MarketDataEngine:
 
         # Try live broker quote
         try:
-            client = self.auth.get_client()
-            q_res = client.quotes(data={"symbols": settings.PRIMARY_INDEX})
+            q_res = self.rest_client.get_quote(settings.PRIMARY_INDEX, blocking=True)
             if q_res and q_res.get("s") == "ok" and q_res.get("d"):
                 lp = q_res["d"][0].get("v", {}).get("lp")
                 if lp and float(lp) > 0:
@@ -619,22 +636,37 @@ class MarketDataEngine:
             print(f"[WARN] Option rotation error (will retry next interval): {e}")
 
     def _poll_option_chain_if_due(self, is_open: bool) -> None:
-        """Polls full FYERS option chain matrix and persists to DuckDB with backoff on failure."""
+        """Polls the NIFTY option chain (60s in market hours) through the shared rate limiter.
+
+        Budget (FYERS Standard Data API, 5/s 50/min 5,000/day): 1 call/min during the
+        375-minute session = ~375 calls/day. Outside market hours OI doesn't change, so we
+        poll at most every 15 minutes. Broker limit responses pause polling for 65s so a
+        per-minute violation can never repeat inside the same window.
+        """
         now = now_ist()
+        if self.option_chain_rate_limited_until and now < self.option_chain_rate_limited_until:
+            return
+
         if self.last_option_chain_time is not None:
             elapsed = (now - self.last_option_chain_time).total_seconds()
-            # If previous attempts failed, apply backoff (30s * 2^failures, max 180s)
-            required_wait = min(180.0, max(30.0, 30.0 * (2 ** min(self.option_chain_failure_count, 3)))) if self.option_chain_failure_count > 0 else 180.0
+            if self.option_chain_failure_count > 0:
+                base = settings.OPTION_CHAIN_POLL_SECONDS
+                required_wait = min(180.0, base * (2 ** min(self.option_chain_failure_count - 1, 2)))
+            else:
+                required_wait = settings.OPTION_CHAIN_POLL_SECONDS if is_open else 900.0
             if elapsed < required_wait:
                 return
 
-        # Fetch option chain
         try:
             loop = asyncio.new_event_loop()
-            chain = loop.run_until_complete(
-                self.rest_client.get_option_chain(symbol=settings.PRIMARY_INDEX, strikecount=10)
-            )
-            loop.close()
+            try:
+                chain = loop.run_until_complete(
+                    self.rest_client.get_option_chain(
+                        symbol=settings.PRIMARY_INDEX, strikecount=settings.OPTION_CHAIN_STRIKECOUNT
+                    )
+                )
+            finally:
+                loop.close()
 
             self.store.save_option_chain_snapshot(chain)
             self.technical_engine.on_option_chain(chain, as_of=now)
@@ -644,17 +676,45 @@ class MarketDataEngine:
             self.latest_total_put_oi = chain.total_put_oi
             self.option_chain_failure_count = 0
             self.option_chain_last_error = None
-
-            print(
-                f"[OPTION CHAIN SNAPSHOT] Expiry: {chain.expiry} | PCR: {chain.pcr:.3f} | "
-                f"Call OI: {chain.total_call_oi:,} | Put OI: {chain.total_put_oi:,}"
-            )
+            self._log_oi_flow(chain)
+        except FyersRateLimitError as e:
+            self.option_chain_failure_count += 1
+            self.option_chain_last_error = str(e)
+            self.last_option_chain_time = now
+            self.option_chain_rate_limited_until = now + timedelta(seconds=65)
+            print(f"[WARN] Option chain rate limited by FYERS ({e.scope}); pausing chain polls 65s: {e}")
         except Exception as e:
             self.option_chain_failure_count += 1
             self.option_chain_last_error = str(e)
             self.last_option_chain_time = now  # Anchor backoff timer to avoid tight loop
             if is_open:
                 print(f"[WARN] Option chain poll failed (attempt {self.option_chain_failure_count}): {e}")
+
+    def _log_oi_flow(self, chain: Any) -> None:
+        """One compact line: PCR, walls, max pain, ATM IV trend and near-ATM OI flow."""
+        profile = None
+        try:
+            analyzer = self.derivatives_engine.oi_analyzer
+            profile = analyzer.latest_profiles.get((chain.underlying.upper(), chain.expiry))
+        except Exception:
+            profile = None
+
+        line = f"[OI FLOW] Exp {chain.expiry} | PCR {chain.pcr:.3f}"
+        if profile is not None:
+            mp = f"{profile.max_pain_strike:.0f}" if profile.max_pain_strike else "-"
+            line += (
+                f" | Call wall {profile.call_wall_strike:.0f} | Put wall {profile.put_wall_strike:.0f} | MaxPain {mp}"
+            )
+            if profile.atm_iv is not None:
+                chg = f" ({profile.atm_iv_change:+.2f})" if profile.atm_iv_change is not None else ""
+                line += f" | ATM {profile.atm_strike:.0f} IV {profile.atm_iv:.2f}{chg}"
+            if profile.observation_interval_seconds > 0:
+                line += (
+                    f" | Near-ATM dOI {profile.observation_interval_seconds:.0f}s: "
+                    f"CE {profile.near_atm_call_oi_change:+,} / PE {profile.near_atm_put_oi_change:+,}"
+                    f" | Bias {profile.aggregate_bias.value}"
+                )
+        print(line)
 
     def start(self):
         """Starts streaming and monitoring pipeline."""
@@ -753,13 +813,19 @@ class MarketDataEngine:
 
                 # Feed watchdog: during market hours, a silent or dropped stream triggers
                 # a non-blocking reconnect with backoff (e.g. after Wi-Fi drops and returns).
-                live_now = self.calendar.get_session_state(is_derivative=True) in (
-                    SessionState.REGULAR_CASH, SessionState.DERIVATIVES_EXT, SessionState.SPECIAL_SESSION
+                # Cash session only: the NIFTY index stops ticking at 15:30, so silence in the
+                # 15:30-15:40 window is expected and must not trigger reconnects or gap repair.
+                cash_live = self.calendar.get_session_state(is_derivative=True) in (
+                    SessionState.REGULAR_CASH, SessionState.SPECIAL_SESSION
                 )
-                if live_now:
-                    action = self.ws_client.ensure_alive(stale_after=15.0)
+                if cash_live:
+                    action = self.ws_client.ensure_alive(stale_after=settings.FEED_GAP_SECONDS)
                     if action:
                         print(f"[WS WATCHDOG] {action}")
+
+                gap_msg = self.gap_backfiller.observe(current_ist, self.last_primary_tick_time, cash_live)
+                if gap_msg:
+                    print(f"[FEED GAP] {gap_msg}")
 
                 self.builder.flush_closed_bars(current_ist)
                 self.technical_engine.expire_pending_evaluations(current_ist)
@@ -795,6 +861,10 @@ class MarketDataEngine:
                 net_lat_str = f"{net_latency:.3f}s" if net_latency is not None else "N/A"
 
                 pcr_str = f" | PCR: {self.latest_option_chain_pcr:.3f}" if self.latest_option_chain_pcr is not None else ""
+                api = self.rate_limiter.get_status()
+                pcr_str += f" | API: {api['daily_requests_used']}/{self.rate_limiter.max_daily_requests}"
+                if api["rate_limit_hits_today"]:
+                    pcr_str += f" (429s: {api['rate_limit_hits_today']})"
 
                 # Paper Trading active telemetry
                 open_pos = self.paper_engine.get_open_positions()

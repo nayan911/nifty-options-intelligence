@@ -22,6 +22,38 @@ from nifty_engine.data.fyers.auth import FyersAuthProvider
 from nifty_engine.utils.timezone import now_ist
 
 
+class FyersRateLimitError(RuntimeError):
+    """Broker rejected a request for exceeding a rate limit (FYERS code -429)."""
+
+    def __init__(self, message: str, scope: str):
+        super().__init__(message)
+        self.scope = scope  # "second" | "minute" | "day" | "unknown"
+
+
+def classify_rate_limit(response: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return the violated window ("second"/"minute"/"day"/"unknown") or None if not a limit error."""
+    if not response or response.get("s") == "ok":
+        return None
+    code = response.get("code")
+    msg = str(response.get("message", "")).lower()
+    is_limit = code in (-429, 429) or "limit" in msg or "too many" in msg
+    if not is_limit:
+        return None
+    if "day" in msg or "daily" in msg:
+        return "day"
+    if "minute" in msg:
+        return "minute"
+    if "second" in msg:
+        return "second"
+    return "unknown"
+
+
+# Seconds to wait before retrying after a broker-side limit response. A per-minute
+# violation must wait out the full rolling minute: retrying sooner risks a second
+# violation, and FYERS blocks the account for the day after more than 3.
+RATE_LIMIT_BACKOFF = {"second": 1.1, "minute": 61.0, "unknown": 61.0}
+
+
 class FyersRestClient:
     """Provides safe, rate-limited access to FYERS Data endpoints."""
 
@@ -33,6 +65,54 @@ class FyersRestClient:
         self.auth_provider = auth_provider or FyersAuthProvider()
         self.rate_limiter = rate_limiter or AsyncTokenBucketRateLimiter()
         self._fyers_client: Optional[fyersModel.FyersModel] = None
+
+    def _limit_backoff(
+        self,
+        response: Optional[Dict[str, Any]],
+        symbol: str,
+        attempt: int,
+        max_retries: int,
+    ) -> Optional[float]:
+        """If response is a broker rate-limit rejection, record it and return the retry delay.
+
+        Returns None when the response is not a limit error. Raises FyersRateLimitError
+        when retrying would be unsafe (daily cap, or repeated per-minute violations).
+        """
+        scope = classify_rate_limit(response)
+        if scope is None:
+            return None
+        hits = self.rate_limiter.record_rate_limit_hit()
+        msg = str((response or {}).get("message", "rate limited"))
+        if scope == "day":
+            raise FyersRateLimitError(f"FYERS daily limit reached ({symbol}): {msg}", scope)
+        if scope in ("minute", "unknown") and hits >= 2:
+            # One more per-minute violation edges toward the >3/day account block.
+            raise FyersRateLimitError(
+                f"FYERS per-minute limit hit {hits}x today ({symbol}); refusing to retry: {msg}", scope
+            )
+        delay = RATE_LIMIT_BACKOFF.get(scope, 61.0)
+        logger.warning(
+            "FYERS %s rate limit for %s (attempt %d/%d). Sleeping %.1fs...",
+            scope, symbol, attempt + 1, max_retries, delay,
+        )
+        return delay
+
+    def get_quote(self, symbol: str, blocking: bool = False) -> Optional[Dict[str, Any]]:
+        """Rate-limited single-symbol quote. Non-blocking by default: returns None if no budget.
+
+        Quotes are opportunistic (paper fills, contract checks) and run on latency-sensitive
+        paths, so they must never stall behind the per-minute window or bypass the limiter.
+        """
+        if blocking:
+            self.rate_limiter.acquire_sync()
+        elif not self.rate_limiter.try_acquire():
+            logger.debug("Quote for %s skipped: no API budget in current window", symbol)
+            return None
+        response = self._get_client().quotes(data={"symbols": symbol})
+        if classify_rate_limit(response):
+            self.rate_limiter.record_rate_limit_hit()
+            return None
+        return response
 
     def _get_client(self) -> fyersModel.FyersModel:
         if self._fyers_client is None:
@@ -73,15 +153,8 @@ class FyersRestClient:
                 break
 
             error_msg = response.get("message", "Error fetching historical data") if response else "Empty response"
-            err_lower = error_msg.lower()
-            if "minute" in err_lower:
-                delay = 8.0 * (2 ** attempt)
-                logger.warning("FYERS minute rate limit hit for %s (attempt %d/%d). Sleeping %.1fs...", symbol, attempt + 1, max_retries, delay)
-                await asyncio.sleep(delay)
-                continue
-            elif "limit" in err_lower or "too many" in err_lower or "second" in err_lower:
-                delay = 1.0 * (2 ** attempt)
-                logger.warning("FYERS burst rate limit hit for %s (attempt %d/%d). Sleeping %.1fs...", symbol, attempt + 1, max_retries, delay)
+            delay = self._limit_backoff(response, symbol, attempt, max_retries)
+            if delay is not None:
                 await asyncio.sleep(delay)
                 continue
             raise RuntimeError(f"FYERS Historical Data Error ({symbol}): {error_msg}")
@@ -147,15 +220,8 @@ class FyersRestClient:
                 break
 
             error_msg = response.get("message", "Error fetching historical data") if response else "Empty response"
-            err_lower = error_msg.lower()
-            if "minute" in err_lower:
-                delay = 8.0 * (2 ** attempt)
-                logger.warning("FYERS minute rate limit hit for %s (attempt %d/%d). Sleeping %.1fs...", symbol, attempt + 1, max_retries, delay)
-                time_mod.sleep(delay)
-                continue
-            elif "limit" in err_lower or "too many" in err_lower or "second" in err_lower:
-                delay = 1.0 * (2 ** attempt)
-                logger.warning("FYERS burst rate limit hit for %s (attempt %d/%d). Sleeping %.1fs...", symbol, attempt + 1, max_retries, delay)
+            delay = self._limit_backoff(response, symbol, attempt, max_retries)
+            if delay is not None:
                 time_mod.sleep(delay)
                 continue
             raise RuntimeError(f"FYERS Historical Data Error ({symbol}): {error_msg}")
@@ -209,8 +275,14 @@ class FyersRestClient:
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(None, lambda: client.optionchain(data=data))
 
+        scope = classify_rate_limit(response)
+        if scope is not None:
+            self.rate_limiter.record_rate_limit_hit()
+            raise FyersRateLimitError(
+                f"FYERS Option Chain rate limited ({scope}): {response.get('message', '')}", scope
+            )
         if not response or response.get("s") != "ok":
-            error_msg = response.get("message", "Error fetching option chain")
+            error_msg = response.get("message", "Error fetching option chain") if response else "Empty response"
             raise RuntimeError(f"FYERS Option Chain Error ({symbol}): {error_msg}")
 
         chain_data = response.get("data", {})
