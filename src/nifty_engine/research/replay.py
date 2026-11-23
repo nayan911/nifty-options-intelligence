@@ -37,7 +37,12 @@ from nifty_engine.research.bars import (
     trading_days,
 )
 from nifty_engine.research.history_store import ResearchHistoryStore
-from nifty_engine.research.manifest import DEFAULT_MANIFEST, dataset_fingerprint, require_valid_manifest
+from nifty_engine.research.manifest import (
+    DEFAULT_MANIFEST,
+    ManifestError,
+    dataset_fingerprint,
+    require_valid_manifest,
+)
 from nifty_engine.research.sessions import CASH, FNO
 from nifty_engine.strategy.params import S000Params
 from nifty_engine.strategy.registry import StrategyEntry, load_registry
@@ -189,7 +194,49 @@ class ReplayDriver:
             for s in EXPIRY_PROBES:
                 engine.expire_pending_evaluations(close_t + timedelta(seconds=s))
 
-    def run(self, start: date, end: date, warmup_days: int = 10, require_manifest: bool = True,
+    def reads(self) -> Dict[Tuple[str, str], set]:
+        """Every research series (instrument, kind) -> resolutions this driver reads."""
+        return {(self.spot_instrument, "SPOT"): {"1", "D"}, (self.fut_instrument, "CONT"): {"1", "D"}}
+
+    def check_data_requirements(self, manifest: Optional[Dict[str, Any]]) -> None:
+        """The strategy's declared data requirements must cover everything the replay reads, and (with a
+        manifest) every declared series must be one the manifest validated as REQUIRED."""
+        req = self.strategy.data_requirements
+        declared = {(s.instrument, s.kind): set(s.resolutions) for s in req.series}
+        problems = []
+        for key, res in self.reads().items():
+            undeclared = res - declared.get(key, set())
+            if undeclared:
+                problems.append(f"replay reads {key[0]}/{key[1]} {sorted(undeclared)} not declared by {self.strategy.id}")
+        for (inst, kind), res in declared.items():
+            unsupported = res - {"1", "D"}
+            if unsupported:
+                problems.append(f"{inst}/{kind}: resolution(s) {sorted(unsupported)} are not validated by the manifest")
+            if manifest is not None:
+                ok = any(s["instrument"] == inst and s["source"] == kind and s.get("required")
+                         for s in manifest.get("series", []))
+                if not ok:
+                    problems.append(f"{inst}/{kind}: required by {self.strategy.id} but not validated as a REQUIRED "
+                                    "series in the dataset manifest")
+        if problems:
+            raise ManifestError(f"{self.strategy.id} data requirements not met: " + "; ".join(problems))
+
+    def contract_tiers(self, days: List[date]) -> Dict[date, Optional[str]]:
+        """Contract-identity confidence of the futures series on each day (None: no segment table)."""
+        has = self.research.conn.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = 'cont_segments'").fetchall()[0][0]
+        if not has:
+            return {d: None for d in days}
+        rows = self.research.conn.execute(
+            """SELECT start_day, end_day, confidence FROM cont_segments
+               WHERE instrument = ? AND source = 'CONT'""", [self.fut_instrument]).fetchall()
+        out: Dict[date, Optional[str]] = {}
+        for d in days:
+            tiers = {c for lo, hi, c in rows if lo <= d <= hi}
+            out[d] = tiers.pop() if len(tiers) == 1 else ("MISSING" if not tiers else "AMBIGUOUS")
+        return out
+
+    def run(self, start: date, end: date, warmup_days: Optional[int] = None, require_manifest: bool = True,
             manifest_path=DEFAULT_MANIFEST) -> ReplayResult:
         """Replay every trading day in [start, end]. Days within `warmup_days` of the dataset start
         are skipped (not enough prior history for a live-equivalent warmup).
@@ -202,11 +249,17 @@ class ReplayDriver:
             "SELECT min(CAST(ts AS DATE)) FROM hist_bars WHERE instrument = ? AND resolution = '1'",
             [self.spot_instrument],
         ).fetchall()[0][0]
+        if warmup_days is None:
+            warmup_days = self.strategy.data_requirements.warmup_trading_days
         manifest = None
         if require_manifest:
             manifest = require_valid_manifest(first, end, self.research, manifest_path)
+        self.check_data_requirements(manifest)
         self._prepare()
         all_days = trading_days(self.cal, first, end)
+        accepted = set(self.strategy.data_requirements.contract_confidence)
+        tiers = self.contract_tiers(trading_days(self.cal, start, end))
+        tier_mix: Dict[str, int] = {}
         min_day = all_days[warmup_days] if len(all_days) > warmup_days else end + timedelta(days=1)
         signals: List[ReplaySignal] = []
         days, skipped = [], []
@@ -214,9 +267,19 @@ class ReplayDriver:
             if d < min_day:
                 skipped.append((d, f"insufficient warmup history (< {warmup_days} prior sessions)"))
                 continue
+            tier = tiers.get(d)
+            if tier is None and require_manifest:
+                raise ManifestError("no contract segment table: run scripts/build_history.py --validate-only")
+            if tier is not None and tier not in accepted:
+                skipped.append((d, f"futures contract confidence {tier} not accepted by {self.strategy.id}"))
+                continue
             self.replay_day(d, signals)
             days.append(d)
+            key = tier or "UNVALIDATED"
+            tier_mix[key] = tier_mix.get(key, 0) + 1
         prov = self.provenance(start, end)
+        prov["contract_confidence_days"] = tier_mix
+        prov["warmup_trading_days"] = warmup_days
         prov["manifest"] = (
             {"validated": True, "generated_at": manifest.get("generated_at"),
              "fingerprint": manifest.get("dataset_fingerprint")} if manifest else {"validated": False}

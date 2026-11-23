@@ -17,6 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from nifty_engine.strategy.params import S000_FIXED, S000Params
 
 DEFAULT_REGISTRY = Path(__file__).resolve().parents[3] / "strategies" / "registry.yaml"
+# Version locks: {strategy_id: {version: params_hash}}. Once a version is established its parameters
+# are frozen; any behavioural change needs a new version (or strategy id) and a new lock entry.
+DEFAULT_LOCK = DEFAULT_REGISTRY.with_name("registry.lock.json")
+LOCK_REQUIRED_STATUSES = ("baseline", "observe", "live")
 SCHEMA_VERSION = 1
 CONFIDENCE_TIERS = ("VERIFIED", "PARTIALLY_VERIFIED", "INFERRED")
 
@@ -112,13 +116,17 @@ def _parse_strategy(sid: str, raw: Any) -> StrategyEntry:
     model, fixed_expected = PARAM_MODELS[sid]
     if "params" not in raw:
         raise RegistryError(f"{sid}: missing 'params'")
+    # Every parameter must be written explicitly in the file (no silent defaults).
+    missing = _missing_keys(model, raw["params"])
+    if missing:
+        raise RegistryError(f"{sid}: params missing explicit value(s): {missing}")
     try:
-        params = model.model_validate(raw["params"], strict=False)
-        # Every parameter must be written explicitly in the file (no silent defaults).
-        missing = _missing_keys(model, raw["params"])
-        if missing:
-            raise RegistryError(f"{sid}: params missing explicit value(s): {missing}")
-        entry = StrategyEntry.model_validate({**raw, "id": sid, "params": params})
+        # Strict JSON-mode validation: no coercion of strings ("1.3"), booleans or floats-as-ints.
+        # (JSON mode still accepts YAML lists for tuples and ints for float fields.)
+        params = model.model_validate_json(_to_json(raw["params"]), strict=True)
+        meta = {k: v for k, v in raw.items() if k != "params"}
+        entry = StrategyEntry.model_validate_json(_to_json({**meta, "id": sid, "params": None}), strict=True)
+        entry = entry.model_copy(update={"params": params})
     except ValidationError as e:
         raise RegistryError(f"{sid}: invalid registry entry:\n{e}") from None
     if _normalize(entry.fixed) != _normalize(fixed_expected):
@@ -145,12 +153,45 @@ def _missing_keys(model, raw: Any, prefix: str = "") -> List[str]:
     return out
 
 
+def _to_json(obj: Any) -> str:
+    def default(o):
+        if isinstance(o, date):
+            return o.isoformat()
+        raise TypeError(f"unsupported value {o!r} ({type(o).__name__})")
+    return json.dumps(obj, default=default)
+
+
+def _check_locks(entries: Dict[str, StrategyEntry], lock_path: Path) -> None:
+    try:
+        locks = json.loads(lock_path.read_text())
+    except FileNotFoundError:
+        raise RegistryError(f"strategy version lock file not found: {lock_path}") from None
+    except json.JSONDecodeError as e:
+        raise RegistryError(f"strategy version lock file {lock_path} is not valid JSON: {e}") from None
+    for sid, e in entries.items():
+        locked = locks.get(sid, {}).get(str(e.version))
+        h = e.params_hash()
+        if locked is not None and locked != h:
+            raise RegistryError(
+                f"{sid} v{e.version} is locked to params hash {locked}, but the registry now hashes to {h}. "
+                f"Behavioural parameters changed: give it a new version (or a new strategy id) with a "
+                f"changelog entry, and lock that version instead of editing v{e.version}."
+            )
+        if locked is None and e.status in LOCK_REQUIRED_STATUSES:
+            raise RegistryError(
+                f"{sid} v{e.version} has status {e.status!r} but no version lock; add "
+                f'"{sid}": {{"{e.version}": "{h}"}} to {lock_path.name} once this version is established.'
+            )
+
+
 def _normalize(obj: Any) -> Any:
     return json.loads(json.dumps(obj, sort_keys=True, default=str))
 
 
-def load_registry(path: Union[str, Path, None] = None) -> Registry:
+def load_registry(path: Union[str, Path, None] = None, lock_path: Union[str, Path, None] = None) -> Registry:
+    """lock_path defaults to registry.lock.json next to the registry file."""
     p = Path(path) if path is not None else DEFAULT_REGISTRY
+    lp = Path(lock_path) if lock_path is not None else p.with_name(DEFAULT_LOCK.name)
     try:
         raw = yaml.safe_load(p.read_text())
     except FileNotFoundError:
@@ -168,4 +209,5 @@ def load_registry(path: Union[str, Path, None] = None) -> Registry:
     if not isinstance(strategies, dict) or not strategies:
         raise RegistryError("'strategies' must be a non-empty mapping")
     entries = {str(sid): _parse_strategy(str(sid), body) for sid, body in strategies.items()}
+    _check_locks(entries, lp)
     return Registry(schema_version=SCHEMA_VERSION, strategies=entries, path=str(p))

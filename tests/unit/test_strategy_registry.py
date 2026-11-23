@@ -2,6 +2,7 @@
 S000 loaded from strategies/registry.yaml behaves exactly like the pre-registry engine."""
 
 import copy
+import json
 import math
 import sys
 from datetime import date, datetime, timedelta
@@ -29,11 +30,13 @@ def _raw():
     return yaml.safe_load(REGISTRY.read_text())
 
 
-def _load_modified(tmp_path, mutate):
+def _load_modified(tmp_path, mutate, locks=None):
     raw = _raw()
     mutate(raw)
     p = tmp_path / "registry.yaml"
     p.write_text(yaml.safe_dump(raw, sort_keys=False))
+    lock = REGISTRY.with_name("registry.lock.json").read_text() if locks is None else json.dumps(locks)
+    (tmp_path / "registry.lock.json").write_text(lock)
     return load_registry(p)
 
 
@@ -232,3 +235,97 @@ def test_live_runner_builds_s000_from_the_registry_and_refuses_a_bad_one(tmp_pat
     monkeypatch.setattr(reg_mod, "DEFAULT_REGISTRY", bad)
     with pytest.raises(RegistryError):
         MarketDataEngine(store=DuckDBStore(db_path=":memory:"))
+
+
+# ------------------------------------------------------------------ strict types (no coercion)
+@pytest.mark.parametrize("label,mutate,match", [
+    ("numeric string", lambda r: r["strategies"]["S000"]["params"]["breakouts"]["5m"].update(min_breakout_rvol="1.3"), "min_breakout_rvol"),
+    ("integer string", lambda r: r["strategies"]["S000"]["params"]["entry"].update(entry_window_minutes="15"), "entry_window_minutes"),
+    ("boolean as number", lambda r: r["strategies"]["S000"]["params"]["scoring"].update(rsi_points=True), "rsi_points"),
+    ("float for an integer", lambda r: r["strategies"]["S000"]["params"]["swings"]["5m"].update(left_bars=3.0), "left_bars"),
+    ("tier value as string", lambda r: r["strategies"]["S000"]["params"]["scoring"].update(rvol_tiers=[["2.0", 25.0], [1.5, 20.0]]), "rvol_tiers"),
+    ("version as string", lambda r: r["strategies"]["S000"].update(version="1"), "version"),
+])
+def test_registry_types_are_not_coerced(tmp_path, label, mutate, match):
+    with pytest.raises(RegistryError, match=match):
+        _load_modified(tmp_path, mutate)
+
+
+# ------------------------------------------------------------------ version immutability
+def test_locked_version_cannot_change_its_parameters(tmp_path):
+    with pytest.raises(RegistryError, match="S000 v1 is locked"):
+        _load_modified(tmp_path, lambda r: r["strategies"]["S000"]["params"]["entry"].update(rsi_overbought=72.0))
+
+
+def test_new_version_must_be_locked_before_it_becomes_baseline(tmp_path):
+    def bump(r, status):
+        e = r["strategies"]["S000"]
+        e["params"]["entry"]["rsi_overbought"] = 72.0
+        e["version"], e["status"] = 2, status
+        e["changelog"].append({"version": 2, "date": "2026-12-01", "change": "RSI 72"})
+
+    with pytest.raises(RegistryError, match="no version lock"):
+        _load_modified(tmp_path, lambda r: bump(r, "baseline"))
+    e = _load_modified(tmp_path, lambda r: bump(r, "research")).get("S000")   # research may iterate unlocked
+    assert e.version == 2 and e.params.entry.rsi_overbought == 72.0
+    locks = {"S000": {"1": "1f615431ffcea0ea", "2": e.params_hash()}}
+    assert _load_modified(tmp_path, lambda r: bump(r, "baseline"), locks=locks).get("S000").version == 2
+
+
+def test_lock_file_is_required(tmp_path):
+    p = tmp_path / "registry.yaml"
+    p.write_text(REGISTRY.read_text())
+    with pytest.raises(RegistryError, match="lock file not found"):
+        load_registry(p)
+
+
+def test_committed_lock_matches_s000_v1():
+    locks = json.loads(REGISTRY.with_name("registry.lock.json").read_text())
+    assert locks["S000"]["1"] == load_registry().get("S000").params_hash() == "1f615431ffcea0ea"
+
+
+# ------------------------------------------------------------------ strategy data requirements
+def _synthetic(days_range=(date(2026, 6, 1), date(2026, 6, 19))):
+    sys.path.insert(0, str(Path(__file__).parent))
+    import test_replay as T
+
+    days = T.trading_days(T.CAL, *days_range)
+    return T, days, T._synthetic_store(days)
+
+
+def test_replay_refuses_inputs_the_strategy_does_not_declare(tmp_path):
+    from nifty_engine.research.manifest import ManifestError
+    from nifty_engine.research.replay import ReplayDriver
+
+    T, days, store = _synthetic()
+    no_fut_daily = _load_modified(tmp_path, lambda r: r["strategies"]["S000"]["data_requirements"]["series"][1]
+                                  .update(resolutions=["1"])).get("S000")
+    with pytest.raises(ManifestError, match=r"NIFTY_FUT/CONT \['D'\] not declared"):
+        ReplayDriver(store, strategy=no_fut_daily).run(days[-1], days[-1], require_manifest=False)
+    drv = ReplayDriver(store)
+    manifest = {"series": [{"instrument": "NIFTY_SPOT", "source": "SPOT", "required": True},
+                           {"instrument": "NIFTY_FUT", "source": "CONT", "required": False}]}
+    with pytest.raises(ManifestError, match="NIFTY_FUT/CONT: required by S000 but not validated"):
+        drv.check_data_requirements(manifest)
+    manifest["series"][1]["required"] = True
+    drv.check_data_requirements(manifest)  # passes
+
+
+def test_replay_skips_days_whose_contract_confidence_is_not_accepted(tmp_path):
+    from nifty_engine.research.replay import ReplayDriver
+
+    T, days, store = _synthetic()
+    store._write("""CREATE TABLE cont_segments (instrument VARCHAR, source VARCHAR, segment_id INTEGER,
+        start_day DATE, end_day DATE, contract_expiry DATE, contract_symbol VARCHAR, confidence VARCHAR,
+        checked_bars INTEGER, matched_bars INTEGER, segment_bars INTEGER, coverage DOUBLE)""")
+    store._write("INSERT INTO cont_segments VALUES ('NIFTY_FUT','CONT',1,?,?,NULL,NULL,'VERIFIED',0,0,0,1.0)",
+                 [days[0], days[-2]])
+    store._write("INSERT INTO cont_segments VALUES ('NIFTY_FUT','CONT',2,?,?,NULL,NULL,'INFERRED',0,0,0,0.0)",
+                 [days[-1], days[-1]])
+    verified_only = _load_modified(tmp_path, lambda r: r["strategies"]["S000"]["data_requirements"]
+                                   .update(contract_confidence=["VERIFIED"])).get("S000")
+    res = ReplayDriver(store, strategy=verified_only).run(days[-2], days[-1], require_manifest=False)
+    assert res.days == [days[-2]]
+    assert res.skipped_days == [(days[-1], "futures contract confidence INFERRED not accepted by S000")]
+    assert res.provenance["contract_confidence_days"] == {"VERIFIED": 1}
+    assert res.provenance["warmup_trading_days"] == 10

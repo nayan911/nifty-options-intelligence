@@ -32,9 +32,10 @@ strategies:
       # Research series (data/research.duckdb), as named in the dataset manifest.
       series:
         - {instrument: NIFTY_SPOT, kind: SPOT, resolutions: ["1", "D"]}
-        - {instrument: NIFTY_FUT, kind: CONT, resolutions: ["1"]}
-      # Futures contract-identity tiers a historical result may come from. CONFLICT is never
-      # used. Results are always reported separately per tier (Phase 3).
+        - {instrument: NIFTY_FUT, kind: CONT, resolutions: ["1", "D"]}   # D: warmup daily references
+      # Futures contract-identity tiers a historical day may come from (enforced by the replay:
+      # other days are skipped with a reason). CONFLICT is never accepted. Results are reported
+      # separately per tier (Phase 3).
       contract_confidence: [VERIFIED, PARTIALLY_VERIFIED, INFERRED]
       warmup_trading_days: 10
 
