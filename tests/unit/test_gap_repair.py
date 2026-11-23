@@ -317,3 +317,25 @@ def test_no_gap_detection_outside_cash_session():
     bf = FeedGapBackfiller(MagicMock(), MagicMock(), MagicMock(), lambda: [FUT], gap_seconds=15)
     assert bf.observe(t(15, 35), {FUT: t(15, 30)}, session_live=False) is None
     assert not bf.active
+
+
+def test_rebuild_is_discarded_if_feed_died_again_during_repair():
+    """A second outage while the worker rebuilds must not re-enable signals on a stale feed."""
+    release = threading.Event()
+    hm = mock_hm()
+    hm.reconcile_session_candles.side_effect = lambda *a, **k: release.wait(5)
+    engine = MagicMock()
+    bf = FeedGapBackfiller(hm, engine, MagicMock(), lambda: [FUT], gap_seconds=15)
+    drive_to_repair(bf)  # worker running since 10:03:06
+    release.set()
+    bf._worker.join(timeout=30)
+
+    msg = bf.observe(t(10, 3, 40), {FUT: t(10, 3, 20)}, True)  # silent 20s while repairing
+    assert "stale again" in msg and bf.state == bf.GAP_OPEN
+    engine.adopt_states.assert_not_called()
+
+    assert "live again" in bf.observe(t(10, 4, 10), {FUT: t(10, 4, 10)}, True).lower()
+    bf.observe(t(10, 5, 6), {FUT: t(10, 5, 6)}, True)  # fresh repair covering both outages
+    bf._worker.join(timeout=30)
+    assert "repaired" in bf.observe(t(10, 5, 7), {FUT: t(10, 5, 7)}, True).lower()
+    engine.adopt_states.assert_called_once()

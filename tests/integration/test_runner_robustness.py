@@ -185,3 +185,73 @@ def test_futures_setups_print_as_context_not_trade_alerts(capsys):
     engine._on_setup_candidate(setup, snap)
     out = capsys.readouterr().out
     assert "[TECHNICAL_SETUP_CANDIDATE" not in out and "[CONTEXT]" in out
+
+
+# ------------------------------------------------------------------ review round 3
+def _ready_engine(monkeypatch, now):
+    from nifty_engine.core.interfaces import SessionState, SystemReadiness
+
+    engine = make_engine()
+    monkeypatch.setattr("run_market_data.now_ist", lambda: now)
+    monkeypatch.setattr(engine.calendar, "get_session_state", lambda *a, **k: SessionState.REGULAR_CASH)
+    monkeypatch.setattr(engine.historical_manager, "assess_readiness", lambda *a, **k: (SystemReadiness.READY, {}))
+    engine.ws_client._is_connected = True
+    return engine
+
+
+def test_new_trading_day_without_restart_blocks_entries(monkeypatch):
+    from nifty_engine.core.interfaces import SystemReadiness
+
+    now = at(10, 0)
+    engine = _ready_engine(monkeypatch, now)
+    spot, fut = "NSE:NIFTY50-INDEX", engine.technical_engine.primary_futures
+    engine.last_signal_tick_times = {spot: now, fut: now}
+    engine.session_date = now.date()
+    assert engine.evaluate_and_update_readiness() == SystemReadiness.READY
+    engine.session_date = date(2026, 11, 20)  # process started on an earlier day
+    assert engine.evaluate_and_update_readiness() == SystemReadiness.NOT_READY
+    assert "restart required" in engine._last_readiness_override
+
+
+def test_readiness_requires_a_valid_live_tick_from_every_signal_feed(monkeypatch):
+    from nifty_engine.core.interfaces import SystemReadiness
+
+    now = at(9, 20)
+    engine = _ready_engine(monkeypatch, now)
+    spot, fut = "NSE:NIFTY50-INDEX", engine.technical_engine.primary_futures
+    engine.last_signal_tick_times = {}
+    assert engine.evaluate_and_update_readiness() == SystemReadiness.NOT_READY  # nothing live yet
+    engine.last_signal_tick_times = {spot: now}
+    assert engine.evaluate_and_update_readiness() == SystemReadiness.NOT_READY  # futures never ticked
+    assert fut in engine._last_readiness_override
+    engine.last_signal_tick_times = {spot: now, fut: now}
+    assert engine.evaluate_and_update_readiness() == SystemReadiness.READY
+
+
+def test_stale_snapshot_does_not_move_spot_price_for_atm_rotation():
+    """On (re)subscribe FYERS replays the last quote with an old exchange timestamp. It is
+    classified VALID_SNAPSHOT (not out-of-order, since it is the first quote seen) and must not
+    set the spot price used for ATM rotation."""
+    engine = make_engine()
+    now = at(11, 0)
+    replay = tick("NSE:NIFTY50-INDEX", now - timedelta(minutes=10), now, ltp=25100.0)
+    engine._on_tick_received(replay, current_time=now)
+    assert engine.snapshots_accepted == 1  # really took the snapshot path
+    assert engine.current_spot_price is None
+    live = tick("NSE:NIFTY50-INDEX", now + timedelta(seconds=1), now + timedelta(seconds=1), ltp=25380.0)
+    engine._on_tick_received(live, current_time=now + timedelta(seconds=1))
+    assert engine.current_spot_price == 25380.0
+
+
+def test_watchlist_reuses_futures_resolved_before_warmup():
+    engine = make_engine()
+    engine.master = MagicMock()
+    engine.master.resolve_future.side_effect = lambda u: {"NIFTY": "NSE:NIFTY26DECFUT",
+                                                          "BANKNIFTY": "NSE:BANKNIFTY26DECFUT"}[u]
+    engine.master.get_active_expiries.return_value = []
+    assert engine._resolve_futures()
+    calls = engine.master.resolve_future.call_count
+    engine.current_spot_price = 25380.0
+    wl = engine._build_watchlist()
+    assert engine.master.resolve_future.call_count == calls  # no second resolution
+    assert "NSE:NIFTY26DECFUT" in wl and "NSE:BANKNIFTY26DECFUT" in wl

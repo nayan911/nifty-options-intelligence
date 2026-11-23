@@ -203,6 +203,14 @@ class FeedGapBackfiller:
             if self.state == self.REPAIRING:
                 if not self._worker_done.is_set():
                     return None
+                if not all_fresh:
+                    # Feed died again while the worker was rebuilding: do not adopt and re-enable
+                    # signals on a feed that is already stale. Wait for it to resume, then redo
+                    # the repair so it also covers the second outage.
+                    self.state = self.GAP_OPEN
+                    self.resumed_at = None
+                    self._worker_shadow = None
+                    return f"Feed stale again ({', '.join(stale) or 'missing'}) during repair; discarding rebuild, waiting"
                 return self._finish(now)
 
         return None

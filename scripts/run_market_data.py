@@ -256,9 +256,8 @@ class MarketDataEngine:
         self.store.insert_tick(tick)
         self.ticks_persisted += 1
 
-        # 2. Track NIFTY spot price and telemetry
-        if tick.symbol == settings.PRIMARY_INDEX:
-            self.current_spot_price = tick.ltp
+        # 2. NIFTY spot price (drives ATM rotation) and feed freshness advance ONLY on ticks
+        # that passed live-market validation; a replayed stale snapshot must not move them.
 
         # Feed freshness advances ONLY on ticks that passed live-market validation. A
         # VALID_SNAPSHOT (e.g. the stale last-quote FYERS replays on resubscribe) or an
@@ -267,6 +266,7 @@ class MarketDataEngine:
             if tick.symbol in self._signal_symbols():
                 self.last_signal_tick_times[tick.symbol] = now_ist()
             if tick.symbol == settings.PRIMARY_INDEX:
+                self.current_spot_price = tick.ltp
                 self.last_primary_tick_time = now_ist()
                 if tick.exchange_timestamp:
                     self.last_primary_network_latency = (tick.local_timestamp - tick.exchange_timestamp).total_seconds()
@@ -380,13 +380,31 @@ class MarketDataEngine:
 
         # 2. Live feed health & connection gating during active market hours
         override_reason: Optional[str] = None
-        if is_live:
+        # A process left running into the next trading day still holds yesterday's futures
+        # ticker, option subscriptions and session state (and can keep running if the token is
+        # refreshed: reconnects reload it). Live rollover is not supported: block entries and
+        # require a fresh start, which re-resolves contracts and re-warms indicators.
+        startup_day = getattr(self, "session_date", None)
+        if startup_day is not None and now.date() != startup_day:
+            effective_readiness = SystemReadiness.NOT_READY
+            override_reason = (
+                f"New trading day ({now.date()}) since startup ({startup_day}): restart required "
+                "to roll contracts and re-warm indicators -> NOT_READY"
+            )
+        elif is_live:
             if self.gap_backfiller.active:
                 effective_readiness = SystemReadiness.NOT_READY
                 override_reason = "Feed gap: waiting for historical backfill -> NOT_READY"
             elif not getattr(self.ws_client, "is_connected", False):
                 effective_readiness = SystemReadiness.NOT_READY
                 override_reason = "WebSocket disconnected during live market -> NOT_READY"
+            elif (
+                curr_state in (SessionState.REGULAR_CASH, SessionState.SPECIAL_SESSION)
+                and any(t is None for t in self._signal_tick_times().values())
+            ):
+                missing = sorted(s for s, t in self._signal_tick_times().items() if t is None)
+                effective_readiness = SystemReadiness.NOT_READY
+                override_reason = f"No valid live tick yet from {', '.join(missing)} -> NOT_READY"
             else:
                 worst_sym, feed_age = self._worst_signal_feed_age()
                 if feed_age is not None and feed_age > 120.0:
@@ -625,11 +643,11 @@ class MarketDataEngine:
             "NSE:BHARTIARTL-EQ",
         ]
 
-        # Futures (resolved before warmup; re-resolved here so the watchlist always matches)
-        if self._resolve_futures():
-            watchlist.append(self.technical_engine.primary_futures)
-            if self.banknifty_futures:
-                watchlist.append(self.banknifty_futures)
+        # Futures: reuse the contracts resolved once before warmup. Re-resolving here could
+        # switch the ticker after warmup if startup straddled the 15:30 expiry cutoff.
+        watchlist.append(self.technical_engine.primary_futures)
+        if self.banknifty_futures:
+            watchlist.append(self.banknifty_futures)
 
         # Dynamic Options: nearest expiry + next weekly expiry
         spot = self.current_spot_price or self._get_initial_spot()
@@ -896,6 +914,8 @@ class MarketDataEngine:
 
     def _run(self):
         """Startup (token, warmup, subscribe, connect) followed by the maintenance loop."""
+        # Contracts, warmup and subscriptions are resolved for THIS trading day only.
+        self.session_date = now_ist().date()
         print("=" * 72)
         print("  NIFTY Options Trading Intelligence - Market Data Pipeline")
         print("=" * 72)
