@@ -330,3 +330,53 @@ def test_market_data_engine_two_way_readiness_monitoring(monkeypatch):
 
     store.close()
 
+
+def test_runner_drops_incomplete_initial_15m_bar_and_prevents_duplicate_close():
+    """Verify that when MarketDataEngine starts at 09:25:
+    1. Incomplete 09:15–09:30 15m candle is dropped and NOT inserted into DuckDB or forwarded.
+    2. A delayed tick after flush does not emit duplicate closed bars.
+    """
+    store = DuckDBStore(db_path=":memory:")
+    engine = MarketDataEngine(store=store)
+
+    sym = "NSE:NIFTY26NOVFUT"
+    # First tick arrives at 09:25:10
+    t_start = IST.localize(datetime(2026, 11, 23, 9, 25, 10))
+    t1 = Tick(symbol=sym, exchange_timestamp=t_start, local_timestamp=t_start, ltp=25700.0, cumulative_volume=1000, incremental_volume=0)
+    engine._on_tick_received(t1, current_time=t_start)
+
+    # Ticks continue through 09:29:50
+    t_end = IST.localize(datetime(2026, 11, 23, 9, 29, 50))
+    t2 = Tick(symbol=sym, exchange_timestamp=t_end, local_timestamp=t_end, ltp=25668.50, cumulative_volume=101790, incremental_volume=100790)
+    engine._on_tick_received(t2, current_time=t_end)
+
+    # Boundary flush at 09:30:00
+    t_0930 = IST.localize(datetime(2026, 11, 23, 9, 30, 0))
+    engine.builder.flush_closed_bars(t_0930)
+
+    # Check DuckDB: 5m candle for 09:25 exists
+    candles_5m = store.get_recent_candles(sym, "5m", limit=10)
+    assert len(candles_5m) == 1
+    assert candles_5m[0].timestamp == IST.localize(datetime(2026, 11, 23, 9, 25, 0))
+    assert candles_5m[0].close == 25668.50
+
+    # Incomplete 15m candle (09:15) was NOT inserted into DuckDB!
+    candles_15m = store.get_recent_candles(sym, "15m", limit=10)
+    assert len(candles_15m) == 0
+
+    # Delayed tick arrives for 09:29:59
+    t_delayed_ts = IST.localize(datetime(2026, 11, 23, 9, 29, 59))
+    t_delayed = Tick(symbol=sym, exchange_timestamp=t_delayed_ts, local_timestamp=t_delayed_ts, ltp=25670.0, cumulative_volume=101800, incremental_volume=10)
+    engine._on_tick_received(t_delayed, current_time=t_0930 + timedelta(seconds=1))
+
+    # Flush again at 09:30:02
+    engine.builder.flush_closed_bars(t_0930 + timedelta(seconds=2))
+
+    # Count of 5m candles must remain strictly 1 (NO duplicate!)
+    candles_5m_after = store.get_recent_candles(sym, "5m", limit=10)
+    assert len(candles_5m_after) == 1
+    assert candles_5m_after[0].close == 25668.50
+
+    store.close()
+
+

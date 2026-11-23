@@ -9,6 +9,7 @@ Strictly adheres to:
 6. Daily volume reset handling.
 """
 
+import logging
 import threading
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
@@ -18,16 +19,26 @@ import pytz
 from nifty_engine.core.interfaces import Candle, Tick
 from nifty_engine.utils.timezone import now_ist
 
+logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
 
 class ActiveCandle:
     """Maintains running state for an unclosed candle bar."""
 
-    def __init__(self, symbol: str, timeframe: str, start_time: datetime) -> None:
+    def __init__(
+        self,
+        symbol: str,
+        timeframe: str,
+        start_time: datetime,
+        is_incomplete: bool = False,
+        initial_tick_offset_seconds: float = 0.0,
+    ) -> None:
         self.symbol = symbol
         self.timeframe = timeframe
         self.start_time = start_time
+        self.is_incomplete = is_incomplete
+        self.initial_tick_offset_seconds = initial_tick_offset_seconds
         self.open: Optional[float] = None
         self.high: Optional[float] = None
         self.low: Optional[float] = None
@@ -93,14 +104,26 @@ class RealtimeCandleBuilder:
         "15m": 15,
     }
 
+    # Maximum delay allowed between bar_start and the first received tick
+    # for an initial bar to be considered complete (untruncated).
+    MAX_INITIAL_TICK_OFFSET_SECONDS = {
+        "1m": 20.0,
+        "5m": 45.0,
+        "15m": 120.0,
+    }
+
     def __init__(
         self,
-        on_candle_close: Optional[Callable[[Candle], None]] = None
+        on_candle_close: Optional[Callable[[Candle], None]] = None,
+        drop_incomplete_initial_bars: bool = True,
     ) -> None:
         self.on_candle_close = on_candle_close
+        self.drop_incomplete_initial_bars = drop_incomplete_initial_bars
         self._lock = threading.Lock()
         # Key: (symbol, timeframe) -> ActiveCandle
         self._active_bars: Dict[tuple, ActiveCandle] = {}
+        # Track last closed bar start time per (symbol, timeframe) to guarantee exactly-once closure
+        self._last_closed_bar_start: Dict[tuple, datetime] = {}
         # Track last processed tick per symbol to reject duplicates: (symbol) -> (timestamp, ltp, cumulative_vol)
         self._last_tick_fingerprint: Dict[str, tuple] = {}
 
@@ -131,24 +154,60 @@ class RealtimeCandleBuilder:
                 key = (tick.symbol, tf)
                 bar_start = self._get_bar_start_time(tick_time, interval_mins)
 
+                # 1. Guard against duplicate closed candle:
+                # If this interval has already been finalized and closed, ignore this delayed tick
+                last_closed = self._last_closed_bar_start.get(key)
+                if last_closed is not None and bar_start <= last_closed:
+                    continue
+
                 active = self._active_bars.get(key)
                 if active is None:
                     # First tick for this symbol/timeframe
-                    active = ActiveCandle(symbol=tick.symbol, timeframe=tf, start_time=bar_start)
+                    offset_sec = (tick_time - bar_start).total_seconds()
+                    max_offset = self.MAX_INITIAL_TICK_OFFSET_SECONDS.get(tf, 20.0)
+                    is_incomplete = bool(self.drop_incomplete_initial_bars and offset_sec > max_offset)
+
+                    active = ActiveCandle(
+                        symbol=tick.symbol,
+                        timeframe=tf,
+                        start_time=bar_start,
+                        is_incomplete=is_incomplete,
+                        initial_tick_offset_seconds=offset_sec,
+                    )
                     active.update(tick)
                     self._active_bars[key] = active
                 elif bar_start > active.start_time:
                     # Interval boundary crossed -> close previous bar
-                    closed_candle = active.to_candle(is_closed=True)
-                    closed_candle.observed_at = tick.local_timestamp or now_ist()
-                    closed_candles.append(closed_candle)
+                    self._last_closed_bar_start[key] = active.start_time
 
-                    # Start fresh bar
-                    new_bar = ActiveCandle(symbol=tick.symbol, timeframe=tf, start_time=bar_start)
+                    if not active.is_incomplete:
+                        closed_candle = active.to_candle(is_closed=True)
+                        closed_candle.observed_at = tick.local_timestamp or now_ist()
+                        closed_candles.append(closed_candle)
+                    else:
+                        logger.warning(
+                            "Dropped incomplete initial candle for %s (%s) starting at %s "
+                            "(first tick arrived %.1fs into %dm interval). Next full bar begins at %s.",
+                            active.symbol,
+                            active.timeframe,
+                            active.start_time.strftime("%H:%M:%S"),
+                            active.initial_tick_offset_seconds,
+                            interval_mins,
+                            bar_start.strftime("%H:%M:%S"),
+                        )
+
+                    # Start fresh bar at the new boundary (always complete because it begins right at the boundary)
+                    new_bar = ActiveCandle(
+                        symbol=tick.symbol,
+                        timeframe=tf,
+                        start_time=bar_start,
+                        is_incomplete=False,
+                        initial_tick_offset_seconds=(tick_time - bar_start).total_seconds(),
+                    )
                     new_bar.update(tick)
                     self._active_bars[key] = new_bar
                 elif bar_start < active.start_time:
-                    # Out-of-order tick arriving for an already closed past interval -> Ignore to prevent lookahead corruption
+                    # Out-of-order tick arriving for an already closed past interval -> Ignore
                     continue
                 else:
                     # Tick belongs to current active bar
@@ -170,9 +229,25 @@ class RealtimeCandleBuilder:
                 bar_end_time = active.start_time + timedelta(minutes=interval_mins)
 
                 if current_time >= bar_end_time and active.tick_count > 0:
-                    closed_candle = active.to_candle(is_closed=True)
-                    closed_candle.observed_at = current_time
-                    closed_candles.append(closed_candle)
+                    # 1. Record last closed bar start time to prevent duplicate recreation!
+                    self._last_closed_bar_start[(symbol, tf)] = active.start_time
+
+                    # 2. Only emit complete candles
+                    if not active.is_incomplete:
+                        closed_candle = active.to_candle(is_closed=True)
+                        closed_candle.observed_at = current_time
+                        closed_candles.append(closed_candle)
+                    else:
+                        logger.warning(
+                            "Dropped incomplete initial candle for %s (%s) starting at %s during flush "
+                            "(first tick arrived %.1fs into %dm interval).",
+                            active.symbol,
+                            active.timeframe,
+                            active.start_time.strftime("%H:%M:%S"),
+                            active.initial_tick_offset_seconds,
+                            interval_mins,
+                        )
+
                     # Remove from active
                     del self._active_bars[(symbol, tf)]
 
