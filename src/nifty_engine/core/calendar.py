@@ -30,6 +30,8 @@ class ExchangeCalendar:
         self.market_open = time(9, 15, 0)
         self.cash_close = time(15, 30, 0)
         self.derivatives_close = time(15, 40, 0)  # Official F&O closing window
+        # [(effective_from, close_time)] sorted ascending; empty -> derivatives_close always
+        self.derivatives_close_history: list = []
 
         self._load_configs()
 
@@ -55,11 +57,26 @@ class ExchangeCalendar:
                     if "derivatives_close" in std:
                         self.derivatives_close = datetime.strptime(std["derivatives_close"], "%H:%M:%S").time()
 
+                    for item in data.get("derivatives_close_history", []) or []:
+                        self.derivatives_close_history.append((
+                            datetime.strptime(str(item["from"]), "%Y-%m-%d").date(),
+                            datetime.strptime(item["close"], "%H:%M:%S").time(),
+                        ))
+                    self.derivatives_close_history.sort()
+
                     # Special sessions (e.g., Muhurat trading)
                     specials = data.get("special_sessions", {})
                     for dt_str, cfg in specials.items():
                         dt_obj = datetime.strptime(dt_str, "%Y-%m-%d").date()
                         self.special_sessions[dt_obj] = cfg
+
+    def derivatives_close_on(self, target_date: date) -> time:
+        """F&O closing time in force on `target_date` (the 15:40 close began 31-Jul-2026)."""
+        close = self.derivatives_close
+        for effective_from, t in self.derivatives_close_history:
+            if target_date >= effective_from:
+                close = t
+        return close
 
     def is_holiday(self, target_date: date) -> bool:
         """Check if date is a Saturday, Sunday, or declared exchange holiday."""
@@ -124,11 +141,12 @@ class ExchangeCalendar:
         if self.market_open <= current_time < self.cash_close:
             return SessionState.REGULAR_CASH
 
-        # Derivatives extended closing window (15:30 - 15:40)
-        if self.cash_close <= current_time < self.derivatives_close:
+        # Derivatives extended closing window (15:30 - 15:40, in force from 31-Jul-2026)
+        fo_close = self.derivatives_close_on(current_date)
+        if self.cash_close <= current_time < fo_close:
             return SessionState.DERIVATIVES_EXT if is_derivative else SessionState.POST_CLOSE
 
-        if current_time >= self.derivatives_close:
+        if current_time >= fo_close:
             return SessionState.CLOSED
 
         return SessionState.CLOSED

@@ -21,6 +21,8 @@ from nifty_engine.data.fyers.instrument_master import FyersInstrumentMaster
 from nifty_engine.data.fyers.rest_client import FyersRestClient
 from nifty_engine.research.history_loader import HistoryLoader, SeriesSpec
 from nifty_engine.research.history_store import DEFAULT_RESEARCH_DB, ResearchHistoryStore
+from nifty_engine.research.manifest import DEFAULT_MANIFEST, build_manifest, write_manifest
+from nifty_engine.research.segments import segment_all
 from nifty_engine.utils.timezone import now_ist
 
 SPOT_SERIES = [
@@ -46,9 +48,12 @@ def futures_contracts(master: FyersInstrumentMaster, underlying: str, as_of: dat
 def build_specs(master: FyersInstrumentMaster, today: date):
     specs = [SeriesSpec(name, sym, "SPOT") for name, sym in SPOT_SERIES]
     for underlying, name in (("NIFTY", "NIFTY_FUT"), ("BANKNIFTY", "BANKNIFTY_FUT")):
-        near = master.resolve_future(underlying)
-        specs.append(SeriesSpec(name, near, "CONT"))
-        for sym, exp in futures_contracts(master, underlying, today):
+        contracts = futures_contracts(master, underlying, today)
+        # FYERS stitches by the requested contract's position: nearest -> near month, 2nd -> next month.
+        specs.append(SeriesSpec(name, contracts[0][0], "CONT", underlying=underlying))
+        if len(contracts) > 1:
+            specs.append(SeriesSpec(name, contracts[1][0], "CONT_NEXT", underlying=underlying))
+        for sym, exp in contracts:
             specs.append(SeriesSpec(name, sym, "OWN", contract_expiry=exp))
     return specs
 
@@ -59,7 +64,9 @@ def main() -> int:
     ap.add_argument("--start", default=(today - timedelta(days=330)).isoformat())
     ap.add_argument("--end", default=today.isoformat())
     ap.add_argument("--db", default=str(DEFAULT_RESEARCH_DB))
+    ap.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--validate-only", action="store_true", help="skip downloading; rebuild the manifest")
     args = ap.parse_args()
     start, end = date.fromisoformat(args.start), date.fromisoformat(args.end)
 
@@ -70,14 +77,14 @@ def main() -> int:
     print(f"Research history build: {start} -> {end}  db={args.db}")
     for s in specs:
         extra = f" (expiry {s.contract_expiry})" if s.contract_expiry else ""
-        print(f"  - {s.instrument:15s} {s.kind:4s} {s.symbol}{extra}")
+        print(f"  - {s.instrument:15s} {s.kind:9s} {s.symbol} -> stored as {s.store_symbol}{extra}")
     if args.dry_run:
         return 0
 
     cal = ExchangeCalendar()
     store = ResearchHistoryStore(args.db)
     rest = FyersRestClient(rate_limiter=AsyncTokenBucketRateLimiter(usage_file=settings.API_USAGE_FILE))
-    loader = HistoryLoader(rest, store, is_trading_day=cal.is_trading_day)
+    loader = HistoryLoader(rest, store, calendar=cal)
 
     def progress(r):
         status = "ok" if not r.errors else f"{len(r.errors)} error(s): {r.errors[0][:90]}"
@@ -85,28 +92,35 @@ def main() -> int:
               f"res={r.resolution:2s} requests={r.requests:2d} skipped={r.skipped_chunks:2d} bars={r.bars:6d} {status}",
               flush=True)
 
-    loader.load_all(specs, start, end, progress=progress)
+    if not args.validate_only:
+        loader.load_all(specs, start, end, progress=progress)
 
-    print("\nContinuous-futures contract switches detected (OI ratio first bar / prev close):")
-    for inst in ("NIFTY_FUT", "BANKNIFTY_FUT"):
-        for b in store.assign_cont_segments(inst, "1"):
-            print(f"  {inst}: {b['prev_day']} -> {b['day']}  oi_ratio={b['oi_ratio']}")
+    # Segment stitched futures by 2-of-3 vote (calendar, OI ratio, basis jump), then validate.
+    segment_reports = segment_all(store, cal)
+    manifest = build_manifest(store, cal, start, end, segment_reports=segment_reports)
+    bad_ohlc = [i for i in store.quality_report() if i.kind == "BAD_OHLC"]
+    for i in bad_ohlc:
+        manifest["errors"].append(f"{i.instrument}/{i.source} {i.day}: {i.detail}")
+    manifest["ok"] = not manifest["errors"]
+    path = write_manifest(manifest, args.manifest)
 
-    print("\nCoverage:")
-    print(store.coverage().to_string(index=False))
-
-    tdays = [start + timedelta(days=i) for i in range((end - start).days + 1)]
-    tdays = [d for d in tdays if cal.is_trading_day(d)]
-    issues = store.quality_report(trading_days=tdays)
-    print(f"\nQuality issues: {len(issues)}")
-    by_kind = {}
-    for i in issues:
-        by_kind.setdefault((i.instrument, i.kind), []).append(i)
-    for (inst, kind), items in sorted(by_kind.items()):
-        sample = ", ".join(f"{x.day}" for x in items[:5])
-        print(f"  {inst:15s} {kind:12s} x{len(items):3d}  e.g. {sample}")
+    print(f"\nManifest: {path}  ok={manifest['ok']}  trading days={manifest['range']['trading_days']}")
+    for key, rv in manifest["rollovers"].items():
+        print(f"  {key}: {len(rv['accepted'])} contract switches accepted (>=2 of calendar/OI/basis), "
+              f"{len(rv['disputed'])} single-signal disputed")
+        for b in rv["accepted"]:
+            if not all(b["votes"].values()):
+                print(f"      {b['day']}: votes={b['votes']} oi_ratio={b['oi_ratio']} basis_change={b['basis_change']}")
+    for srow in manifest["series"]:
+        counts = ", ".join(f"{k}={v}" for k, v in sorted(srow["status_counts"].items()))
+        flag = " [required]" if srow["required"] else ""
+        print(f"  {srow['instrument']:15s} {srow['source']:4s} {srow['symbol']:24s} {counts}{flag}")
+    for w in manifest["warnings"]:
+        print(f"  WARNING: {w}")
+    for e in manifest["errors"]:
+        print(f"  ERROR: {e}")
     store.close()
-    return 0
+    return 0 if manifest["ok"] else 1
 
 
 if __name__ == "__main__":

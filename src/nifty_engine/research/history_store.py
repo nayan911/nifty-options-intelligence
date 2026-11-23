@@ -30,7 +30,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS hist_bars (
     instrument VARCHAR NOT NULL,        -- logical series, e.g. NIFTY_SPOT, NIFTY_FUT, INDIAVIX
     symbol VARCHAR NOT NULL,            -- real FYERS symbol (contract for futures)
-    source VARCHAR NOT NULL,            -- OWN (contract's own series) | CONT (FYERS stitched) | SPOT
+    source VARCHAR NOT NULL,            -- SPOT | OWN (real contract) | CONT (stitched near month) | CONT_NEXT (stitched next month)
     resolution VARCHAR NOT NULL,        -- '1' (minute) or 'D'
     ts TIMESTAMP WITH TIME ZONE NOT NULL,
     open DOUBLE NOT NULL,
@@ -112,17 +112,21 @@ class ResearchHistoryStore:
         instrument: str,
         resolution: str = "1",
         oi_ratio_threshold: float = 0.5,
+        source: str = "CONT",
     ) -> List[Dict]:
-        """Split a CONT futures series into single-contract segments at contract switches.
+        """OI-ratio-only segmentation (heuristic; kept for diagnostics).
+
+        Production segmentation uses research.segments (2-of-3 vote: expiry calendar, OI ratio,
+        basis jump): the OI rule alone missed a real NIFTY switch (Feb 2026) and flagged others.
 
         A switch is detected between consecutive trading days when OI at the day's first bar is
         below `oi_ratio_threshold` x (or above its inverse) the previous day's last-bar OI. Returns
         the detected boundaries for reporting.
         """
         df = self.conn.execute(
-            """SELECT ts, oi FROM hist_bars WHERE instrument = ? AND source = 'CONT' AND resolution = ?
+            """SELECT ts, oi FROM hist_bars WHERE instrument = ? AND source = ? AND resolution = ?
                ORDER BY ts""",
-            [instrument, resolution],
+            [instrument, source, resolution],
         ).df()
         if df.empty:
             return []
@@ -148,9 +152,9 @@ class ResearchHistoryStore:
         try:
             self._write(
                 """UPDATE hist_bars SET segment_id = segmap.segment_id FROM segmap
-                   WHERE hist_bars.instrument = ? AND hist_bars.source = 'CONT' AND hist_bars.resolution = ?
+                   WHERE hist_bars.instrument = ? AND hist_bars.source = ? AND hist_bars.resolution = ?
                      AND CAST(hist_bars.ts AS DATE) = segmap.day""",
-                [instrument, resolution],
+                [instrument, source, resolution],
             )
         finally:
             self.conn.unregister("segmap")
@@ -173,6 +177,29 @@ class ResearchHistoryStore:
             [symbol, source, resolution, day],
         ).fetchall()[0][0]
         return n > 0
+
+    def minutes_by_day(self, symbol: str, source: str, resolution: str, lo: date, hi: date) -> Dict[date, set]:
+        """Stored bar start times per day in [lo, hi] (for per-day completeness checks)."""
+        df = self.conn.execute(
+            """SELECT ts FROM hist_bars WHERE symbol = ? AND source = ? AND resolution = ?
+               AND CAST(ts AS DATE) BETWEEN ? AND ?""",
+            [symbol, source, resolution, lo, hi],
+        ).df()
+        out: Dict[date, set] = {}
+        if df.empty:
+            return out
+        ts = pd.to_datetime(df["ts"]).dt.tz_convert("Asia/Kolkata")
+        for t in ts:
+            py = t.to_pydatetime()
+            out.setdefault(py.date(), set()).add(py)
+        return out
+
+    def first_day(self, symbol: str, source: str, resolution: str) -> Optional[date]:
+        v = self.conn.execute(
+            "SELECT min(CAST(ts AS DATE)) FROM hist_bars WHERE symbol = ? AND source = ? AND resolution = ?",
+            [symbol, source, resolution],
+        ).fetchall()[0][0]
+        return v
 
     def bars(self, instrument: str, source: str, resolution: str = "1",
              start: Optional[datetime] = None, end: Optional[datetime] = None) -> pd.DataFrame:

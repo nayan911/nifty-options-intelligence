@@ -43,8 +43,8 @@ def test_session_state_regular_trading(calendar):
 
 
 def test_session_state_derivatives_extended_window(calendar):
-    # 15:35 PM on a regular Tuesday (Derivatives active, Cash closed)
-    dt = IST.localize(datetime(2026, 1, 27, 15, 35, 0))
+    # 15:35 on a regular Tuesday after the 31-Jul-2026 F&O close extension (Derivatives active, Cash closed)
+    dt = IST.localize(datetime(2026, 11, 17, 15, 35, 0))
 
     # Cash check -> POST_CLOSE (Cash closed at 15:30)
     cash_state = calendar.get_session_state(dt, is_derivative=False)
@@ -135,3 +135,14 @@ def test_2026_special_sessions_match_observed_data():
     assert cal.get_session_state(ist.localize(datetime(2026, 2, 1, 11, 0))) == SessionState.SPECIAL_SESSION
     assert cal.get_session_state(ist.localize(datetime(2026, 11, 8, 14, 45))) == SessionState.SPECIAL_SESSION
     assert cal.get_session_state(ist.localize(datetime(2026, 11, 8, 18, 30))) == SessionState.CLOSED
+
+
+
+def test_fo_closing_time_follows_dated_history(calendar):
+    """FYERS history: futures closed at 15:29 until 30-Jul-2026 and at 15:39 from 31-Jul-2026."""
+    before = IST.localize(datetime(2026, 1, 27, 15, 35, 0))
+    after = IST.localize(datetime(2026, 7, 31, 15, 35, 0))
+    assert calendar.get_session_state(before, is_derivative=True) == SessionState.CLOSED
+    assert calendar.get_session_state(after, is_derivative=True) == SessionState.DERIVATIVES_EXT
+    assert calendar.derivatives_close_on(date(2026, 7, 30)).strftime("%H:%M") == "15:30"
+    assert calendar.derivatives_close_on(date(2026, 7, 31)).strftime("%H:%M") == "15:40"

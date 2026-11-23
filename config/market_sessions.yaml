@@ -13,10 +13,14 @@ standard:
   derivatives_close: "15:40:00"  # Current official F&O closing session
   post_market_close: "16:00:00"
 
-# Future framework update scheduled for Dec 7, 2026 onward
-future_revisions:
-  effective_date: "2026-12-07"
-  derivatives_extended_hours_active: false  # Will be toggled upon official exchange rollout
+# F&O closing time by date. Verified in FYERS 1m history: NIFTY/BANKNIFTY futures had 375 bars
+# (last 15:29) every session until 30-Jul-2026 and 385 bars (last 15:39) from 31-Jul-2026.
+# (Replaces an unused "future_revisions" block that said extended hours were not active.)
+derivatives_close_history:
+  - from: "2000-01-01"
+    close: "15:30:00"
+  - from: "2026-07-31"
+    close: "15:40:00"
 
 # Special Sessions (Muhurat Trading, DR Drills)
 special_sessions:
@@ -26,12 +30,12 @@ special_sessions:
     name: "Union Budget Session 2026 (Sunday)"
     session_start: "09:15:00"
     session_end: "15:30:00"
-    derivatives_close: "15:40:00"
+    derivatives_close: "15:30:00"   # before the 31-Jul extended F&O close (futures: 375 bars)
   # NSE Muhurat Trading 2026 (Diwali Laxmi Pujan, Sunday Nov 8). Previously configured as
-  # 18:15-19:15; FYERS history shows the actual session ran 14:20-15:29 (index) and to 15:39
-  # (futures).
+  # 18:15-19:15; FYERS history shows the actual session ran 14:20-15:29 (index, 70 bars) and
+  # to 15:39 (futures, 80 bars).
   "2026-11-08":
     name: "Muhurat Trading 2026"
-    session_start: "14:15:00"
+    session_start: "14:20:00"
     session_end: "15:30:00"
     derivatives_close: "15:40:00"

@@ -10,7 +10,9 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Callable, List, Optional
 
+from nifty_engine.core.calendar import ExchangeCalendar
 from nifty_engine.research.history_store import ResearchHistoryStore
+from nifty_engine.research.sessions import expected_minutes, kind_for
 
 logger = logging.getLogger(__name__)
 
@@ -22,22 +24,41 @@ DAILY_CHUNK_DAYS = 360
 class SeriesSpec:
     """One series to download.
 
-    kind: SPOT (index/equity), CONT (FYERS stitched futures), OWN (a real futures contract)
+    kind: SPOT (index/equity), CONT (FYERS stitched NEAR-month futures), CONT_NEXT (stitched
+    NEXT-month futures), OWN (a real futures contract, unadjusted).
+
+    FYERS stitches by the requested contract's position: requesting the nearest listed contract
+    yields the near-month series, requesting the second yields the next-month series (verified:
+    via DEC on 23-Nov the "continuous" bars matched the DEC/NOV next-month contracts exactly).
     """
     instrument: str
-    symbol: str
+    symbol: str          # symbol sent to FYERS
     kind: str
     resolutions: tuple = ("1", "D")
     contract_expiry: Optional[date] = None
+    underlying: Optional[str] = None
 
     @property
     def include_oi(self) -> bool:
-        return self.kind in ("CONT", "OWN")
+        return self.kind in ("CONT", "CONT_NEXT", "OWN")
 
     @property
     def continuous(self) -> bool:
-        # Continuous stitching only for CONT; OWN must be the contract's own unadjusted series.
-        return self.kind == "CONT"
+        # Stitching only for CONT series; OWN must be the contract's own unadjusted series.
+        return self.kind in ("CONT", "CONT_NEXT")
+
+    @property
+    def source(self) -> str:
+        return "SPOT" if self.kind == "SPOT" else self.kind
+
+    @property
+    def store_symbol(self) -> str:
+        """Stable storage key. Stitched series get a logical name so later refreshes (requested via
+        a different contract after rollover) update the same rows instead of duplicating history."""
+        if self.kind in ("CONT", "CONT_NEXT"):
+            pos = "NEAR" if self.kind == "CONT" else "NEXT"
+            return f"CONT:{self.underlying or self.instrument}:{pos}"
+        return self.symbol
 
 
 @dataclass
@@ -60,26 +81,50 @@ def date_chunks(start: date, end: date, days: int):
 
 class HistoryLoader:
     def __init__(self, rest_client, store: ResearchHistoryStore,
-                 is_trading_day: Optional[Callable[[date], bool]] = None) -> None:
+                 calendar: Optional[ExchangeCalendar] = None, sparse_tolerance: int = 5) -> None:
         self.rest_client = rest_client
         self.store = store
-        self.is_trading_day = is_trading_day or (lambda d: d.weekday() < 5)
+        self.calendar = calendar or ExchangeCalendar()
+        self.sparse_tolerance = sparse_tolerance
+
+    def is_trading_day(self, d: date) -> bool:
+        return self.calendar.is_trading_day(d)
 
     def _chunk_complete(self, spec: SeriesSpec, resolution: str, lo: date, hi: date) -> bool:
-        """Skip re-downloading a chunk whose first and last trading days are already stored."""
-        days = [lo + timedelta(days=i) for i in range((hi - lo).days + 1)]
-        tdays = [d for d in days if self.is_trading_day(d)]
+        """A chunk may be skipped only if EVERY trading day in it is complete.
+
+        Intraday: every minute the exchange calendar expects is stored (a real futures contract
+        may miss up to `sparse_tolerance` no-trade minutes). Daily: a bar exists for every trading
+        day. A real contract's chunk entirely before its first available bar is pre-listing
+        (FYERS serves contracts only from listing) and is not re-requested.
+        """
+        tdays = [d for d in (lo + timedelta(days=i) for i in range((hi - lo).days + 1)) if self.is_trading_day(d)]
         if not tdays:
             return True
-        source = "SPOT" if spec.kind == "SPOT" else spec.kind
-        return (self.store.has_day(spec.symbol, source, resolution, tdays[0])
-                and self.store.has_day(spec.symbol, source, resolution, tdays[-1]))
+        source = spec.source
+        sym = spec.store_symbol
+        if spec.kind == "OWN":
+            first = self.store.first_day(sym, source, resolution)
+            if first is None:
+                return False
+            if hi < first:
+                return True
+            tdays = [d for d in tdays if d >= first]
+        stored = self.store.minutes_by_day(sym, source, resolution, lo, hi)
+        if resolution == "D":
+            return all(d in stored for d in tdays)
+        allowed = self.sparse_tolerance if spec.kind in ("OWN", "CONT_NEXT") else 0
+        kind = kind_for(spec.kind)
+        for d in tdays:
+            missing = len(set(expected_minutes(self.calendar, d, kind)) - stored.get(d, set()))
+            if missing > allowed:
+                return False
+        return True
 
     def load(self, spec: SeriesSpec, start: date, end: date, resolution: str,
              resume: bool = True) -> LoadResult:
         res = LoadResult(spec=spec, resolution=resolution)
         span = DAILY_CHUNK_DAYS if resolution == "D" else INTRADAY_CHUNK_DAYS
-        source = "SPOT" if spec.kind == "SPOT" else spec.kind
         for lo, hi in date_chunks(start, end, span):
             # Always refresh the most recent chunk (today's bars may have been partial before).
             if resume and hi < end and self._chunk_complete(spec, resolution, lo, hi):
@@ -101,7 +146,8 @@ class HistoryLoader:
                 logger.warning("History load failed for %s %s %s..%s: %s", spec.symbol, resolution, lo, hi, e)
                 continue
             res.bars += self.store.upsert_bars(
-                spec.instrument, spec.symbol, source, resolution, candles, contract_expiry=spec.contract_expiry
+                spec.instrument, spec.store_symbol, spec.source, resolution, candles,
+                contract_expiry=spec.contract_expiry,
             )
         return res
 
@@ -114,8 +160,4 @@ class HistoryLoader:
                 results.append(r)
                 if progress:
                     progress(r)
-            if spec.kind == "CONT":
-                for resolution in spec.resolutions:
-                    if resolution != "D":
-                        self.store.assign_cont_segments(spec.instrument, resolution)
         return results

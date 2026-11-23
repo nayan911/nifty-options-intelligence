@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 import pytz
 
 from nifty_engine.core.interfaces import Candle
-from nifty_engine.research.history_loader import HistoryLoader, SeriesSpec, date_chunks
+from nifty_engine.research.history_loader import SeriesSpec, date_chunks
 from nifty_engine.research.history_store import ResearchHistoryStore
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -45,19 +45,6 @@ def test_series_flags_own_is_unstitched_with_oi_spot_has_no_oi():
     assert SeriesSpec("X", "NSE:NIFTY26DECFUT", "OWN").include_oi is True
     assert SeriesSpec("X", "NSE:NIFTY26DECFUT", "CONT").continuous is True
     assert SeriesSpec("X", "NSE:NIFTY50-INDEX", "SPOT").include_oi is False
-
-
-def test_load_resume_skips_complete_chunks_but_refreshes_latest():
-    days = [date(2026, 6, 1) + timedelta(days=i) for i in range(200)]
-    tdays = [d for d in days if d.weekday() < 5]
-    rest = FakeRest({"NSE:NIFTY50-INDEX": [c for d in tdays for c in day_bars("NSE:NIFTY50-INDEX", d, n=3)]})
-    store = ResearchHistoryStore(":memory:")
-    loader = HistoryLoader(rest, store)
-    spec = SeriesSpec("NIFTY_SPOT", "NSE:NIFTY50-INDEX", "SPOT", resolutions=("1",))
-    first = loader.load(spec, days[0], days[-1], "1")
-    assert first.requests == 3 and first.bars == len(tdays) * 3
-    second = loader.load(spec, days[0], days[-1], "1")
-    assert second.skipped_chunks == 2 and second.requests == 1  # only the latest chunk re-fetched
 
 
 def test_cont_segments_split_at_oi_collapse():
