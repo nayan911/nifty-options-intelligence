@@ -41,6 +41,7 @@ from nifty_engine.analysis.technical.support_resistance import (
 from nifty_engine.analysis.technical.swings import SwingDetector, SwingPoint
 from nifty_engine.core.calendar import get_bar_close_time
 from nifty_engine.core.interfaces import BreakoutState, Candle
+from nifty_engine.strategy.params import S000Params
 
 
 @dataclass
@@ -94,7 +95,10 @@ class SymbolTechnicalState:
         max_history_1m: int = 400,
         max_history_5m: int = 200,
         max_history_15m: int = 100,
+        params: Optional["S000Params"] = None,
     ):
+        p = params if params is not None else S000Params()
+        self.params = p
         self.symbol = symbol
         self.is_index = is_index
         self.max_history_1m = max_history_1m
@@ -107,30 +111,21 @@ class SymbolTechnicalState:
         self.candles_15m: Deque[Candle] = deque(maxlen=max_history_15m)
 
         # Structural swing detectors
-        self.swing_detector_1m = SwingDetector(timeframe="1m", left_bars=3, right_bars=3)
-        self.swing_detector_5m = SwingDetector(timeframe="5m", left_bars=3, right_bars=3)
-        self.swing_detector_15m = SwingDetector(timeframe="15m", left_bars=2, right_bars=2)
+        sw = p.swings
+        self.swing_detector_1m = SwingDetector(timeframe="1m", left_bars=sw.tf_1m.left_bars, right_bars=sw.tf_1m.right_bars)
+        self.swing_detector_5m = SwingDetector(timeframe="5m", left_bars=sw.tf_5m.left_bars, right_bars=sw.tf_5m.right_bars)
+        self.swing_detector_15m = SwingDetector(timeframe="15m", left_bars=sw.tf_15m.left_bars, right_bars=sw.tf_15m.right_bars)
 
         # Support & Resistance Engine
-        self.sr_engine = SupportResistanceEngine(zone_atr_multiple=0.15, min_zone_width_points=3.0)
+        self.sr_engine = SupportResistanceEngine(
+            zone_atr_multiple=p.levels.zone_atr_multiple, min_zone_width_points=p.levels.min_zone_width_points
+        )
 
         # Timeframe-isolated Breakout State Machines
         # 1-minute: fast momentum / micro breakouts (max 6 candles = 6m)
-        self.breakout_machine_1m = BreakoutStateMachine(
-            min_breakout_rvol=1.3,
-            min_body_atr_ratio=0.35,
-            approach_buffer_atr=0.25,
-            invalidation_buffer_atr=0.20,
-            max_retest_candles=6,
-        )
+        self.breakout_machine_1m = BreakoutStateMachine(invalidation_buffer_atr=0.20, **p.breakouts.tf_1m.model_dump())
         # 5-minute: primary setup detector (max 4 candles = 20m)
-        self.breakout_machine_5m = BreakoutStateMachine(
-            min_breakout_rvol=1.3,
-            min_body_atr_ratio=0.35,
-            approach_buffer_atr=0.25,
-            invalidation_buffer_atr=0.20,
-            max_retest_candles=4,
-        )
+        self.breakout_machine_5m = BreakoutStateMachine(invalidation_buffer_atr=0.20, **p.breakouts.tf_5m.model_dump())
 
         # Active breakout setups tracked per level_id (strictly separated by timeframe)
         self.active_breakouts_1m: Dict[str, BreakoutContext] = {}
@@ -1194,8 +1189,11 @@ class TechnicalAnalysisEngine:
         on_setup_candidate: Optional[Callable[[BreakoutContext, TechnicalSnapshot], None]] = None,
         on_technical_candidate: Optional[Callable[[Any], None]] = None,
         derivatives_engine: Optional[Any] = None,
+        params: Optional["S000Params"] = None,
     ):
         self._lock = threading.RLock()
+        # Strategy parameters (strategies/registry.yaml); defaults reproduce S000 exactly.
+        self.params = params if params is not None else S000Params()
         self.primary_index = primary_index
         self.primary_futures = primary_futures
         self.on_setup_candidate = on_setup_candidate
@@ -1209,6 +1207,7 @@ class TechnicalAnalysisEngine:
                 engine=self,
                 on_candidate=on_technical_candidate,
                 derivatives_engine=derivatives_engine,
+                params=self.params,
             )
 
         # Explicit Index-to-Futures Mapping (prevents NIFTY futures confirming BANKNIFTY)
@@ -1243,6 +1242,7 @@ class TechnicalAnalysisEngine:
                 engine=self,
                 on_candidate=callback,
                 derivatives_engine=self.derivatives_engine,
+                params=self.params,
             )
 
     def on_option_chain(self, snapshot: Any, as_of: Optional[datetime] = None) -> None:
@@ -1254,7 +1254,7 @@ class TechnicalAnalysisEngine:
 
     def _get_or_create_state(self, symbol: str, is_index: bool = False) -> SymbolTechnicalState:
         if symbol not in self.states:
-            self.states[symbol] = SymbolTechnicalState(symbol=symbol, is_index=is_index)
+            self.states[symbol] = SymbolTechnicalState(symbol=symbol, is_index=is_index, params=self.params)
         return self.states[symbol]
 
     def set_futures_ticker(self, futures_ticker: str) -> None:
@@ -1323,7 +1323,9 @@ class TechnicalAnalysisEngine:
         can never emit a signal or mutate shared derivatives state.
         """
         with self._lock:
-            shadow = TechnicalAnalysisEngine(primary_index=self.primary_index, primary_futures=self.primary_futures)
+            shadow = TechnicalAnalysisEngine(
+                primary_index=self.primary_index, primary_futures=self.primary_futures, params=self.params
+            )
             for idx, fut in self.index_futures_map.items():
                 shadow.set_index_futures_mapping(idx, fut)
             return shadow

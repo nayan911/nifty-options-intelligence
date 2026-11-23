@@ -41,6 +41,7 @@ from nifty_engine.data.historical_manager import HistoricalCandleManager
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.data.tick_normalizer import TickNormalizer, TickStatus
 from nifty_engine.paper_trading.engine import PaperTradingEngine
+from nifty_engine.strategy.registry import load_registry
 from nifty_engine.utils.timezone import now_ist
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -73,12 +74,18 @@ class MarketDataEngine:
             primary_futures="NSE:NIFTY26NOVFUT",
             contract_selector=self.contract_selector,
         )
+        # Strategy parameters come ONLY from the validated registry; an invalid registry stops
+        # startup (RegistryError) rather than trading with unintended parameters.
+        self.strategy = load_registry().get("S000")
+        logger.info("Strategy %s v%s (%s), params %s", self.strategy.id, self.strategy.version,
+                    self.strategy.status, self.strategy.params_hash())
         self.technical_engine = TechnicalAnalysisEngine(
             primary_index=settings.PRIMARY_INDEX,
             primary_futures="NSE:NIFTY26NOVFUT",
             on_setup_candidate=self._on_setup_candidate,
             on_technical_candidate=self._on_technical_candidate,
             derivatives_engine=self.derivatives_engine,
+            params=self.strategy.params,
         )
         self.paper_engine = PaperTradingEngine(
             store=self.store,

@@ -39,6 +39,8 @@ from nifty_engine.research.bars import (
 from nifty_engine.research.history_store import ResearchHistoryStore
 from nifty_engine.research.manifest import DEFAULT_MANIFEST, dataset_fingerprint, require_valid_manifest
 from nifty_engine.research.sessions import CASH, FNO
+from nifty_engine.strategy.params import S000Params
+from nifty_engine.strategy.registry import StrategyEntry, load_registry
 
 IST = pytz.timezone("Asia/Kolkata")
 SPOT = "NSE:NIFTY50-INDEX"
@@ -92,8 +94,14 @@ class ReplayDriver:
                  spot_instrument: str = "NIFTY_SPOT", fut_instrument: str = "NIFTY_FUT",
                  fut_store_symbol: str = "CONT:NIFTY:NEAR",
                  engine_factory: Optional[Callable[..., TechnicalAnalysisEngine]] = None,
-                 delivery_order: str = "tick") -> None:
+                 delivery_order: str = "tick", strategy: Optional[StrategyEntry] = None,
+                 params: Optional[S000Params] = None) -> None:
+        """strategy: registry entry to replay (default: S000 from strategies/registry.yaml).
+        params: optional override for research experiments; provenance flags it as an override."""
         self.research = research
+        self.strategy = strategy if strategy is not None else load_registry().get("S000")
+        self.params = params if params is not None else self.strategy.params
+        self.params_override = params is not None and params != self.strategy.params
         self.cal = calendar or ExchangeCalendar()
         self.spot_instrument = spot_instrument
         self.fut_instrument = fut_instrument
@@ -169,7 +177,7 @@ class ReplayDriver:
                 "decision_at": c.decision_at.isoformat() if c.decision_at else None}))
 
         engine = self.engine_factory(primary_index=SPOT, primary_futures=FUT, on_setup_candidate=on_setup,
-                                     on_technical_candidate=on_candidate)
+                                     on_technical_candidate=on_candidate, params=self.params)
         start_of_day = IST.localize(datetime.combine(d, time(9, 0)))
         with pinned_clock(start_of_day):
             hm = HistoricalCandleManager(rest_client=None, store=store, calendar=self.cal)
@@ -229,6 +237,13 @@ class ReplayDriver:
             "dataset_fingerprint": dataset_fingerprint(self.research),
             "git_commit": _git_commit(),
             "engine": "TechnicalAnalysisEngine (live code path)",
+            "strategy": {
+                **self.strategy.provenance(),
+                "params_override": self.params_override,
+                "effective_params_hash": hashlib.sha256(
+                    json.dumps(self.params.canonical(), sort_keys=True).encode()).hexdigest()[:16],
+                "delivery_order": self.delivery_order,
+            },
             "futures_series": self.fut_store_symbol,
             "range": [start.isoformat(), end.isoformat()],
             "generated_at": datetime.now().isoformat(timespec="seconds"),

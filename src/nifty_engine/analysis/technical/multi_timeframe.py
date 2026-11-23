@@ -41,6 +41,7 @@ from nifty_engine.analysis.technical.engine import (
 )
 from nifty_engine.analysis.technical.support_resistance import PriceZone
 from nifty_engine.core.interfaces import Candle
+from nifty_engine.strategy.params import S000Params
 
 
 class SetupLifecycleState(str, Enum):
@@ -120,26 +121,38 @@ class MultiTimeframeAnalyzer:
         self,
         engine: TechnicalAnalysisEngine,
         on_candidate: Optional[Callable[[TechnicalCandidate], None]] = None,
-        min_confluence_score: float = 60.0,
-        min_headroom_atr_multiple: float = 1.5,
-        min_risk_points: float = 8.0,
-        entry_window_minutes: int = 15,
-        max_1m_futures_age_seconds: float = 60.0,
-        max_5m_futures_age_seconds: float = 300.0,
-        max_15m_macro_age_seconds: float = 1200.0,
+        min_confluence_score: Optional[float] = None,
+        min_headroom_atr_multiple: Optional[float] = None,
+        min_risk_points: Optional[float] = None,
+        entry_window_minutes: Optional[int] = None,
+        max_1m_futures_age_seconds: Optional[float] = None,
+        max_5m_futures_age_seconds: Optional[float] = None,
+        max_15m_macro_age_seconds: Optional[float] = None,
         derivatives_engine: Optional[Any] = None,
+        params: Optional[S000Params] = None,
     ):
         self._lock = threading.RLock()
         self.engine = engine
         self.on_candidate = on_candidate
         self.derivatives_engine = derivatives_engine
-        self.min_confluence_score = min_confluence_score
-        self.min_headroom_atr_multiple = min_headroom_atr_multiple
-        self.min_risk_points = min_risk_points
-        self.entry_window_minutes = entry_window_minutes
-        self.max_1m_futures_age_seconds = max_1m_futures_age_seconds
-        self.max_5m_futures_age_seconds = max_5m_futures_age_seconds
-        self.max_15m_macro_age_seconds = max_15m_macro_age_seconds
+        # Strategy parameters (strategies/registry.yaml). Explicit keyword arguments override them
+        # (kept for existing callers/tests); defaults reproduce S000 exactly.
+        if params is None:
+            params = getattr(engine, "params", None)
+        p = params if isinstance(params, S000Params) else S000Params()
+        self.params = p
+
+        def pick(v, default):
+            return default if v is None else v
+
+        self.min_confluence_score = pick(min_confluence_score, p.scoring.min_score)
+        self.min_headroom_atr_multiple = pick(min_headroom_atr_multiple, p.qualification.min_headroom_atr_multiple)
+        self.min_headroom_points = p.qualification.min_headroom_points
+        self.min_risk_points = pick(min_risk_points, p.entry.min_risk_points)
+        self.entry_window_minutes = pick(entry_window_minutes, p.entry.entry_window_minutes)
+        self.max_1m_futures_age_seconds = pick(max_1m_futures_age_seconds, p.entry.max_1m_futures_age_seconds)
+        self.max_5m_futures_age_seconds = pick(max_5m_futures_age_seconds, p.qualification.max_5m_futures_age_seconds)
+        self.max_15m_macro_age_seconds = pick(max_15m_macro_age_seconds, p.qualification.max_15m_macro_age_seconds)
 
         # In-flight setups waiting for 1m entry timing: {setup_id: Active5mSetup}
         self.active_setups: Dict[str, Active5mSetup] = {}
@@ -263,7 +276,10 @@ class MultiTimeframeAnalyzer:
 
         # 3. Tier 1 Headroom to Opposing 15m S/R Obstacles
         atr_5m = snap_5m.atr
-        min_headroom = max(self.min_headroom_atr_multiple * atr_5m, 25.0) if atr_5m is not None else 25.0
+        min_headroom = (
+            max(self.min_headroom_atr_multiple * atr_5m, self.min_headroom_points)
+            if atr_5m is not None else self.min_headroom_points
+        )
 
         opposing_zone: Optional[PriceZone] = None
         headroom_points: Optional[float] = None
@@ -444,7 +460,9 @@ class MultiTimeframeAnalyzer:
 
         # 1. Intrabar & Close Stop-Loss Breach Check: hard invalidation boundary
         base_sl = setup.stop_loss if setup.stop_loss is not None else (
-            nominal_lvl - 25.0 if setup.direction == BreakoutDirection.BULLISH else nominal_lvl + 25.0
+            nominal_lvl - self.params.entry.fallback_stop_points
+            if setup.direction == BreakoutDirection.BULLISH
+            else nominal_lvl + self.params.entry.fallback_stop_points
         )
         if setup.direction == BreakoutDirection.BULLISH:
             if candle.low <= base_sl or candle.close <= base_sl:
@@ -505,7 +523,7 @@ class MultiTimeframeAnalyzer:
                 return None
 
             # Overbought RSI exhaustion filter
-            if snap_1m.rsi is not None and snap_1m.rsi > 75.0:
+            if snap_1m.rsi is not None and snap_1m.rsi > self.params.entry.rsi_overbought:
                 return None
         else:
             # Bearish candle momentum: red candle OR confirmed below EMA 9
@@ -522,7 +540,7 @@ class MultiTimeframeAnalyzer:
                 return None
 
             # Oversold RSI exhaustion filter
-            if snap_1m.rsi is not None and snap_1m.rsi < 25.0:
+            if snap_1m.rsi is not None and snap_1m.rsi < self.params.entry.rsi_oversold:
                 return None
 
         # 5. Stop-Loss Optimization using 1m Micro-Structure
@@ -555,15 +573,17 @@ class MultiTimeframeAnalyzer:
                 risk_points = self.min_risk_points
 
         # 6. Targets & Realized Headroom Validation (Target 1 check + Target 2 capping)
+        t1_mult = self.params.targets.target_1_rr
+        t2_mult = self.params.targets.target_2_rr
         nominal_target_1 = (
-            round(entry_price + 1.5 * risk_points, 1)
+            round(entry_price + t1_mult * risk_points, 1)
             if setup.direction == BreakoutDirection.BULLISH
-            else round(entry_price - 1.5 * risk_points, 1)
+            else round(entry_price - t1_mult * risk_points, 1)
         )
         nominal_target_2 = (
-            round(entry_price + 2.0 * risk_points, 1)
+            round(entry_price + t2_mult * risk_points, 1)
             if setup.direction == BreakoutDirection.BULLISH
-            else round(entry_price - 2.0 * risk_points, 1)
+            else round(entry_price - t2_mult * risk_points, 1)
         )
 
         target_1 = nominal_target_1
@@ -575,7 +595,7 @@ class MultiTimeframeAnalyzer:
                 barrier_price = snap_15m.nearest_resistance.lower_bound
                 live_headroom = max(0.0, barrier_price - entry_price)
                 # Opposing 15m barrier must not block Target 1 (1.5R)
-                if live_headroom < 1.5 * risk_points:
+                if live_headroom < t1_mult * risk_points:
                     return None
                 # Cap Target 2 at the barrier price if nominal 2.0R extends past it
                 if nominal_target_2 > barrier_price:
@@ -586,7 +606,7 @@ class MultiTimeframeAnalyzer:
                 barrier_price = snap_15m.nearest_support.upper_bound
                 live_headroom = max(0.0, entry_price - barrier_price)
                 # Opposing 15m barrier must not block Target 1 (1.5R)
-                if live_headroom < 1.5 * risk_points:
+                if live_headroom < t1_mult * risk_points:
                     return None
                 # Cap Target 2 at the barrier price if nominal 2.0R extends past it
                 if nominal_target_2 < barrier_price:
@@ -714,6 +734,7 @@ class MultiTimeframeAnalyzer:
 
         Strict zero-tolerance scoring: Missing or unknown data receives 0 points.
         """
+        sc = self.params.scoring
         score = 0.0
         decision_time = as_of or entry_time or snap_1m.effective_available_at
 
@@ -721,46 +742,44 @@ class MultiTimeframeAnalyzer:
         if snap_15m and snap_15m.trend_bias != "INSUFFICIENT_DATA":
             if direction == BreakoutDirection.BULLISH:
                 if snap_15m.trend_bias == "BULLISH":
-                    score += 30.0 if not snap_15m.is_provisional else 20.0
+                    score += sc.trend_aligned if not snap_15m.is_provisional else sc.trend_aligned_provisional
                 elif snap_15m.trend_bias == "SIDEWAYS":
-                    score += 15.0
+                    score += sc.trend_sideways
             elif direction == BreakoutDirection.BEARISH:
                 if snap_15m.trend_bias == "BEARISH":
-                    score += 30.0 if not snap_15m.is_provisional else 20.0
+                    score += sc.trend_aligned if not snap_15m.is_provisional else sc.trend_aligned_provisional
                 elif snap_15m.trend_bias == "SIDEWAYS":
-                    score += 15.0
+                    score += sc.trend_sideways
 
         # 2. 5m Volume Surge (max +25 pts, missing/sub-threshold = +0 pts)
         rvol = max(
             setup.breakout_rvol if setup.breakout_rvol is not None else 0.0,
             snap_5m.rvol if snap_5m.rvol is not None else 0.0,
         )
-        if rvol >= 2.0:
-            score += 25.0
-        elif rvol >= 1.5:
-            score += 20.0
-        elif rvol >= 1.3:
-            score += 15.0
+        for min_rvol, pts in sc.rvol_tiers:
+            if rvol >= min_rvol:
+                score += pts
+                break
 
         # 3. VWAP Positioning (max +20 pts, missing = +0 pts)
         if self._evaluate_vwap_alignment(snap_5m, direction, "5m", as_of=snap_5m.effective_available_at, confirmation_status=confirmation_status):
-            score += 10.0
+            score += sc.vwap_5m
         if self._evaluate_vwap_alignment(snap_1m, direction, "1m", as_of=decision_time, confirmation_status=confirmation_status):
-            score += 10.0
+            score += sc.vwap_1m
 
         # 4. 15m Headroom (max +15 pts, unknown/missing ATR/inadequate = +0 pts)
         if headroom_points is not None and snap_5m.atr is not None:
-            if headroom_points >= 2.0 * snap_5m.atr:
-                score += 15.0
-            elif headroom_points >= 1.5 * snap_5m.atr:
-                score += 10.0
+            for min_atr, pts in sc.headroom_tiers:
+                if headroom_points >= min_atr * snap_5m.atr:
+                    score += pts
+                    break
 
         # 5. 1m Momentum Sweet-Spot (max +10 pts, missing/outside = +0 pts)
         rsi = snap_1m.rsi
         if rsi is not None:
-            if direction == BreakoutDirection.BULLISH and 50.0 <= rsi <= 68.0:
-                score += 10.0
-            elif direction == BreakoutDirection.BEARISH and 32.0 <= rsi <= 50.0:
-                score += 10.0
+            if direction == BreakoutDirection.BULLISH and sc.rsi_bull_range[0] <= rsi <= sc.rsi_bull_range[1]:
+                score += sc.rsi_points
+            elif direction == BreakoutDirection.BEARISH and sc.rsi_bear_range[0] <= rsi <= sc.rsi_bear_range[1]:
+                score += sc.rsi_points
 
         return min(100.0, score)

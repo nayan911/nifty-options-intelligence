@@ -69,7 +69,15 @@ class BreakoutStateMachine:
         approach_buffer_atr: float = 0.25,
         invalidation_buffer_atr: float = 0.20,
         max_retest_candles: int = 6,
+        min_approach_points: float = 4.0,
+        stop_buffer_atr: float = 0.1,
+        min_setup_risk_points: float = 10.0,
+        setup_target_rr: float = 1.5,
     ):
+        self.min_approach_points = min_approach_points
+        self.stop_buffer_atr = stop_buffer_atr
+        self.min_setup_risk_points = min_setup_risk_points
+        self.setup_target_rr = setup_target_rr
         self.min_breakout_rvol = min_breakout_rvol
         self.min_body_atr_ratio = min_body_atr_ratio
         self.approach_buffer_atr = approach_buffer_atr
@@ -123,7 +131,7 @@ class BreakoutStateMachine:
             return context
 
         effective_atr = atr_value if atr_value is not None and atr_value > 0.0 else max(zone.upper_bound - zone.nominal_price, 5.0)
-        approach_dist = max(self.approach_buffer_atr * effective_atr, 4.0)
+        approach_dist = max(self.approach_buffer_atr * effective_atr, self.min_approach_points)
         effective_rvol = futures_rvol if futures_rvol is not None else 1.0
 
         state = context.current_state
@@ -210,9 +218,9 @@ class BreakoutStateMachine:
                     if candle.close >= zone.nominal_price and candle.close > candle.open:
                         context.retest_time = candle.timestamp
                         context.retest_candle_index = candle_index
-                        context.stop_loss = round(candle.low - (0.1 * effective_atr), 2)
-                        risk = max(candle.close - context.stop_loss, 10.0)
-                        context.target_price = round(candle.close + (1.5 * risk), 2)
+                        context.stop_loss = round(candle.low - (self.stop_buffer_atr * effective_atr), 2)
+                        risk = max(candle.close - context.stop_loss, self.min_setup_risk_points)
+                        context.target_price = round(candle.close + (self.setup_target_rr * risk), 2)
 
                         context.transition_to(
                             BreakoutState.RETEST_CONFIRMED,
@@ -254,9 +262,9 @@ class BreakoutStateMachine:
                     if candle.close <= zone.nominal_price and candle.close < candle.open:
                         context.retest_time = candle.timestamp
                         context.retest_candle_index = candle_index
-                        context.stop_loss = round(candle.high + (0.1 * effective_atr), 2)
-                        risk = max(context.stop_loss - candle.close, 10.0)
-                        context.target_price = round(candle.close - (1.5 * risk), 2)
+                        context.stop_loss = round(candle.high + (self.stop_buffer_atr * effective_atr), 2)
+                        risk = max(context.stop_loss - candle.close, self.min_setup_risk_points)
+                        context.target_price = round(candle.close - (self.setup_target_rr * risk), 2)
 
                         context.transition_to(
                             BreakoutState.RETEST_CONFIRMED,
