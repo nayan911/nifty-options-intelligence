@@ -1316,6 +1316,24 @@ class TechnicalAnalysisEngine:
                     state.latest_candle_timestamps.clear()
                     state._pending_breakout_eval.clear()
 
+    def reset_symbols(self, symbols: List[str]) -> None:
+        """Discard all technical state for `symbols` so it can be rebuilt from verified bars.
+
+        Used after a feed gap: a partially observed bar may already be baked into EMAs,
+        ATR, VWAP, swings and breakout machines, and appending corrected bars cannot undo
+        that. In-flight multi-timeframe setups are dropped too, since they were formed on
+        the broken series.
+        """
+        with self._lock:
+            for sym in symbols:
+                old = self.states.get(sym)
+                is_index = old.is_index if old is not None else ("INDEX" in sym)
+                self.states[sym] = SymbolTechnicalState(symbol=sym, is_index=is_index)
+                self._pending_1m_entry.pop(sym, None)
+            if self.multi_timeframe_analyzer is not None:
+                self.multi_timeframe_analyzer.active_setups.clear()
+                self.multi_timeframe_analyzer._pending_5m_setups.clear()
+
     def bootstrap_candles(self, candles: List[Candle]) -> int:
         """Bootstraps technical indicators, moving averages, and swings with historical candles.
 

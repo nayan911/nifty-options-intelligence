@@ -39,6 +39,10 @@ class DuckDBStore(IStorageEngine):
         self._tick_buffer: List[Tick] = []
         self._lock = threading.Lock()
         self._conn = duckdb.connect(self.db_path)
+        # TIMESTAMPTZ values come back in the session time zone, which defaults to the
+        # host's. Pin it to IST so session logic (e.g. `ts.time() == 09:15` for the opening
+        # candle / CDO / opening range) is correct on any machine, including UTC CI runners.
+        self._conn.execute("SET GLOBAL TimeZone = 'Asia/Kolkata'")
         self._init_schemas()
 
     def _get_cursor(self) -> duckdb.DuckDBPyConnection:

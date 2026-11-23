@@ -405,6 +405,16 @@ class FyersRestClient:
             for s, data in sorted(strike_map.items())
         ]
 
+        window_call_oi, window_put_oi = total_call_oi, total_put_oi
+        # Prefer FYERS' expiry-wide totals (verified per-expiry: they change with the
+        # requested expiry) so PCR doesn't drift as ATM shifts the strike window.
+        try:
+            exp_call_oi = int(chain_data.get("callOi") or 0)
+            exp_put_oi = int(chain_data.get("putOi") or 0)
+        except (TypeError, ValueError):
+            exp_call_oi = exp_put_oi = 0
+        if exp_call_oi > 0 and exp_put_oi > 0:
+            total_call_oi, total_put_oi = exp_call_oi, exp_put_oi
         pcr = round(total_put_oi / total_call_oi, 3) if total_call_oi > 0 else 0.0
 
         sym_upper = underlying_symbol.upper()
@@ -432,6 +442,8 @@ class FyersRestClient:
             total_call_oi=total_call_oi,
             total_put_oi=total_put_oi,
             pcr=pcr,
+            window_call_oi=window_call_oi,
+            window_put_oi=window_put_oi,
             is_synchronized_snapshot=is_synced,
         )
 

@@ -286,6 +286,7 @@ def test_market_data_engine_two_way_readiness_monitoring(monkeypatch):
     # WebSocket connected and feed fresh, but 1m indicators still cold -> DEGRADED
     engine.ws_client._is_connected = True
     engine.last_primary_tick_time = t_now
+    engine.last_signal_tick_times = {sym_idx: t_now, sym_fut: t_now}
 
     r2 = engine.evaluate_and_update_readiness()
     assert r2 == SystemReadiness.DEGRADED
@@ -318,9 +319,18 @@ def test_market_data_engine_two_way_readiness_monitoring(monkeypatch):
     t_recovered = t_now + timedelta(seconds=135)
     monkeypatch.setattr("run_market_data.now_ist", lambda: t_recovered)
     engine.last_primary_tick_time = t_recovered
+    engine.last_signal_tick_times = {sym_idx: t_recovered, sym_fut: t_recovered}
     r6 = engine.evaluate_and_update_readiness()
     assert r6 == SystemReadiness.READY
     assert engine.paper_engine.system_readiness == SystemReadiness.READY
+
+    # 8b. Futures-only stall: spot keeps ticking, futures silent 130s -> NOT_READY
+    t_fut_stall = t_recovered + timedelta(seconds=130)
+    monkeypatch.setattr("run_market_data.now_ist", lambda: t_fut_stall)
+    engine.last_signal_tick_times = {sym_idx: t_fut_stall, sym_fut: t_recovered}
+    assert engine.evaluate_and_update_readiness() == SystemReadiness.NOT_READY
+    engine.last_signal_tick_times = {sym_idx: t_fut_stall, sym_fut: t_fut_stall}
+    assert engine.evaluate_and_update_readiness() == SystemReadiness.READY
 
     # 9. Safety Downgrade: WebSocket disconnection -> DOWNGRADE to NOT_READY
     engine.ws_client._is_connected = False
@@ -487,7 +497,7 @@ def test_open_feed_gap_holds_signal_candles_and_forces_not_ready(monkeypatch):
     engine.technical_engine.on_candle = lambda c, **kw: seen.append(c.symbol)
 
     ts = IST.localize(datetime(2026, 11, 23, 13, 45, 0))
-    engine.gap_backfiller.gap_started_at = ts - timedelta(minutes=5)
+    engine.gap_backfiller.state = engine.gap_backfiller.GAP_OPEN
 
     engine._on_candle_closed(
         Candle(symbol="NSE:NIFTY50-INDEX", timeframe="1m", timestamp=ts,

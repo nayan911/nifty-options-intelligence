@@ -116,9 +116,14 @@ class OptionChainSnapshot(BaseModel):
     last_oi_change_timestamp: Optional[datetime] = Field(default=None, description="Last time strike OI values changed")
     expiry: date
     strikes: List[OptionChainStrike]
+    # Expiry-wide totals as reported by FYERS (callOi/putOi); fall back to the polled
+    # strike window when the broker omits them. Window-only PCR shifts whenever ATM
+    # moves the strike window, so it is kept separately and labelled as such.
     total_call_oi: int = 0
     total_put_oi: int = 0
     pcr: float = 0.0
+    window_call_oi: int = 0
+    window_put_oi: int = 0
     is_synchronized_snapshot: bool = Field(default=False, description="True if broker API guarantees synchronized quotes and Greeks in this snapshot")
 
 

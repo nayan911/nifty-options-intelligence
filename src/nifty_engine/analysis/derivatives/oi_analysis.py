@@ -144,9 +144,17 @@ class OIProfile:
     # Near-ATM flow summary (changes are vs the previous snapshot of the same expiry)
     atm_strike: Optional[float] = None
     atm_iv: Optional[float] = None  # avg of ATM CE/PE IV as reported by broker (percent)
-    atm_iv_change: Optional[float] = None  # IV points vs previous snapshot
-    near_atm_call_oi_change: int = 0  # >0: call writing near ATM (resistance building)
-    near_atm_put_oi_change: int = 0  # >0: put writing near ATM (support building)
+    # IV change measured at the PREVIOUS snapshot's ATM strike (same-strike comparison,
+    # so smile differences aren't reported as IV moves). May differ from atm_strike.
+    atm_iv_change: Optional[float] = None
+    atm_iv_change_strike: Optional[float] = None
+    # Net OI change summed over near-ATM strikes. OI change alone does NOT prove writing
+    # or buying; see the price+OI buildup classification below for positioning evidence.
+    near_atm_call_oi_change: int = 0
+    near_atm_put_oi_change: int = 0
+    # Dominant non-neutral price+OI buildup among near-ATM strikes, e.g. ("SHORT_BUILDUP", 3)
+    near_atm_call_buildup: Optional[Tuple[str, int]] = None
+    near_atm_put_buildup: Optional[Tuple[str, int]] = None
 
 
 class OpenInterestAnalyzer:
@@ -672,6 +680,7 @@ class OpenInterestAnalyzer:
         atm_strike: Optional[float] = None
         atm_iv: Optional[float] = None
         atm_iv_change: Optional[float] = None
+        atm_iv_change_strike: Optional[float] = None
         if sorted_strikes:
             atm_strike = min(sorted_strikes, key=lambda k: abs(k - snapshot.spot_price))
             atm = strikes_analysis[atm_strike]
@@ -685,8 +694,22 @@ class OpenInterestAnalyzer:
                 ref_ivs = [v for v in (ref.call_iv, ref.put_iv) if v is not None and v > 0]
                 if ref_ivs:
                     atm_iv_change = round(sum(ref_ivs) / len(ref_ivs) - prev_profile.atm_iv, 2)
+                    atm_iv_change_strike = prev_profile.atm_strike
         near_call_chg = sum(s.call_oi_change for s in near_atm)
         near_put_chg = sum(s.put_oi_change for s in near_atm)
+
+        def _dominant(buildups: List[BuildupType]) -> Optional[Tuple[str, int]]:
+            counts: Dict[str, int] = {}
+            for b in buildups:
+                if b != BuildupType.NEUTRAL:
+                    counts[b.value] = counts.get(b.value, 0) + 1
+            if not counts:
+                return None
+            top = max(counts, key=counts.get)
+            return (top, counts[top])
+
+        near_call_buildup = _dominant([s.call_buildup for s in near_atm])
+        near_put_buildup = _dominant([s.put_buildup for s in near_atm])
 
         profile = OIProfile(
             underlying=underlying,
@@ -707,8 +730,11 @@ class OpenInterestAnalyzer:
             atm_strike=atm_strike,
             atm_iv=atm_iv,
             atm_iv_change=atm_iv_change,
+            atm_iv_change_strike=atm_iv_change_strike,
             near_atm_call_oi_change=near_call_chg,
             near_atm_put_oi_change=near_put_chg,
+            near_atm_call_buildup=near_call_buildup,
+            near_atm_put_buildup=near_put_buildup,
         )
         self._profile_history[key].append(profile)
         self.latest_profiles[key] = profile

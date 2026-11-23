@@ -109,6 +109,9 @@ class MarketDataEngine:
 
         # Telemetry: Feed Age vs Exchange Network Latency
         self.last_primary_tick_time: Optional[datetime] = None
+        # Independent freshness per signal instrument (spot AND futures): either one going
+        # stale opens a feed gap and blocks entries.
+        self.last_signal_tick_times: Dict[str, datetime] = {}
         self.last_primary_network_latency: Optional[float] = None
 
         # Scheduled Option Chain Snapshot Collection & Failure Backoff
@@ -234,6 +237,8 @@ class MarketDataEngine:
         self.ticks_persisted += 1
 
         # 2. Track NIFTY spot price and telemetry
+        if tick.symbol in self._signal_symbols():
+            self.last_signal_tick_times[tick.symbol] = now_ist()
         if tick.symbol == settings.PRIMARY_INDEX:
             self.current_spot_price = tick.ltp
             self.last_primary_tick_time = now_ist()
@@ -296,6 +301,18 @@ class MarketDataEngine:
         """Instruments allowed to drive direction/setup detection (NIFTY spot + futures only)."""
         return {settings.PRIMARY_INDEX, self.technical_engine.primary_futures}
 
+    def _signal_tick_times(self) -> Dict[str, Optional[datetime]]:
+        return {s: self.last_signal_tick_times.get(s) for s in self._signal_symbols()}
+
+    def _worst_signal_feed_age(self) -> "tuple[Optional[str], Optional[float]]":
+        """Stalest signal instrument and its feed age in seconds (None if none seen yet)."""
+        now = now_ist()
+        ages = {s: (now - t).total_seconds() for s, t in self._signal_tick_times().items() if t is not None}
+        if not ages:
+            return None, None
+        sym = max(ages, key=ages.get)
+        return sym, ages[sym]
+
     def _log_readiness_override(self, reason: str) -> None:
         """Log a readiness override once per distinct reason instead of on every evaluation."""
         if reason != self._last_readiness_override:
@@ -334,15 +351,15 @@ class MarketDataEngine:
             elif not getattr(self.ws_client, "is_connected", False):
                 effective_readiness = SystemReadiness.NOT_READY
                 override_reason = "WebSocket disconnected during live market -> NOT_READY"
-            elif self.last_primary_tick_time is not None:
-                feed_age = (now_ist() - self.last_primary_tick_time).total_seconds()
-                if feed_age > 120.0:
+            else:
+                worst_sym, feed_age = self._worst_signal_feed_age()
+                if feed_age is not None and feed_age > 120.0:
                     effective_readiness = SystemReadiness.NOT_READY
-                    override_reason = "Primary feed stale > 120s -> NOT_READY"
-                elif feed_age > 60.0:
+                    override_reason = f"{worst_sym} feed stale > 120s -> NOT_READY"
+                elif feed_age is not None and feed_age > 60.0:
                     if effective_readiness == SystemReadiness.READY:
                         effective_readiness = SystemReadiness.DEGRADED
-                        override_reason = "Primary feed stale > 60s -> DEGRADED"
+                        override_reason = f"{worst_sym} feed stale > 60s -> DEGRADED"
         if override_reason:
             self._log_readiness_override(override_reason)
         elif self._last_readiness_override is not None:
@@ -699,20 +716,27 @@ class MarketDataEngine:
         except Exception:
             profile = None
 
-        line = f"[OI FLOW] Exp {chain.expiry} | PCR {chain.pcr:.3f}"
+        window_pcr = (
+            f"{chain.window_put_oi / chain.window_call_oi:.3f}" if getattr(chain, "window_call_oi", 0) else "-"
+        )
+        line = f"[OI FLOW] Exp {chain.expiry} | PCR expiry {chain.pcr:.3f} (window {window_pcr})"
         if profile is not None:
             mp = f"{profile.max_pain_strike:.0f}" if profile.max_pain_strike else "-"
             line += (
-                f" | Call wall {profile.call_wall_strike:.0f} | Put wall {profile.put_wall_strike:.0f} | MaxPain {mp}"
+                f" | Call wall {profile.call_wall_strike:.0f} | Put wall {profile.put_wall_strike:.0f} | MaxPain(window) {mp}"
             )
             if profile.atm_iv is not None:
-                chg = f" ({profile.atm_iv_change:+.2f})" if profile.atm_iv_change is not None else ""
-                line += f" | ATM {profile.atm_strike:.0f} IV {profile.atm_iv:.2f}{chg}"
+                line += f" | IV@{profile.atm_strike:.0f}(ATM) {profile.atm_iv:.2f}"
+                if profile.atm_iv_change is not None:
+                    line += f" | dIV@{profile.atm_iv_change_strike:.0f}(prev ATM) {profile.atm_iv_change:+.2f}"
             if profile.observation_interval_seconds > 0:
+                def _bu(b):
+                    return f" [{b[0]} x{b[1]}]" if b else ""
                 line += (
-                    f" | Near-ATM dOI {profile.observation_interval_seconds:.0f}s: "
-                    f"CE {profile.near_atm_call_oi_change:+,} / PE {profile.near_atm_put_oi_change:+,}"
-                    f" | Bias {profile.aggregate_bias.value}"
+                    f" | Near-ATM OI chg {profile.observation_interval_seconds:.0f}s: "
+                    f"CE {profile.near_atm_call_oi_change:+,}{_bu(profile.near_atm_call_buildup)} / "
+                    f"PE {profile.near_atm_put_oi_change:+,}{_bu(profile.near_atm_put_buildup)}"
+                    f" | Price+OI bias {profile.aggregate_bias.value}"
                 )
         print(line)
 
@@ -823,7 +847,7 @@ class MarketDataEngine:
                     if action:
                         print(f"[WS WATCHDOG] {action}")
 
-                gap_msg = self.gap_backfiller.observe(current_ist, self.last_primary_tick_time, cash_live)
+                gap_msg = self.gap_backfiller.observe(current_ist, self._signal_tick_times(), cash_live)
                 if gap_msg:
                     print(f"[FEED GAP] {gap_msg}")
 
@@ -858,9 +882,11 @@ class MarketDataEngine:
                 net_latency = self.last_primary_network_latency
 
                 feed_age_str = f"{feed_age:.2f}s" if feed_age is not None else "N/A"
+                fut_ts = self.last_signal_tick_times.get(self.technical_engine.primary_futures)
+                feed_age_str += f" | FUT Feed Age: {(now - fut_ts).total_seconds():.2f}s" if fut_ts else " | FUT Feed Age: N/A"
                 net_lat_str = f"{net_latency:.3f}s" if net_latency is not None else "N/A"
 
-                pcr_str = f" | PCR: {self.latest_option_chain_pcr:.3f}" if self.latest_option_chain_pcr is not None else ""
+                pcr_str = f" | PCR(expiry): {self.latest_option_chain_pcr:.3f}" if self.latest_option_chain_pcr is not None else ""
                 api = self.rate_limiter.get_status()
                 pcr_str += f" | API: {api['daily_requests_used']}/{self.rate_limiter.max_daily_requests}"
                 if api["rate_limit_hits_today"]:

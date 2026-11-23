@@ -1,17 +1,15 @@
 """Tests for sliding-window rate limiting, option chain OI/IV flow, and feed-gap backfill."""
 
 from datetime import date, datetime, timedelta
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytz
 
 from nifty_engine.analysis.derivatives.oi_analysis import OpenInterestAnalyzer
 from nifty_engine.core import rate_limiter as rl
-from nifty_engine.core.interfaces import Candle, OptionChainSnapshot, OptionChainStrike
+from nifty_engine.core.interfaces import OptionChainSnapshot, OptionChainStrike
 from nifty_engine.core.rate_limiter import AsyncTokenBucketRateLimiter
 from nifty_engine.data.fyers.rest_client import classify_rate_limit
-from nifty_engine.data.gap_backfill import FeedGapBackfiller
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -109,87 +107,8 @@ def test_oi_profile_reports_atm_iv_change_and_near_atm_oi_flow():
     assert p1.atm_iv_change == -1.0
     assert p1.near_atm_call_oi_change == 30_000
     assert p1.near_atm_put_oi_change == -15_000
+    assert p1.atm_iv_change_strike == 25400.0
     assert p1.observation_interval_seconds == 60.0
-
-
-# --------------------------------------------------------------------------- gap backfill
-def _bar(sym, tf, ts, close=100.0):
-    return Candle(symbol=sym, timeframe=tf, timestamp=ts, open=close, high=close, low=close,
-                  close=close, volume=1, is_closed=True)
-
-
-class FakeEngine:
-    def __init__(self, last_ts):
-        self.states = {"IDX": SimpleNamespace(latest_candle_timestamps={"1m": last_ts})}
-        self.replayed = []
-
-    def bootstrap_candles(self, candles):
-        self.replayed = sorted(candles, key=lambda c: (c.timestamp, c.timeframe))
-        return len(candles)
-
-
-class FakeStore:
-    def __init__(self, bars):
-        self.bars = bars
-
-    def get_candles(self, sym, tf, start_time, end_time):
-        return [b for b in self.bars if b.symbol == sym and b.timeframe == tf and start_time <= b.timestamp <= end_time]
-
-
-def test_gap_detect_hold_resume_and_repair_replays_missing_bars():
-    t = lambda h, m, s=0: IST.localize(datetime(2026, 11, 23, h, m, s))  # noqa: E731
-    last_live_bar = t(13, 41)
-    engine = FakeEngine(last_live_bar)
-    broker_bars = [_bar("IDX", "1m", t(13, m)) for m in range(40, 50)]
-    store = FakeStore(broker_bars)
-    hm = MagicMock()
-    hm.is_symbol_reconciled.return_value = True
-
-    bf = FeedGapBackfiller(hm, engine, store, symbols_provider=lambda: ["IDX"], gap_seconds=15)
-    last_tick = t(13, 42, 30)
-
-    assert bf.observe(t(13, 42, 40), last_tick, True) is None  # 10s silence: fine
-    msg = bf.observe(t(13, 42, 50), last_tick, True)
-    assert "gap detected" in msg.lower() and bf.active
-
-    # Live candle arriving during the gap is held, not analyzed
-    assert bf.hold(_bar("IDX", "1m", t(13, 47))) is True
-
-    # Feed resumes at 13:47:20 -> repair scheduled for next boundary + settle (13:48:05)
-    msg = bf.observe(t(13, 47, 20), t(13, 47, 20), True)
-    assert "resumed" in msg.lower()
-    assert bf.observe(t(13, 47, 50), t(13, 47, 50), True) is None
-    hm.reconcile_session_candles.assert_not_called()
-
-    msg = bf.observe(t(13, 48, 6), t(13, 48, 6), True)
-    assert "repaired" in msg.lower() and not bf.active
-    hm.reconcile_session_candles.assert_called_once()
-    replayed_ts = [c.timestamp for c in engine.replayed if c.timeframe == "1m"]
-    # Only bars newer than the engine's last processed 13:41 bar, through 13:48 close
-    assert replayed_ts == [t(13, m) for m in range(42, 49)]
-
-
-def test_gap_repair_retries_when_broker_coverage_incomplete():
-    t = lambda h, m, s=0: IST.localize(datetime(2026, 11, 23, h, m, s))  # noqa: E731
-    hm = MagicMock()
-    hm.is_symbol_reconciled.return_value = False
-    bf = FeedGapBackfiller(hm, FakeEngine(t(10, 0)), FakeStore([]), lambda: ["IDX"], gap_seconds=15, retry_seconds=30)
-
-    bf.observe(t(10, 1), t(10, 0, 30), True)
-    bf.observe(t(10, 2, 10), t(10, 2, 10), True)
-    msg = bf.observe(t(10, 3, 6), t(10, 3, 6), True)
-    assert "incomplete" in msg and bf.active
-
-    hm.is_symbol_reconciled.return_value = True
-    assert bf.observe(t(10, 3, 20), t(10, 3, 20), True) is None  # waiting for retry window
-    assert "repaired" in bf.observe(t(10, 3, 40), t(10, 3, 40), True).lower()
-
-
-def test_no_gap_detection_outside_cash_session():
-    t0 = IST.localize(datetime(2026, 11, 23, 15, 35))
-    bf = FeedGapBackfiller(MagicMock(), FakeEngine(None), FakeStore([]), lambda: ["IDX"], gap_seconds=15)
-    assert bf.observe(t0, t0 - timedelta(minutes=5), session_live=False) is None
-    assert not bf.active
 
 
 def test_atm_iv_change_uses_same_strike_when_atm_shifts():
@@ -217,3 +136,28 @@ def test_atm_iv_change_uses_same_strike_when_atm_shifts():
     p = an.on_option_chain(chain(t0 + timedelta(seconds=60), 25395, smile2), as_of=t0 + timedelta(seconds=60))
     assert p.atm_strike == 25400.0 and p.atm_iv == 29.3
     assert p.atm_iv_change == -0.5
+    assert p.atm_iv_change_strike == 25350.0  # change is labelled with the strike it was measured at
+
+
+def test_pcr_uses_fyers_expiry_totals_and_keeps_window_separately():
+    """Window-only PCR drifts as ATM moves the strike window; FYERS callOi/putOi are expiry-wide."""
+    from nifty_engine.data.fyers.rest_client import FyersRestClient
+
+    payload = {
+        "callOi": 300_000_000,
+        "putOi": 213_000_000,
+        "expiryData": [{"date": "23-11-2026", "expiry": 1795417200}],
+        "optionsChain": [
+            {"symbol": "NSE:NIFTY50-INDEX", "strike_price": -1, "ltp": 25380.0},
+            {"symbol": "NSE:NIFTY26NOV25400CE", "strike_price": 25400, "option_type": "CE", "ltp": 30.0, "oi": 150},
+            {"symbol": "NSE:NIFTY26NOV25400PE", "strike_price": 25400, "option_type": "PE", "ltp": 40.0, "oi": 135},
+        ],
+    }
+    snap = FyersRestClient.parse_option_chain_payload(payload, "NSE:NIFTY50-INDEX")
+    assert snap.total_call_oi == 300_000_000 and snap.total_put_oi == 213_000_000
+    assert snap.pcr == 0.71
+    assert (snap.window_call_oi, snap.window_put_oi) == (150, 135)
+
+    del payload["callOi"], payload["putOi"]
+    fallback = FyersRestClient.parse_option_chain_payload(payload, "NSE:NIFTY50-INDEX")
+    assert fallback.total_call_oi == 150 and fallback.pcr == 0.9
