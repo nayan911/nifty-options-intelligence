@@ -102,8 +102,8 @@ def _synthetic_store(days):
 def test_replay_is_deterministic_and_matches_the_live_runner_path():
     days = trading_days(CAL, date(2026, 6, 1), date(2026, 6, 19))
     store = _synthetic_store(days)
-    r1 = ReplayDriver(store).run(days[-2], days[-1], warmup_days=10)
-    r2 = ReplayDriver(store).run(days[-2], days[-1], warmup_days=10)
+    r1 = ReplayDriver(store).run(days[-2], days[-1], warmup_days=10, require_manifest=False)
+    r2 = ReplayDriver(store).run(days[-2], days[-1], warmup_days=10, require_manifest=False)
     assert r1.days == days[-2:]
     assert signals_digest(r1.signals) == signals_digest(r2.signals)
     assert sum(s.kind == "SETUP" for s in r1.signals) > 20  # the synthetic market really produces breakouts
@@ -116,6 +116,80 @@ def test_replay_is_deterministic_and_matches_the_live_runner_path():
 def test_days_without_enough_warmup_history_are_skipped_and_reported():
     days = trading_days(CAL, date(2026, 6, 1), date(2026, 6, 10))
     store = _synthetic_store(days)
-    res = ReplayDriver(store).run(days[0], days[-1], warmup_days=5)
+    res = ReplayDriver(store).run(days[0], days[-1], warmup_days=5, require_manifest=False)
     assert [d for d, _ in res.skipped_days] == days[:5]
     assert res.days == days[5:]
+
+
+# ------------------------------------------------------------------ parity with the REAL live builder
+from nifty_engine.core.interfaces import Tick  # noqa: E402
+from nifty_engine.data.candle_builder import RealtimeCandleBuilder  # noqa: E402
+
+
+def _ohlc_rows(day, kind, drop_minutes=()):
+    mins = [m for i, m in enumerate(expected_minutes(CAL, day, kind)) if i not in drop_minutes]
+    rows = []
+    for i, t in enumerate(mins):
+        base = 25000 + (i % 37) * 3 - (i % 11) * 2
+        rows.append({"ts": pd.Timestamp(t), "open": base, "high": base + 7, "low": base - 5, "close": base + 2,
+                     "volume": 100 + i, "oi": 5000 + i})
+    return pd.DataFrame(rows)
+
+
+def _live_builder_bars(df1m, symbol, is_index, end_flush):
+    """Feed ticks derived from 1m bars (O,H,L,C at :00/:15/:30/:45; bar volume on the close tick) to
+    the actual RealtimeCandleBuilder, flushing once per minute like the live 1s loop."""
+    out = []
+    b = RealtimeCandleBuilder(on_candle_close=out.append)
+    cum = 0
+    for r in df1m.itertuples(index=False):
+        t = r.ts.to_pydatetime()
+        b.flush_closed_bars(t)  # live loop runs every second; this is the last flush before the minute
+        for sec, px, vol in ((0, r.open, 0), (15, r.high, 0), (30, r.low, 0), (45, r.close, int(r.volume))):
+            cum += vol
+            ts = t + timedelta(seconds=sec)
+            b.process_tick(Tick(symbol=symbol, exchange_timestamp=ts, local_timestamp=ts, ltp=float(px),
+                                cumulative_volume=0 if is_index else cum, incremental_volume=0 if is_index else vol,
+                                is_index=is_index))
+    b.flush_closed_bars(end_flush)
+    return {(c.timeframe, c.timestamp, c.open, c.high, c.low, c.close, c.volume) for c in out}
+
+
+def _replay_bars(df1m, kind, is_index):
+    clean = in_session_1m(df1m, CAL, kind)
+    got = set()
+    for tf in ("1m", "5m", "15m"):
+        for r in resample(clean, tf).itertuples(index=False):
+            got.add((tf, r.ts.to_pydatetime(), float(r.open), float(r.high), float(r.low), float(r.close),
+                     0 if is_index else int(r.volume)))
+    return got
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("label,day,kind,is_index,drop", [
+    ("regular cash session", date(2026, 6, 10), CASH, True, ()),
+    ("Muhurat cash (starts 14:20)", date(2026, 11, 8), CASH, True, ()),
+    ("Muhurat futures (to 15:39)", date(2026, 11, 8), FNO, False, ()),
+    ("futures 15:30-15:39 closing window", date(2026, 10, 15), FNO, False, ()),
+    ("5m bucket missing its first minute", date(2026, 6, 10), FNO, False, (45,)),          # 10:00 missing
+    ("15m bucket missing 3 leading minutes", date(2026, 6, 10), FNO, False, (45, 46, 47)),  # > 120 s late
+    ("15m bucket missing exactly 2 leading minutes", date(2026, 6, 10), FNO, False, (60, 61)),  # = 120 s: kept
+])
+def test_replay_bars_equal_the_live_candle_builder(label, day, kind, is_index, drop):
+    df = _ohlc_rows(day, kind, drop_minutes=drop)
+    end = IST.localize(datetime(day.year, day.month, day.day, 16, 0))
+    live = _live_builder_bars(df, "NSE:NIFTY50-INDEX" if is_index else "NSE:NIFTY-FUT-NEAR", is_index, end)
+    replay = _replay_bars(df, kind, is_index)
+    assert replay == live, f"{label}: only-replay={sorted(replay - live)[:3]} only-live={sorted(live - replay)[:3]}"
+
+
+
+def test_replay_fails_closed_without_a_valid_manifest(tmp_path):
+    from nifty_engine.research.manifest import ManifestError
+
+    days = trading_days(CAL, date(2026, 6, 1), date(2026, 6, 12))
+    store = _synthetic_store(days)
+    with pytest.raises(ManifestError, match="No dataset manifest"):
+        ReplayDriver(store).run(days[-1], days[-1], warmup_days=5, manifest_path=tmp_path / "none.json")

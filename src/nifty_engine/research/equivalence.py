@@ -1,4 +1,10 @@
-"""Equivalence check: the replay driver vs the live runner's candle path on identical bars.
+"""TECHNICAL-PARITY check: the replay driver vs the live runner's candle path on identical bars.
+
+Scope (be precise about what this proves): same raw setups, multi-timeframe candidates, their
+timing, levels, stops/targets and confluence scores. It does NOT prove decision parity: the
+derivatives assessment is disabled (no historical option chains), readiness evaluation is
+stubbed, and the paper-entry path is bypassed. Decision parity (eligibility, rejection reasons,
+entries) is a separate test level once the strategy registry and decision journal exist.
 
 The live pipeline delivers candles through MarketDataEngine._on_candle_closed (signal-symbol
 filter, gap-hold, event lock, paper engine, readiness), not by calling the engine directly. This

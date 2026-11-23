@@ -31,7 +31,7 @@ from nifty_engine.data.historical_manager import HistoricalCandleManager
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.research.bars import build_intraday_candles, daily_candles, trading_days
 from nifty_engine.research.history_store import ResearchHistoryStore
-from nifty_engine.research.manifest import dataset_fingerprint
+from nifty_engine.research.manifest import DEFAULT_MANIFEST, dataset_fingerprint, require_valid_manifest
 from nifty_engine.research.sessions import CASH, FNO
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -164,14 +164,23 @@ class ReplayDriver:
             for s in EXPIRY_PROBES:
                 engine.expire_pending_evaluations(close_t + timedelta(seconds=s))
 
-    def run(self, start: date, end: date, warmup_days: int = 10) -> ReplayResult:
+    def run(self, start: date, end: date, warmup_days: int = 10, require_manifest: bool = True,
+            manifest_path=DEFAULT_MANIFEST) -> ReplayResult:
         """Replay every trading day in [start, end]. Days within `warmup_days` of the dataset start
-        are skipped (not enough prior history for a live-equivalent warmup)."""
-        self._prepare()
+        are skipped (not enough prior history for a live-equivalent warmup).
+
+        Fails closed: unless `require_manifest=False` (synthetic unit tests only), the validated
+        dataset manifest must be ok, cover every day the replay reads (warmup history included) and
+        match the current data's fingerprint.
+        """
         first = self.research.conn.execute(
             "SELECT min(CAST(ts AS DATE)) FROM hist_bars WHERE instrument = ? AND resolution = '1'",
             [self.spot_instrument],
         ).fetchall()[0][0]
+        manifest = None
+        if require_manifest:
+            manifest = require_valid_manifest(first, end, self.research, manifest_path)
+        self._prepare()
         all_days = trading_days(self.cal, first, end)
         min_day = all_days[warmup_days] if len(all_days) > warmup_days else end + timedelta(days=1)
         signals: List[ReplaySignal] = []
@@ -182,7 +191,12 @@ class ReplayDriver:
                 continue
             self.replay_day(d, signals)
             days.append(d)
-        return ReplayResult(start, end, days, signals, self.provenance(start, end), skipped)
+        prov = self.provenance(start, end)
+        prov["manifest"] = (
+            {"validated": True, "generated_at": manifest.get("generated_at"),
+             "fingerprint": manifest.get("dataset_fingerprint")} if manifest else {"validated": False}
+        )
+        return ReplayResult(start, end, days, signals, prov, skipped)
 
     def provenance(self, start: date, end: date) -> Dict[str, Any]:
         return {

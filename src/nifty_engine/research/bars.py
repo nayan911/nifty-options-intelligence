@@ -7,6 +7,11 @@ prints (e.g. 09:08-09:14 on 7-9 Sep 2026) never enter any bar or indicator.
 
 Aggregation: open=first, high=max, low=min, close=last, volume=sum, oi=last. Stitched futures
 switch contracts only between sessions, and bars never span sessions, so no bar mixes contracts.
+
+Live-builder parity: RealtimeCandleBuilder DROPS any bar whose first tick arrives later than
+MAX_INITIAL_TICK_OFFSET_SECONDS after the bar's start (1m 20s, 5m 45s, 15m 120s). Replay applies
+the same rule (first stored minute vs bucket start), e.g. the Muhurat 14:15 15m bar (trading
+starts 14:20, 300 s late) is not emitted live and is therefore not replayed either.
 """
 
 from datetime import date, timedelta
@@ -16,6 +21,7 @@ import pandas as pd
 
 from nifty_engine.core.calendar import ExchangeCalendar
 from nifty_engine.core.interfaces import Candle
+from nifty_engine.data.candle_builder import RealtimeCandleBuilder
 from nifty_engine.research.sessions import expected_minutes
 
 TF_MINUTES = {"1m": 1, "5m": 5, "15m": 15}
@@ -36,13 +42,24 @@ def in_session_1m(df: pd.DataFrame, cal: ExchangeCalendar, kind: str) -> pd.Data
     return out.sort_values("ts").reset_index(drop=True)
 
 
-def resample(df1m: pd.DataFrame, tf: str) -> pd.DataFrame:
-    """Aggregate in-session 1m rows (columns ts, open, high, low, close, volume, oi) into `tf`."""
+def resample(df1m: pd.DataFrame, tf: str, drop_late_start: bool = True) -> pd.DataFrame:
+    """Aggregate in-session 1m rows (columns ts, open, high, low, close, volume, oi) into `tf`.
+
+    drop_late_start: drop buckets whose first available minute starts later than the live builder's
+    MAX_INITIAL_TICK_OFFSET_SECONDS for `tf` (the live system never emits those bars).
+    """
     if tf == "1m" or df1m.empty:
         return df1m.copy()
     n = TF_MINUTES[tf]
     ts = pd.to_datetime(df1m["ts"])
     bucket = ts.dt.floor(f"{n}min")
+    if drop_late_start:
+        max_offset = RealtimeCandleBuilder.MAX_INITIAL_TICK_OFFSET_SECONDS[tf]
+        first_in_bucket = ts.groupby(bucket).transform("min")
+        late = (first_in_bucket - bucket).dt.total_seconds() > max_offset
+        df1m, bucket = df1m.loc[~late], bucket[~late]
+        if df1m.empty:
+            return df1m.copy()
     g = df1m.assign(bucket=bucket).groupby("bucket", sort=True)
     out = pd.DataFrame({
         "ts": g["ts"].first().index,
