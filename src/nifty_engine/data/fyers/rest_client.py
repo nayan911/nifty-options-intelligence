@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time as time_mod
 from datetime import date, datetime, time, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
 from fyers_apiv3 import fyersModel
@@ -260,14 +260,15 @@ class FyersRestClient:
         self,
         symbol: str = "NSE:NIFTY50-INDEX",
         strikecount: int = 10,
+        expiry_epoch: Optional[int] = None,
     ) -> OptionChainSnapshot:
-        """Fetch live option chain with Greeks."""
+        """Fetch live option chain with Greeks (nearest expiry unless `expiry_epoch` is given)."""
         await self.rate_limiter.acquire()
 
         data = {
             "symbol": symbol,
             "strikecount": strikecount,
-            "timestamp": "",
+            "timestamp": str(expiry_epoch) if expiry_epoch else "",
             "greeks": "1",
         }
 
@@ -406,6 +407,16 @@ class FyersRestClient:
         ]
 
         window_call_oi, window_put_oi = total_call_oi, total_put_oi
+
+        available_expiries: List[Tuple[date, int]] = []
+        for e in expiry_data if isinstance(expiry_data, list) else []:
+            if not isinstance(e, dict):
+                continue
+            try:
+                epoch = int(e.get("expiry") or e.get("timestamp"))
+                available_expiries.append((datetime.fromtimestamp(epoch, tz=IST).date(), epoch))
+            except (TypeError, ValueError):
+                continue
         # Prefer FYERS' expiry-wide totals (verified per-expiry: they change with the
         # requested expiry) so PCR doesn't drift as ATM shifts the strike window.
         try:
@@ -444,6 +455,7 @@ class FyersRestClient:
             pcr=pcr,
             window_call_oi=window_call_oi,
             window_put_oi=window_put_oi,
+            available_expiries=available_expiries,
             is_synchronized_snapshot=is_synced,
         )
 

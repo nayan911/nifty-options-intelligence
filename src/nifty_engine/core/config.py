@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     # 4,500/day budget) and 1 call/min against the 40/min cap.
     OPTION_CHAIN_POLL_SECONDS: float = 60.0
     OPTION_CHAIN_STRIKECOUNT: int = 10
+    # In the last hours before expiry the expiring chain's IV collapses toward 0 and its OI
+    # changes are dominated by positions being closed, so OI/IV analysis switches to the next
+    # expiry once the nearest one has less than this many hours left (11:30 on expiry day).
+    OPTION_CHAIN_NEXT_EXPIRY_HOURS: float = 4.0
+
+    # ATM option rotation only when spot is this many points beyond the strike midpoint
+    ATM_ROTATION_HYSTERESIS_POINTS: float = 10.0
 
     # Feed gap handling: if the primary index stops ticking for this long during the
     # cash session, missed bars are backfilled from FYERS history after it resumes.

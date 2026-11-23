@@ -9,6 +9,7 @@ Guarantees data integrity before database persistence and candle construction:
    do not trigger live trading breakout states.
 """
 
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
@@ -27,6 +28,20 @@ INDEX_SYMBOLS = {
     "BSE:SENSEX-INDEX",
     "NSE:INDIAVIX-INDEX",
 }
+
+
+_DERIVATIVE_SUFFIX = re.compile(r"(FUT|CE|PE)$")
+
+
+def is_derivative_symbol(symbol: str) -> bool:
+    """True for exchange-traded futures/options (e.g. NSE:NIFTY26NOVFUT, NSE:NIFTY26NOV25400CE).
+
+    Indices (-INDEX) and equities (-EQ) are cash-segment instruments.
+    """
+    s = symbol.upper()
+    if s.endswith("-INDEX") or s.endswith("-EQ"):
+        return False
+    return bool(_DERIVATIVE_SUFFIX.search(s))
 
 
 class TickStatus(str, Enum):
@@ -52,9 +67,14 @@ class TickNormalizer:
         self,
         calendar: Optional[ExchangeCalendar] = None,
         max_freshness_seconds: float = 30.0,
+        max_clock_skew_seconds: float = 2.0,
     ):
         self.calendar = calendar or ExchangeCalendar()
         self.max_freshness_seconds = max_freshness_seconds
+        # Local clock may run slightly behind the exchange clock (live logs showed
+        # -37..-89 ms on ~11% of NIFTY ticks). Requiring latency >= 0 misclassified those
+        # genuine live ticks as stale snapshots and dropped them from candle building.
+        self.max_clock_skew_seconds = max_clock_skew_seconds
         # Per-symbol state tracking
         self._last_fingerprint: Dict[str, Tuple] = {}
         self._last_exchange_time: Dict[str, datetime] = {}
@@ -98,7 +118,12 @@ class TickNormalizer:
         # 4. Session & Live vs Snapshot Classification (Dual-Gate Validation)
         # Gate A: Current real-world wall-clock time must be an open trading session
         current_wall_time = current_time or now_ist()
-        current_session = self.calendar.get_session_state(current_wall_time, is_derivative=True)
+        # Cash instruments (indices, equities) stop trading at 15:30; only F&O contracts
+        # continue in the derivatives closing window. Using the derivatives session for
+        # everything made the index/equities emit flat synthetic bars until 15:40.
+        current_session = self.calendar.get_session_state(
+            current_wall_time, is_derivative=is_derivative_symbol(sym)
+        )
         is_market_currently_open = current_session in (
             SessionState.REGULAR_CASH,
             SessionState.DERIVATIVES_EXT,
@@ -112,7 +137,7 @@ class TickNormalizer:
                 exch_dt = raw_tick.exchange_timestamp.astimezone(IST)
                 same_trading_date = exch_dt.date() == current_wall_time.date()
                 latency_sec = (current_wall_time - exch_dt).total_seconds()
-                is_fresh = 0 <= latency_sec <= self.max_freshness_seconds
+                is_fresh = -self.max_clock_skew_seconds <= latency_sec <= self.max_freshness_seconds
                 status = TickStatus.VALID_LIVE if (same_trading_date and is_fresh) else TickStatus.VALID_SNAPSHOT
             else:
                 # Missing exchange timestamp during open market: classify as UNVERIFIED (quarantined from breakouts)

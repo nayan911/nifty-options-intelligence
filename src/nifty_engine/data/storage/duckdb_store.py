@@ -736,6 +736,29 @@ class DuckDBStore(IStorageEngine):
             cols = [desc[0] for desc in cur.description]
             return [dict(zip(cols, row)) for row in res]
 
+    def purge_post_close_cash_bars(self) -> int:
+        """Delete intraday bars for cash instruments (indices, equities) starting at/after 15:30 IST.
+
+        The cash segment closes at 15:30, but earlier builds kept emitting flat synthetic
+        index/equity bars from repeated last-price quotes until 15:40. Those bars would
+        otherwise feed the next session's indicator warmup. Idempotent; safe at startup.
+        """
+        query = """
+            DELETE FROM candles
+            WHERE (symbol LIKE '%-INDEX' OR symbol LIKE '%-EQ')
+              AND timeframe IN ('1m', '5m', '15m')
+              AND strftime(timestamp, '%H:%M') >= '15:30'
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            n = cur.execute(
+                "SELECT count(*) FROM candles WHERE (symbol LIKE '%-INDEX' OR symbol LIKE '%-EQ') "
+                "AND timeframe IN ('1m','5m','15m') AND strftime(timestamp, '%H:%M') >= '15:30'"
+            ).fetchone()[0]
+            if n:
+                cur.execute(query)
+        return int(n)
+
     def close(self) -> None:
         """Flush any pending buffered ticks and close connection."""
         self.flush_ticks()

@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from datetime import date, datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -124,6 +124,9 @@ class OptionChainSnapshot(BaseModel):
     pcr: float = 0.0
     window_call_oi: int = 0
     window_put_oi: int = 0
+    # [(expiry_date, fyers_expiry_epoch), ...] as listed by FYERS, nearest first. The epoch
+    # is what FYERS' optionchain `timestamp` param expects to select a specific expiry.
+    available_expiries: List[Tuple[date, int]] = Field(default_factory=list)
     is_synchronized_snapshot: bool = Field(default=False, description="True if broker API guarantees synchronized quotes and Greeks in this snapshot")
 
 

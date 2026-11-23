@@ -8,6 +8,7 @@ and out-of-order quarantine, builds 1m/5m/15m OHLCV bars, and persists data into
 import asyncio
 import logging
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
@@ -125,6 +126,15 @@ class MarketDataEngine:
         # Readiness override de-duplication (log on change, not every evaluation)
         self._last_readiness_override: Optional[str] = None
 
+        # Candle closes arrive from TWO threads: the websocket thread (a tick crosses a bar
+        # boundary) and the 1s maintenance loop (clock-driven flush). The paper engine,
+        # readiness state and counters are not thread-safe, so every event that can touch
+        # them is serialized through this lock (re-entrant: callbacks nest).
+        self._event_lock = threading.RLock()
+        self._shutting_down = False
+        # Raw setup alert de-duplication: (symbol, timeframe, bar_ts, direction) -> levels
+        self._alerted_setups: Dict[tuple, List[str]] = {}
+
         # Feed-gap detection + historical backfill for the signal instruments
         self.gap_backfiller = FeedGapBackfiller(
             historical_manager=self.historical_manager,
@@ -134,6 +144,8 @@ class MarketDataEngine:
             gap_seconds=settings.FEED_GAP_SECONDS,
         )
         self.option_chain_rate_limited_until: Optional[datetime] = None
+        self.chain_expiries: List[tuple] = []  # [(date, fyers_epoch)] from the last chain response
+        self._chain_expiry_note: Optional[str] = None
 
     def _get_live_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Provides on-demand authentic broker quote snapshot for paper engine."""
@@ -197,6 +209,8 @@ class MarketDataEngine:
 
     def _on_tick_received(self, raw_tick: Tick, current_time: Optional[datetime] = None):
         """Processes raw tick through normalizer, sanitizes volume, persists, and builds bars."""
+        if self._shutting_down:
+            return
         sym = raw_tick.symbol
         self.total_ticks_received += 1
 
@@ -257,7 +271,8 @@ class MarketDataEngine:
             self.symbol_stats[sym]["live"] += 1
             self.builder.process_tick(tick)
             if hasattr(self, "paper_engine"):
-                self.paper_engine.on_tick(tick)
+                with self._event_lock:
+                    self.paper_engine.on_tick(tick)
         elif res.status == TickStatus.UNVERIFIED:
             self.unverified_ticks_accepted += 1
             self.symbol_stats[sym].setdefault("unverified", 0)
@@ -268,7 +283,16 @@ class MarketDataEngine:
             self.symbol_stats[sym]["snapshot"] += 1
 
     def _on_candle_closed(self, candle: Candle):
-        """Invoked when a 1m/5m/15m bar closes (guaranteed exactly once per closed candle)."""
+        """Invoked when a 1m/5m/15m bar closes (guaranteed exactly once per closed candle).
+
+        Called from both the websocket thread and the maintenance loop; serialized.
+        """
+        if self._shutting_down:
+            return
+        with self._event_lock:
+            self._handle_candle_closed(candle)
+
+    def _handle_candle_closed(self, candle: Candle):
         self.candle_count += 1
         self.store.insert_candle(candle)
         # Flush DuckDB buffer on candle close
@@ -322,7 +346,7 @@ class MarketDataEngine:
     def _log_readiness_override(self, reason: str) -> None:
         """Log a readiness override once per distinct reason instead of on every evaluation."""
         if reason != self._last_readiness_override:
-            logger.warning("Readiness override: %s", reason)
+            logger.info("Readiness override: %s", reason)
             print(f"[READINESS] {reason}")
             self._last_readiness_override = reason
 
@@ -417,7 +441,20 @@ class MarketDataEngine:
         )
 
     def _on_setup_candidate(self, setup: BreakoutContext, snap: TechnicalSnapshot) -> None:
-        """Invoked when a high-probability technical breakout & retest completes."""
+        """Invoked when a high-probability technical breakout & retest completes.
+
+        Several levels can confirm on the same bar (e.g. a psychological round number and a
+        swing-low cluster 10 pts apart). That is ONE setup with confluence, not two.
+        """
+        key = (snap.symbol, snap.timeframe, snap.timestamp, setup.direction.value)
+        if key in self._alerted_setups:
+            self._alerted_setups[key].append(setup.level_id)
+            print(f"  + confluence for {snap.symbol} {snap.timeframe} {setup.direction.value} @ "
+                  f"{snap.timestamp.strftime('%H:%M')}: {setup.level_id} ({setup.nominal_price:.1f})")
+            return
+        if len(self._alerted_setups) > 500:
+            self._alerted_setups.clear()
+        self._alerted_setups[key] = [setup.level_id]
         print(
             f"\n{'='*75}\n"
             f"  [TECHNICAL_SETUP_CANDIDATE: {setup.direction.value}]\n"
@@ -623,6 +660,10 @@ class MarketDataEngine:
         new_atm = round(self.current_spot_price / 50.0) * 50.0
         if new_atm == self.active_atm_strike:
             return
+        # Hysteresis: only rotate once spot is clearly past the strike midpoint, otherwise a
+        # spot hovering at e.g. 25375 flips ATM 25350<->25400 and churns 12 subscriptions.
+        if abs(self.current_spot_price - self.active_atm_strike) < 25.0 + settings.ATM_ROTATION_HYSTERESIS_POINTS:
+            return
 
         try:
             expiries = self.master.get_active_expiries("NIFTY")
@@ -683,14 +724,19 @@ class MarketDataEngine:
         try:
             loop = asyncio.new_event_loop()
             try:
+                expiry_epoch = self._select_chain_expiry(now)
                 chain = loop.run_until_complete(
                     self.rest_client.get_option_chain(
-                        symbol=settings.PRIMARY_INDEX, strikecount=settings.OPTION_CHAIN_STRIKECOUNT
+                        symbol=settings.PRIMARY_INDEX,
+                        strikecount=settings.OPTION_CHAIN_STRIKECOUNT,
+                        expiry_epoch=expiry_epoch,
                     )
                 )
             finally:
                 loop.close()
 
+            if chain.available_expiries:
+                self.chain_expiries = list(chain.available_expiries)
             self.store.save_option_chain_snapshot(chain)
             self.technical_engine.on_option_chain(chain, as_of=now)
             self.last_option_chain_time = now
@@ -712,6 +758,30 @@ class MarketDataEngine:
             self.last_option_chain_time = now  # Anchor backoff timer to avoid tight loop
             if is_open:
                 print(f"[WARN] Option chain poll failed (attempt {self.option_chain_failure_count}): {e}")
+
+    def _select_chain_expiry(self, now: datetime) -> Optional[int]:
+        """Expiry to analyse: the nearest one, unless it expires within
+        OPTION_CHAIN_NEXT_EXPIRY_HOURS, in which case the next one (FYERS epoch).
+
+        Returns None for "broker default (nearest)". Needs one prior response to know the
+        expiry list, so the very first poll always uses the nearest expiry.
+        """
+        if len(self.chain_expiries) < 2:
+            return None
+        (near_date, _), (next_date, next_epoch) = self.chain_expiries[0], self.chain_expiries[1]
+        near_close = IST.localize(datetime.combine(near_date, datetime.min.time())).replace(hour=15, minute=30)
+        hours_left = (near_close - now).total_seconds() / 3600.0
+        if hours_left < settings.OPTION_CHAIN_NEXT_EXPIRY_HOURS:
+            note = f"{next_date}"
+            if self._chain_expiry_note != note:
+                print(
+                    f"[OPTION CHAIN] Nearest expiry {near_date} has {max(hours_left, 0):.1f}h left; "
+                    f"OI/IV analysis switched to next expiry {next_date}"
+                )
+                self._chain_expiry_note = note
+            return int(next_epoch)
+        self._chain_expiry_note = None
+        return None
 
     def _log_oi_flow(self, chain: Any) -> None:
         """One compact line: PCR, walls, max pain, ATM IV trend and near-ATM OI flow."""
@@ -764,6 +834,9 @@ class MarketDataEngine:
 
         print("[OK] FYERS access token verified.")
         print(f"[OK] DuckDB Storage ready: {self.store.db_path}")
+        purged = self.store.purge_post_close_cash_bars()
+        if purged:
+            print(f"[OK] Purged {purged} synthetic post-15:30 index/equity bars from history")
 
         try:
             self.master.load_master(auto_download=False)
@@ -857,9 +930,10 @@ class MarketDataEngine:
                 if gap_msg:
                     print(f"[FEED GAP] {gap_msg}")
 
-                self.builder.flush_closed_bars(current_ist)
-                self.technical_engine.expire_pending_evaluations(current_ist)
-                self.paper_engine.check_time_events(current_ist)
+                with self._event_lock:
+                    self.builder.flush_closed_bars(current_ist)
+                    self.technical_engine.expire_pending_evaluations(current_ist)
+                    self.paper_engine.check_time_events(current_ist)
 
                 # Periodic 10-second maintenance operations
                 if loop_ticks % 10 != 0:
@@ -869,7 +943,8 @@ class MarketDataEngine:
                 self.store.flush_ticks()
 
                 # 3. Dynamic option rotation if ATM shifted
-                self.check_and_rotate_options()
+                with self._event_lock:
+                    self.check_and_rotate_options()
 
                 # 4. Session evaluation & status reporting
                 curr_state = self.calendar.get_session_state(is_derivative=True)
@@ -899,14 +974,15 @@ class MarketDataEngine:
                     pcr_str += f" (429s: {api['rate_limit_hits_today']})"
 
                 # Paper Trading active telemetry
-                open_pos = self.paper_engine.get_open_positions()
+                with self._event_lock:
+                    open_pos = list(self.paper_engine.get_open_positions())
+                    summary = self.paper_engine.get_account_summary()
                 if open_pos:
                     for p in open_pos:
                         print(
                             f"  [ACTIVE PAPER POSITION: {p.symbol}] Entry: ₹{p.entry_price:.2f} | LTP: ₹{p.current_ltp:.2f} | "
                             f"Target: ₹{p.target_premium_t1:.2f} | SL: ₹{p.stop_loss_premium:.2f} | M2M Gross: ₹{p.gross_pnl:+.2f} | Net: ₹{p.net_pnl:+.2f}"
                         )
-                summary = self.paper_engine.get_account_summary()
                 if summary["total_trades"] > 0:
                     print(
                         f"  [PAPER JOURNAL] Closed: {summary['total_trades']} (Win: {summary['win_rate_pct']}%) | "
@@ -915,11 +991,12 @@ class MarketDataEngine:
                     )
 
                 # 6. Continuous Operational Readiness Evaluation
-                readiness = self.evaluate_and_update_readiness()
+                with self._event_lock:
+                    readiness = self.evaluate_and_update_readiness()
 
                 if not is_open:
                     print(
-                        f"[HOLIDAY / OFFLINE STATUS] Session: {curr_state.value.upper()} | Readiness: {readiness.value} | "
+                        f"[HOLIDAY / OFFLINE STATUS] Session: {curr_state.value.upper()} | Entries: DISABLED (market closed) | "
                         f"WS: {ws_status} | Subscribed: {sub_count} | Broker Acks: {self.ws_client.subscription_acks} | "
                         f"Quotes Seen: {quote_count}/{sub_count} | Snapshots: {self.snapshots_accepted} | "
                         f"Duplicates: {self.duplicates_dropped} | Trading Signals: DISABLED{pcr_str}"
@@ -933,15 +1010,31 @@ class MarketDataEngine:
         except KeyboardInterrupt:
             print("\nShutting down cleanly...")
         finally:
-            if hasattr(self, "paper_engine"):
-                try:
-                    self.paper_engine.checkpoint_active_positions(force=True)
-                except Exception as e:
-                    logger.warning("Error checkpointing paper positions on shutdown: %s", e)
-            self.store.flush_ticks()
-            self.ws_client.close()
-            self.store.close()
-            print("Pipeline stopped.")
+            self._shutdown()
+
+    def _shutdown(self) -> None:
+        """Persist state FIRST, then drop the socket. A second Ctrl-C must not skip the DB close.
+
+        Previously the websocket close (bounded 5s wait) ran before store.close(); pressing
+        Ctrl-C again during that wait aborted cleanup and left DuckDB unclosed.
+        """
+        self._shutting_down = True  # tick/candle callbacks from the socket thread become no-ops
+        self.running = False
+        steps = [
+            ("checkpoint paper positions", lambda: self.paper_engine.checkpoint_active_positions(force=True)),
+            ("flush ticks", self.store.flush_ticks),
+            ("close database", self.store.close),
+            ("close websocket", lambda: self.ws_client.close(timeout=3.0)),
+        ]
+        for name, fn in steps:
+            try:
+                with self._event_lock:
+                    fn()
+            except KeyboardInterrupt:
+                print(f"  (interrupt during '{name}' ignored; finishing shutdown)")
+            except Exception as e:
+                logger.warning("Shutdown step '%s' failed: %s", name, e)
+        print("Pipeline stopped.")
 
 
 if __name__ == "__main__":
