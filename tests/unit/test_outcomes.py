@@ -38,7 +38,8 @@ def op_for(c):
 def test_entry_is_the_next_bar_open_and_target_first_wins():
     b = bars([(25100, 25110, 25095, 25108), (25108, 25131, 25105, 25130)])
     r = label(op_for(cand()), b, 30, 20.0, 60)
-    assert r["entry"] == 25100 and r["outcome"] == "TARGET" and r["minutes"] == 1 and r["mfe"] == 31
+    assert r["entry"] == 25100 and r["outcome"] == "TARGET" and r["mfe"] == 31
+    assert r["minutes"] == 2 and r["exit_at"] == (T0 + timedelta(minutes=2)).isoformat()  # end of the hit bar
 
 
 def test_stop_first_and_bearish_direction():
@@ -62,17 +63,26 @@ def test_ambiguous_bar_is_never_a_win():
 def test_timeout_respects_horizon_and_session_end():
     b = bars([(25100, 25110, 25095, 25105)] * 50 + [(25105, 25140, 25100, 25138)])
     r = label(op_for(cand()), b, 30, 20.0, 45)
-    assert r["outcome"] == "TIMEOUT" and r["minutes"] == 44 and r["close_points"] == 5
+    assert r["outcome"] == "TIMEOUT" and r["close_points"] == 5
+    assert r["minutes"] == 45 and r["exit_at"] == (T0 + timedelta(minutes=45)).isoformat()  # 10:44 bar closes 10:45
     assert label(op_for(cand()), b, 30, 20.0, 60)["outcome"] == "TARGET"
     short = bars([(25100, 25110, 25095, 25105)] * 3)
     assert label(op_for(cand()), short, 30, 20.0, 60)["outcome"] == "TIMEOUT"
     assert label(op_for(cand(decision=T0 + timedelta(minutes=10))), short, 30, 20.0, 60)["outcome"] == "NO_ENTRY"
 
 
-def test_open_beyond_s000_stop_is_an_immediate_stop():
+def test_open_beyond_s000_stop_is_no_trade_and_never_adds_points():
     b = bars([(25075, 25140, 25070, 25130)])
     r = label(op_for(cand(stop=25080.0)), b, 30, "S000", 60)
-    assert r["outcome"] == "STOP" and r["minutes"] == 0
+    assert r["outcome"] == "INVALID_AT_OPEN" and r["stop_points"] <= 0
+    k = "T30_SS000_H60"
+    s = summarize([_with(op_for(cand(cid="x", stop=25080.0)), k, r)], k)
+    assert s["invalid_at_open"] == 1 and s["n"] == 0 and s["expectancy_points"] is None
+    import pytest
+
+    from nifty_engine.research.outcomes import points
+    with pytest.raises(ValueError):
+        points({"outcome": "STOP", "stop_points": -5.0}, 30.0)  # a stopped trade can never add points
 
 
 def test_same_bar_candidates_are_one_opportunity_with_highest_confluence_rep():
@@ -117,3 +127,12 @@ def test_expectancy_counts_ambiguous_as_a_stop_and_timeouts_at_close():
         ("d", {"outcome": "TIMEOUT", "minutes": 59, "mfe": 9, "mae": 5, "stop_points": 20.0, "close_points": 6.0}))]
     s = summarize(ops, k)
     assert s["expectancy_points"] == round((30 - 20 - 20 + 6) / 4, 2) and s["TARGET"] == 1 and s["hit_rate"] == 25.0
+
+
+def test_exit_at_bar_end_lets_the_next_open_enter():
+    a = _with(op_for(cand(cid="a")), "K", {"outcome": "TARGET", "entry_at": T0.isoformat(),
+                                           "exit_at": (T0 + timedelta(minutes=3)).isoformat(), "minutes": 3})
+    b = _with(op_for(cand(decision=T0 + timedelta(minutes=3), cid="b")), "K",
+              {"outcome": "STOP", "entry_at": (T0 + timedelta(minutes=3)).isoformat(),
+               "exit_at": (T0 + timedelta(minutes=5)).isoformat(), "minutes": 2})
+    assert [o.rep["candidate_id"] for o in one_position_at_a_time([a, b], "K")] == ["a", "b"]

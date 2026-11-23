@@ -87,9 +87,14 @@ class ReplayResult:
 
 
 def _git_commit() -> str:
+    """Short HEAD commit, suffixed '-dirty' when tracked files have uncommitted changes (then the
+    commit alone does not identify the code that produced a result)."""
     try:
-        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
                               timeout=5).stdout.strip() or "unknown"
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], capture_output=True,
+                               text=True, timeout=5).stdout.strip()
+        return f"{head}-dirty" if dirty else head
     except Exception:
         return "unknown"
 

@@ -8,9 +8,14 @@ Definitions (fixed before looking at results):
   (decision_at = close of the trigger bar). No entry if the session ends first.
 - Outcome per (target, stop, horizon), walking 1m bars from the entry bar inclusive:
     TARGET    target touched (high/low) before the stop
-    STOP      stop touched first (also if the entry open is already beyond the S000 stop level)
+    STOP      stop touched first
     AMBIGUOUS both touched inside the same 1m bar: order unknown, NEVER counted as a win
-    TIMEOUT   neither within the horizon (or before the session's last bar)
+    TIMEOUT   neither within the horizon (or before the session's last bar); exits at that bar's close
+    INVALID_AT_OPEN  the entry open is already at/beyond S000's stop level: the setup is void before
+              entry, so no trade is taken. Excluded from hit rates and expectancy, but counted and
+              reported, so a rise in such cases is visible.
+  Exit time: the END of the 1m bar in which the exit happened (the close of a timeout bar, and the
+  conservative bound for a target/stop touched somewhere inside the bar). "minutes" is entry to exit.
   Targets are NIFTY points from the entry. Stops: S000's own stop level, or fixed points.
 - One position at a time: for each configuration, a "trade" is an opportunity taken only when no
   earlier trade is still open at its entry (the realistic sequence for a single manual trader).
@@ -79,8 +84,8 @@ def label(op: Opportunity, bars: pd.DataFrame, target: float, stop: Any, horizon
         stop_px = entry - s * stop_pts
     res: Dict[str, Any] = {"entry": entry, "entry_at": entry_at.isoformat(), "stop_points": round(stop_pts, 2)}
     mfe = mae = 0.0
-    if stop_pts <= 0:  # opened beyond the S000 stop level
-        res.update(outcome="STOP", exit_at=entry_at.isoformat(), minutes=0, mfe=0.0, mae=round(-stop_pts, 2))
+    if stop_pts <= 0:  # opened at/beyond the S000 stop level: the setup is void, no trade
+        res.update(outcome="INVALID_AT_OPEN")
         return res
     for r in window.itertuples(index=False):
         fav = s * ((r.high if s > 0 else r.low) - entry)
@@ -88,20 +93,22 @@ def label(op: Opportunity, bars: pd.DataFrame, target: float, stop: Any, horizon
         hit_t = fav >= target
         hit_s = adv >= stop_pts
         mfe, mae = max(mfe, fav), max(mae, adv)
-        minutes = int((r.ts - entry_at).total_seconds() // 60)
+        bar_end = r.ts + pd.Timedelta(minutes=1)
+        minutes = int((bar_end - entry_at).total_seconds() // 60)
         if hit_t and hit_s:
-            res.update(outcome="AMBIGUOUS", exit_at=r.ts.isoformat(), minutes=minutes)
+            res.update(outcome="AMBIGUOUS", exit_at=bar_end.isoformat(), minutes=minutes)
             break
         if hit_t:
-            res.update(outcome="TARGET", exit_at=r.ts.isoformat(), minutes=minutes)
+            res.update(outcome="TARGET", exit_at=bar_end.isoformat(), minutes=minutes)
             break
         if hit_s:
-            res.update(outcome="STOP", exit_at=r.ts.isoformat(), minutes=minutes)
+            res.update(outcome="STOP", exit_at=bar_end.isoformat(), minutes=minutes)
             break
     else:
         last = window.iloc[-1] if not window.empty else after.iloc[0]
-        res.update(outcome="TIMEOUT", exit_at=last["ts"].isoformat(),
-                   minutes=int((last["ts"] - entry_at).total_seconds() // 60),
+        close_at = last["ts"] + pd.Timedelta(minutes=1)  # the close is known when the bar ends
+        res.update(outcome="TIMEOUT", exit_at=close_at.isoformat(),
+                   minutes=int((close_at - entry_at).total_seconds() // 60),
                    close_points=round(s * (float(last["close"]) - entry), 2))
     res.update(mfe=round(mfe, 2), mae=round(mae, 2), target_px=round(tgt_px, 2), stop_px=round(stop_px, 2))
     return res
@@ -131,7 +138,7 @@ def one_position_at_a_time(ops: List[Opportunity], key: str) -> List[Opportunity
         if "entry_at" not in o:
             continue
         start = pd.Timestamp(o["entry_at"])
-        if busy_until is not None and start <= busy_until:
+        if busy_until is not None and start < busy_until:  # exit at bar end; next open may enter
             continue
         taken.append(op)
         busy_until = pd.Timestamp(o["exit_at"])
@@ -149,7 +156,9 @@ def wilson(k: int, n: int, z: float = 1.96) -> Tuple[Optional[float], Optional[f
 
 
 def summarize(ops: List[Opportunity], key: str) -> Dict[str, Any]:
-    rows = [op.outcomes[key] for op in ops if op.outcomes.get(key, {}).get("outcome") not in (None, "NO_ENTRY", "NO_DATA")]
+    excluded = ("NO_ENTRY", "NO_DATA", "INVALID_AT_OPEN")
+    invalid = sum(op.outcomes.get(key, {}).get("outcome") == "INVALID_AT_OPEN" for op in ops)
+    rows = [op.outcomes[key] for op in ops if op.outcomes.get(key, {}).get("outcome") not in (None,) + excluded]
     n = len(rows)
     counts = {k: sum(r["outcome"] == k for r in rows) for k in ("TARGET", "STOP", "AMBIGUOUS", "TIMEOUT")}
     lo, hi = wilson(counts["TARGET"], n)
@@ -160,7 +169,7 @@ def summarize(ops: List[Opportunity], key: str) -> Dict[str, Any]:
     mean_pts = float(pd.Series(pts).mean()) if pts else None
     se_pts = float(pd.Series(pts).std(ddof=0) / math.sqrt(len(pts))) if len(pts) > 1 else None
     return {
-        "n": n, **counts,
+        "n": n, **counts, "invalid_at_open": invalid,
         "hit_rate": round(100 * counts["TARGET"] / n, 1) if n else None,
         "hit_rate_ci95": [lo, hi],
         "target_vs_stop": round(100 * counts["TARGET"] / decided, 1) if decided else None,
@@ -179,7 +188,10 @@ def points(r: Dict[str, Any], target: float) -> float:
     if r["outcome"] == "TARGET":
         return target
     if r["outcome"] in ("STOP", "AMBIGUOUS"):
-        return -float(r["stop_points"])
+        sp = float(r["stop_points"])
+        if sp <= 0:
+            raise ValueError(f"a stopped trade must have a positive stop distance, got {sp}")
+        return -sp
     return float(r.get("close_points", 0.0))
 
 
