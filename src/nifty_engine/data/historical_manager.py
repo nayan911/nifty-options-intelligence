@@ -173,6 +173,52 @@ class HistoricalCandleManager:
             logger.warning("Failed direct 09:15 opening candle fetch for %s on %s: %s", symbol, date_str, e)
             return None
 
+    def reconcile_session_candles(
+        self,
+        symbols: List[str],
+        target_date: Optional[date] = None,
+        timeframes: Optional[List[str]] = None,
+    ) -> Dict[str, Dict[str, int]]:
+        """Reconciles and overwrites intraday candles for target_date against FYERS historical API.
+
+        Fetches verified broker candles (15m, 5m, 1m) directly for target_date and batch-upserts
+        them into DuckDB, repairing any truncated or corrupted candles recorded during live streaming.
+        """
+        t_date = target_date or now_ist().date()
+        date_str = t_date.strftime("%Y-%m-%d")
+        tfs = timeframes or ["15m", "5m", "1m"]
+        results: Dict[str, Dict[str, int]] = {}
+
+        for sym in symbols:
+            results[sym] = {}
+            for tf in tfs:
+                res = self.TIMEFRAME_TO_RESOLUTION.get(tf, tf)
+                try:
+                    candles = self.rest_client.get_historical_candles_sync(
+                        symbol=sym,
+                        resolution=res,
+                        date_from=date_str,
+                        date_to=date_str,
+                    )
+                    completed = [c for c in candles if c.is_closed]
+                    if completed:
+                        count = self.store.insert_candles_batch(completed)
+                        results[sym][tf] = count
+                        logger.info(
+                            "Reconciled %d %s candles for %s on %s",
+                            count,
+                            tf,
+                            sym,
+                            date_str,
+                        )
+                    else:
+                        results[sym][tf] = 0
+                except Exception as e:
+                    logger.warning("Reconciliation failed for %s (%s) on %s: %s", sym, tf, date_str, e)
+                    results[sym][tf] = 0
+
+        return results
+
     def get_daily_reference_levels(
         self,
         symbol: str,
@@ -279,6 +325,7 @@ class HistoricalCandleManager:
         candle_limit_1m: int = 100,
         candle_limit_5m: int = 100,
         candle_limit_15m: int = 50,
+        reconcile_session: bool = False,
     ) -> Dict[str, Any]:
         """Pre-seeds daily references and bootstraps recent 15m, 5m & 1m historical candles into TechnicalAnalysisEngine."""
         target_date = as_of_date or now_ist().date()
@@ -335,6 +382,12 @@ class HistoricalCandleManager:
         # replay all completed candles of the current session up to the cutoff without generating trades.
         now = now_ist()
         if target_date < now.date() or (target_date == now.date() and now.time() > time(9, 15)):
+            if reconcile_session:
+                try:
+                    self.reconcile_session_candles(symbols, target_date=target_date)
+                except Exception as e:
+                    logger.warning("Session reconciliation prior to catchup failed: %s", e)
+
             session_start = IST.localize(datetime.combine(target_date, time(9, 15)))
             session_end = now if target_date == now.date() else IST.localize(datetime.combine(target_date, time(15, 30)))
 

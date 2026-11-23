@@ -1,6 +1,7 @@
 """Rate-limited, asynchronous REST Client for FYERS Data API v3."""
 
 import asyncio
+import time as time_mod
 from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -102,24 +103,39 @@ class FyersRestClient:
         resolution: str = "1",
         date_from: str = "",
         date_to: str = "",
+        max_retries: int = 3,
     ) -> List[Candle]:
-        """Synchronously fetch historical candles via FYERS SDK with rate limiting."""
-        self.rate_limiter.acquire_sync()
+        """Synchronously fetch historical candles via FYERS SDK with rate limiting and exponential backoff on transient throttling."""
+        response = None
+        error_msg = ""
+        for attempt in range(max_retries):
+            self.rate_limiter.acquire_sync()
 
-        data = {
-            "symbol": symbol,
-            "resolution": resolution,
-            "date_format": "1",
-            "range_from": date_from,
-            "range_to": date_to,
-            "cont_flag": "1",
-        }
+            data = {
+                "symbol": symbol,
+                "resolution": resolution,
+                "date_format": "1",
+                "range_from": date_from,
+                "range_to": date_to,
+                "cont_flag": "1",
+            }
 
-        client = self._get_client()
-        response = client.history(data=data)
+            client = self._get_client()
+            response = client.history(data=data)
 
-        if not response or response.get("s") != "ok":
+            if response and response.get("s") == "ok":
+                break
+
             error_msg = response.get("message", "Error fetching historical data") if response else "Empty response"
+            err_lower = error_msg.lower()
+            if "minute" in err_lower:
+                time_mod.sleep(8.0 * (attempt + 1))
+                continue
+            elif "limit" in err_lower or "too many" in err_lower or "second" in err_lower:
+                time_mod.sleep(1.0 * (attempt + 1))
+                continue
+            raise RuntimeError(f"FYERS Historical Data Error ({symbol}): {error_msg}")
+        else:
             raise RuntimeError(f"FYERS Historical Data Error ({symbol}): {error_msg}")
 
         raw_candles = response.get("candles", [])

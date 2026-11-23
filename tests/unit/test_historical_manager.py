@@ -727,3 +727,35 @@ def test_1m_warmup_and_session_catchup_at_10am(store, monkeypatch):
     assert snap_1m.ema_9 is not None
     assert snap_1m.atr is not None
 
+
+def test_reconcile_session_candles_overwrites_corrupted_candles(store):
+    """Verify reconcile_session_candles fetches broker candles and overwrites partial/corrupted bars in DuckDB."""
+    sym = "NSE:NIFTY26NOVFUT"
+    t_0915 = IST.localize(datetime(2026, 11, 23, 9, 15, 0))
+
+    # 1. Store currently has corrupted/truncated 15m bar from live streaming
+    corrupted_15m = make_candle(sym, "15m", t_0915, o=25750.30, h=25758.00, l=25661.00, c=25668.50, v=101790)
+    store.insert_candle(corrupted_15m)
+
+    stored_before = store.get_candles(sym, "15m", start_time=t_0915, end_time=t_0915)[0]
+    assert stored_before.volume == 101790
+    assert stored_before.open == 25750.30
+
+    # 2. Mock broker REST client returning official, complete 15m candle
+    official_15m = make_candle(sym, "15m", t_0915, o=25969.00, h=26000.00, l=25661.00, c=25668.50, v=502320)
+    mock_rest = MagicMock()
+    mock_rest.get_historical_candles_sync.return_value = [official_15m]
+
+    manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
+
+    # 3. Run reconciliation
+    res = manager.reconcile_session_candles([sym], target_date=date(2026, 11, 23), timeframes=["15m"])
+    assert res[sym]["15m"] == 1
+
+    # 4. Verify DuckDB row has been repaired and replaced with official values
+    stored_after = store.get_candles(sym, "15m", start_time=t_0915, end_time=t_0915)[0]
+    assert stored_after.volume == 502320
+    assert stored_after.open == 25969.00
+    assert stored_after.high == 26000.00
+
+

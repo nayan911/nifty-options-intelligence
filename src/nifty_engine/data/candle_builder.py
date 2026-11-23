@@ -196,13 +196,17 @@ class RealtimeCandleBuilder:
                             bar_start.strftime("%H:%M:%S"),
                         )
 
-                    # Start fresh bar at the new boundary (always complete because it begins right at the boundary)
+                    # Start fresh bar at the new boundary: check completeness in case feed was delayed/paused
+                    offset_sec = (tick_time - bar_start).total_seconds()
+                    max_offset = self.MAX_INITIAL_TICK_OFFSET_SECONDS.get(tf, 20.0)
+                    is_incomplete = bool(self.drop_incomplete_initial_bars and offset_sec > max_offset)
+
                     new_bar = ActiveCandle(
                         symbol=tick.symbol,
                         timeframe=tf,
                         start_time=bar_start,
-                        is_incomplete=False,
-                        initial_tick_offset_seconds=(tick_time - bar_start).total_seconds(),
+                        is_incomplete=is_incomplete,
+                        initial_tick_offset_seconds=offset_sec,
                     )
                     new_bar.update(tick)
                     self._active_bars[key] = new_bar

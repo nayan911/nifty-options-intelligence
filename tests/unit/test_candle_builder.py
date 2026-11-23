@@ -231,3 +231,47 @@ def test_complete_initial_candle_accepted_on_normal_startup():
     assert closed_1m[0].timestamp == IST.localize(datetime(2026, 11, 23, 9, 15, 0))
     assert closed_1m[0].close == 25805.0
 
+
+def test_feed_pause_and_reconnect_drops_incomplete_candle_on_interval_advancement():
+    """Verify that when a data feed pauses and reconnects partway through a new interval,
+
+    the newly created interval boundary bar is recognized as incomplete and dropped.
+    """
+    closed_bars = []
+    builder = RealtimeCandleBuilder(on_candle_close=lambda c: closed_bars.append(c), drop_incomplete_initial_bars=True)
+
+    # 1. Start cleanly at 09:25:05 (offset 5s into 09:25 5m bar)
+    t_092505 = IST.localize(datetime(2026, 11, 23, 9, 25, 5))
+    builder.process_tick(Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=t_092505, ltp=25750.0, cumulative_volume=1000, incremental_volume=0, is_index=False))
+
+    # 2. Feed drops until 09:32:30 (advances across 09:30 boundary, offset 150s into 09:30 5m bar)
+    t_093230 = IST.localize(datetime(2026, 11, 23, 9, 32, 30))
+    builder.process_tick(Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=t_093230, ltp=25710.0, cumulative_volume=1500, incremental_volume=500, is_index=False))
+
+    # 09:25 5m bar should have closed on boundary crossing
+    closed_5m_first = [c for c in closed_bars if c.timeframe == "5m"]
+    assert len(closed_5m_first) == 1
+    assert closed_5m_first[0].timestamp == IST.localize(datetime(2026, 11, 23, 9, 25, 0))
+
+    # 3. Flush at 09:35:00: The 09:30 5m candle was created at 09:32:30 (offset 150s > 45s threshold)
+    # It must be dropped as incomplete!
+    t_093500 = IST.localize(datetime(2026, 11, 23, 9, 35, 0))
+    builder.flush_closed_bars(t_093500)
+
+    closed_5m_after_gap = [c for c in closed_bars if c.timeframe == "5m"]
+    assert len(closed_5m_after_gap) == 1  # 09:30 bar was dropped, still only 1 closed bar
+
+    # 4. Now a fresh tick arrives right on time at 09:35:05 (offset 5s < 45s)
+    t_093505 = IST.localize(datetime(2026, 11, 23, 9, 35, 5))
+    builder.process_tick(Tick(symbol="NSE:NIFTY26NOVFUT", local_timestamp=t_093505, ltp=25680.0, cumulative_volume=2000, incremental_volume=500, is_index=False))
+
+    # 5. Flush at 09:40:00: 09:35 bar was complete and should be emitted
+    t_094000 = IST.localize(datetime(2026, 11, 23, 9, 40, 0))
+    builder.flush_closed_bars(t_094000)
+
+    closed_5m_final = [c for c in closed_bars if c.timeframe == "5m"]
+    assert len(closed_5m_final) == 2
+    assert closed_5m_final[1].timestamp == IST.localize(datetime(2026, 11, 23, 9, 35, 0))
+    assert closed_5m_final[1].close == 25680.0
+
+

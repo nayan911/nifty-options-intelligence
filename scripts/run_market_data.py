@@ -663,6 +663,7 @@ class MarketDataEngine:
             warmup_res = self.historical_manager.warm_up_technical_engine(
                 engine=self.technical_engine,
                 symbols=core_tracked,
+                reconcile_session=True,
             )
             for sym, info in warmup_res.items():
                 if sym.startswith("_"):
