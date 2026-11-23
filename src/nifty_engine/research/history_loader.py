@@ -121,10 +121,44 @@ class HistoryLoader:
                 return False
         return True
 
+    def _append_start(self, spec: SeriesSpec, resolution: str, start: date, end: date) -> Optional[date]:
+        """Stitched series are APPEND-ONLY: return the first day after the last complete stored day.
+
+        FYERS stitches by the requested contract's position at request time, and that meaning shifts
+        around each rollover (a refresh on 23-Nov via DEC returned near-month bars and overwrote the
+        stored next-month series from 25-Sep). Re-requesting or back-filling stored history is
+        therefore unsafe; only days after the stored range are fetched. Returns None if the series
+        is empty (initial download of the whole range).
+        """
+        stored = self.store.minutes_by_day(spec.store_symbol, spec.source, resolution, start, end)
+        if not stored:
+            return None
+        kind = kind_for(spec.kind)
+        allowed = self.sparse_tolerance if spec.kind == "CONT_NEXT" else 0
+        last_complete = None
+        for d in sorted(stored, reverse=True):
+            if resolution == "D":
+                last_complete = d
+                break
+            missing = len(set(expected_minutes(self.calendar, d, kind)) - stored[d])
+            if missing <= allowed:
+                last_complete = d
+                break
+        if last_complete is None:
+            return None
+        return last_complete + timedelta(days=1)
+
     def load(self, spec: SeriesSpec, start: date, end: date, resolution: str,
              resume: bool = True) -> LoadResult:
         res = LoadResult(spec=spec, resolution=resolution)
         span = DAILY_CHUNK_DAYS if resolution == "D" else INTRADAY_CHUNK_DAYS
+        if resume and spec.kind in ("CONT", "CONT_NEXT"):
+            nxt = self._append_start(spec, resolution, start, end)
+            if nxt is not None:
+                if nxt > end:
+                    res.skipped_chunks += 1
+                    return res
+                start = nxt
         for lo, hi in date_chunks(start, end, span):
             # Always refresh the most recent chunk (today's bars may have been partial before).
             if resume and hi < end and self._chunk_complete(spec, resolution, lo, hi):

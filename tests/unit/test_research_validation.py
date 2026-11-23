@@ -113,31 +113,57 @@ def test_real_contract_tolerates_sparse_minutes_and_skips_pre_listing_chunks():
 # ------------------------------------------------------------------ manifest gate
 def _fill(store, inst, src, sym, days, kind, **kw):
     store.upsert_bars(inst, sym, src, "1", [c for d in days for c in bars_for(sym, d, kind, **kw)])
+    daily = [Candle(symbol=sym, timeframe="D", timestamp=IST.localize(datetime(d.year, d.month, d.day)), open=1,
+                    high=1, low=1, close=1, volume=1, oi=kw.get("oi"), is_closed=True) for d in days]
+    store.upsert_bars(inst, sym, src, "D", daily)
+    if src in ("CONT", "CONT_NEXT"):
+        store._write("UPDATE hist_bars SET segment_id = 0 WHERE symbol = ? AND source = ? AND resolution = '1'",
+                     [sym, src])
 
 
-def test_manifest_ok_only_when_required_series_complete(tmp_path):
-    days = _tdays(date(2026, 9, 1), 10)
+def _complete_store(days):
     store = ResearchHistoryStore(":memory:")
     _fill(store, "NIFTY_SPOT", "SPOT", "NSE:NIFTY50-INDEX", days, CASH)
     _fill(store, "NIFTY_FUT", "CONT", "CONT:NIFTY:NEAR", days, FNO, oi=1000)
     _fill(store, "INDIAVIX", "SPOT", "NSE:INDIAVIX-INDEX", days, CASH)
     _fill(store, "BANKNIFTY_SPOT", "SPOT", "NSE:NIFTYBANK-INDEX", days, CASH)
     _fill(store, "BANKNIFTY_FUT", "CONT", "CONT:BANKNIFTY:NEAR", days, FNO, oi=1000)
+    return store
+
+
+def test_manifest_ok_only_when_required_series_complete(tmp_path):
+    days = _tdays(date(2026, 9, 1), 10)
+    store = _complete_store(days)
     m = build_manifest(store, CAL, days[0], days[-1])
     assert m["ok"], m["errors"]
+    path = write_manifest(m, tmp_path / "manifest.json")
+    assert require_valid_manifest(days[0], days[-1], store, path)["ok"]
+    with pytest.raises(ManifestError):
+        require_valid_manifest(days[0] - timedelta(days=30), days[-1], store, path)  # range not covered
 
     store._write("DELETE FROM hist_bars WHERE symbol = 'NSE:NIFTY50-INDEX' AND ts = ?",
                  [expected_minutes(CAL, days[3], CASH)[100]])
+    # Data changed after validation: the old manifest must no longer be accepted
+    with pytest.raises(ManifestError, match="changed since validation"):
+        require_valid_manifest(days[0], days[-1], store, path)
     m2 = build_manifest(store, CAL, days[0], days[-1])
     assert not m2["ok"] and any("NIFTY_SPOT" in e for e in m2["errors"])
+    write_manifest(m2, path)
+    with pytest.raises(ManifestError, match="not valid"):
+        require_valid_manifest(days[0], days[-1], store, path)
 
-    path = write_manifest(m2, tmp_path / "manifest.json")
-    with pytest.raises(ManifestError):
-        require_valid_manifest(days[0], days[-1], path)
-    write_manifest(m, path)
-    assert require_valid_manifest(days[0], days[-1], path)["ok"]
-    with pytest.raises(ManifestError):
-        require_valid_manifest(days[0] - timedelta(days=30), days[-1], path)  # range not covered
+
+def test_manifest_integrity_checks_daily_oi_segments():
+    days = _tdays(date(2026, 9, 1), 10)
+    store = _complete_store(days)
+    store._write("DELETE FROM hist_bars WHERE symbol = 'NSE:NIFTY50-INDEX' AND resolution = 'D' "
+                 "AND CAST(ts AS DATE) = ?", [days[2]])
+    store._write("UPDATE hist_bars SET oi = NULL WHERE symbol = 'CONT:NIFTY:NEAR' AND ts = ?",
+                 [expected_minutes(CAL, days[1], FNO)[5]])
+    store._write("UPDATE hist_bars SET segment_id = NULL WHERE symbol = 'CONT:BANKNIFTY:NEAR' AND ts = ?",
+                 [expected_minutes(CAL, days[1], FNO)[5]])
+    errs = " | ".join(build_manifest(store, CAL, days[0], days[-1])["errors"])
+    assert "without a daily bar" in errs and "without OI" in errs and "not assigned to a contract segment" in errs
 
 
 def test_out_of_session_bars_are_warned_not_counted():
@@ -145,7 +171,7 @@ def test_out_of_session_bars_are_warned_not_counted():
     store = ResearchHistoryStore(":memory:")
     store.upsert_bars("NIFTY_SPOT", "NSE:NIFTY50-INDEX", "SPOT", "1",
                       [c for d in days for c in bars_for("NSE:NIFTY50-INDEX", d, extra_before=5)])
-    m = build_manifest(store, CAL, days[0], days[-1], required=(("NIFTY_SPOT", "SPOT"),))
+    m = build_manifest(store, CAL, days[0], days[-1], required=())
     assert m["ok"]
     assert any("out-of-session" in w for w in m["warnings"])
 
@@ -175,7 +201,7 @@ def test_switch_accepted_when_two_signals_agree_even_if_oi_rule_misses():
 
 def test_off_calendar_switch_accepted_and_basis_only_move_disputed():
     store = ResearchHistoryStore(":memory:")
-    # 25-Sep pattern (no expiry): OI 2.1x and basis 433 -> 156 => switch
+    # Synthetic off-calendar switch: OI 2.1x and basis 433 -> 156 => switch (2 signals)
     # then 29-May -> 1-Jun pattern: basis move alone => disputed, not a boundary
     plan = [(date(2026, 9, 23), 25433.0, 500_000), (date(2026, 9, 24), 25433.0, 860_000),
             (date(2026, 9, 25), 25156.0, 1_800_000), (date(2026, 9, 28), 25300.0, 1_820_000)]
@@ -207,3 +233,72 @@ def test_manifest_json_roundtrip_has_rollover_votes(tmp_path):
     loaded = pd.read_json(path, typ="series")
     assert loaded["rollovers"]["NIFTY_FUT/CONT"]["accepted"][0]["day"] == "2026-02-25"
     assert isinstance(datetime.fromisoformat(loaded["generated_at"]), datetime)
+
+
+
+# ------------------------------------------------------------------ contract identity, repair, append-only
+from nifty_engine.research.contracts import (  # noqa: E402
+    contract_expiry_for,
+    identical_days,
+    repair_next_from_own,
+    segment_contract_table,
+)
+
+
+def test_contract_expiry_for_near_and_next():
+    assert contract_expiry_for(CAL, date(2026, 10, 15), "CONT") == date(2026, 10, 27)
+    assert contract_expiry_for(CAL, date(2026, 10, 15), "CONT_NEXT") == date(2026, 11, 23)
+    assert contract_expiry_for(CAL, date(2026, 11, 23), "CONT") == date(2026, 11, 23)  # expiry day itself
+
+
+def _own(store, inst, sym, expiry, days, px, oi):
+    bars = [c for d in days for c in bars_for(sym, d, FNO, px=px, oi=oi)]
+    store.upsert_bars(inst, sym, "OWN", "1", bars, contract_expiry=expiry)
+
+
+def test_next_series_duplicating_near_is_repaired_from_real_contract_or_deleted():
+    store = ResearchHistoryStore(":memory:")
+    d_repairable, d_lost = date(2026, 10, 15), date(2026, 9, 25)
+    for d in (d_repairable, d_lost):  # NEXT accidentally holds the near-month bars on both days
+        store.upsert_bars("NIFTY_FUT", "CONT:NIFTY:NEAR", "CONT", "1", bars_for("n", d, FNO, px=25000.0, oi=9))
+        store.upsert_bars("NIFTY_FUT", "CONT:NIFTY:NEXT", "CONT_NEXT", "1", bars_for("n", d, FNO, px=25000.0, oi=9))
+    _own(store, "NIFTY_FUT", "NSE:NIFTY26NOVFUT", date(2026, 11, 23), [d_repairable], 25150.0, 3)
+    _own(store, "BANKNIFTY_FUT", "NSE:BANKNIFTY26NOVFUT", date(2026, 11, 23), [d_repairable], 55000.0, 7)
+    assert identical_days(store, "NIFTY") == [d_lost, d_repairable]
+
+    rep = repair_next_from_own(store, CAL, "NIFTY_FUT", "NIFTY")
+    assert rep == {"repaired": [d_repairable], "deleted_unrecoverable": [d_lost]}
+    assert identical_days(store, "NIFTY") == []
+    closes = store.conn.execute("SELECT DISTINCT close FROM hist_bars WHERE symbol = 'CONT:NIFTY:NEXT'").fetchall()
+    assert closes == [(25150.0,)]  # NIFTY's real NOV contract, not BANKNIFTY's (same expiry date)
+
+
+def test_segment_identity_verified_conflict_inferred():
+    store = ResearchHistoryStore(":memory:")
+    d = date(2026, 10, 15)
+    store.upsert_bars("NIFTY_FUT", "CONT:NIFTY:NEXT", "CONT_NEXT", "1", bars_for("n", d, FNO, px=25150.0, oi=3))
+    store._write("UPDATE hist_bars SET segment_id = 0")
+    _own(store, "NIFTY_FUT", "NSE:NIFTY26NOVFUT", date(2026, 11, 23), [d], 25150.0, 3)
+    assert segment_contract_table(store, CAL, "NIFTY_FUT", "CONT_NEXT", "NIFTY")[0]["confidence"] == "VERIFIED"
+    store._write("UPDATE hist_bars SET close = close + 50 WHERE source = 'OWN'")
+    assert segment_contract_table(store, CAL, "NIFTY_FUT", "CONT_NEXT", "NIFTY")[0]["confidence"] == "CONFLICT"
+    store._write("DELETE FROM hist_bars WHERE source = 'OWN'")
+    assert segment_contract_table(store, CAL, "NIFTY_FUT", "CONT_NEXT", "NIFTY")[0]["confidence"] == "INFERRED"
+
+
+def test_stitched_series_are_append_only():
+    """A refresh must never rewrite stored stitched history (FYERS' stitching meaning shifts at rollover)."""
+    days = _tdays(date(2026, 9, 1), 20)
+    old, new = days[:10], days[10:]
+    store = ResearchHistoryStore(":memory:")
+    store.upsert_bars("NIFTY_FUT", "CONT:NIFTY:NEXT", "CONT_NEXT", "1",
+                      [c for d in old for c in bars_for("x", d, FNO, px=25150.0, oi=3)])
+    # Server now returns DIFFERENT (near-month) bars for the old days, plus the new days
+    served = [c for d in days for c in bars_for("x", d, FNO, px=25000.0, oi=9)]
+    rest = FakeRest(served)
+    spec = SeriesSpec("NIFTY_FUT", "NSE:NIFTY26DECFUT", "CONT_NEXT", resolutions=("1",), underlying="NIFTY")
+    HistoryLoader(rest, store, calendar=CAL).load(spec, days[0], days[-1], "1")
+    assert rest.calls == [(new[0].isoformat(), days[-1].isoformat())]  # only days after the stored range
+    old_px = store.conn.execute(
+        "SELECT DISTINCT close FROM hist_bars WHERE CAST(ts AS DATE) <= ?", [old[-1]]).fetchall()
+    assert old_px == [(25150.0,)]  # untouched

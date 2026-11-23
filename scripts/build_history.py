@@ -19,6 +19,7 @@ from nifty_engine.core.config import settings
 from nifty_engine.core.rate_limiter import AsyncTokenBucketRateLimiter
 from nifty_engine.data.fyers.instrument_master import FyersInstrumentMaster
 from nifty_engine.data.fyers.rest_client import FyersRestClient
+from nifty_engine.research.contracts import segment_contract_table, write_segment_table
 from nifty_engine.research.history_loader import HistoryLoader, SeriesSpec
 from nifty_engine.research.history_store import DEFAULT_RESEARCH_DB, ResearchHistoryStore
 from nifty_engine.research.manifest import DEFAULT_MANIFEST, build_manifest, write_manifest
@@ -97,6 +98,11 @@ def main() -> int:
 
     # Segment stitched futures by 2-of-3 vote (calendar, OI ratio, basis jump), then validate.
     segment_reports = segment_all(store, cal)
+    seg_rows = []
+    for inst, und in (("NIFTY_FUT", "NIFTY"), ("BANKNIFTY_FUT", "BANKNIFTY")):
+        for src in ("CONT", "CONT_NEXT"):
+            seg_rows += segment_contract_table(store, cal, inst, src, und)
+    write_segment_table(store, seg_rows)
     manifest = build_manifest(store, cal, start, end, segment_reports=segment_reports)
     bad_ohlc = [i for i in store.quality_report() if i.kind == "BAD_OHLC"]
     for i in bad_ohlc:
@@ -104,7 +110,10 @@ def main() -> int:
     manifest["ok"] = not manifest["errors"]
     path = write_manifest(manifest, args.manifest)
 
-    print(f"\nManifest: {path}  ok={manifest['ok']}  trading days={manifest['range']['trading_days']}")
+    print(f"\nManifest: {path}  ok={manifest['ok']}  trading days={manifest['range']['trading_days']}  "
+          f"fingerprint={manifest['dataset_fingerprint']}")
+    from collections import Counter
+    print("  contract identity:", dict(Counter(c["confidence"] for c in manifest["contract_segments"])))
     for key, rv in manifest["rollovers"].items():
         print(f"  {key}: {len(rv['accepted'])} contract switches accepted (>=2 of calendar/OI/basis), "
               f"{len(rv['disputed'])} single-signal disputed")

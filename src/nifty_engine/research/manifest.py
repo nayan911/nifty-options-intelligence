@@ -18,6 +18,7 @@ COMPLETE on every trading day. Backtests must refuse to run
 otherwise (see `require_valid_manifest`).
 """
 
+import hashlib
 import json
 import subprocess
 from dataclasses import dataclass
@@ -63,6 +64,66 @@ def _git_commit() -> str:
                               timeout=5).stdout.strip() or "unknown"
     except Exception:
         return "unknown"
+
+
+def dataset_fingerprint(store: ResearchHistoryStore) -> str:
+    """Content fingerprint of the research dataset plus the calendar config it was validated with.
+
+    Any added/removed/changed bar (count, time range, price or OI totals per series) or any change
+    to the holiday/session config yields a different fingerprint.
+    """
+    rows = store.conn.execute(
+        """SELECT instrument, source, symbol, resolution, count(*), min(ts)::VARCHAR, max(ts)::VARCHAR,
+                  round(sum(close), 4), sum(coalesce(oi, 0)), sum(volume), sum(coalesce(segment_id, -1))
+           FROM hist_bars GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4"""
+    ).fetchall()
+    h = hashlib.sha256(repr(rows).encode())
+    from nifty_engine.core.config import settings
+    for cfg in (settings.HOLIDAYS_CONFIG_PATH, settings.SESSIONS_CONFIG_PATH):
+        p = Path(cfg)
+        h.update(p.read_bytes() if p.exists() else b"")
+    return h.hexdigest()[:24]
+
+
+def _integrity_errors(store: ResearchHistoryStore, cal: ExchangeCalendar, trading_days: Sequence[date],
+                      required: Sequence[Tuple[str, str]]) -> List[str]:
+    """Checks beyond 1m coverage: daily bars, futures OI, segment ids, contract identity."""
+    errors: List[str] = []
+    tset = set(trading_days)
+    lo, hi = (min(trading_days), max(trading_days)) if trading_days else (None, None)
+    for inst, src in required:
+        have = {r[0] for r in store.conn.execute(
+            """SELECT DISTINCT CAST(ts AS DATE) FROM hist_bars WHERE instrument = ? AND source = ?
+               AND resolution = 'D' AND CAST(ts AS DATE) BETWEEN ? AND ?""", [inst, src, lo, hi]).fetchall()}
+        miss = sorted(tset - have)
+        if miss:
+            errors.append(f"{inst}/{src}: {len(miss)} trading day(s) without a daily bar, e.g. {miss[:3]}")
+    for inst, src, sym, n in store.conn.execute(
+        """SELECT instrument, source, symbol, count(*) FROM hist_bars
+           WHERE source IN ('CONT', 'CONT_NEXT', 'OWN') AND oi IS NULL GROUP BY 1, 2, 3"""
+    ).fetchall():
+        errors.append(f"{inst}/{src} {sym}: {n} futures bars without OI")
+    for inst, src, n in store.conn.execute(
+        """SELECT instrument, source, count(*) FROM hist_bars
+           WHERE source IN ('CONT', 'CONT_NEXT') AND resolution = '1' AND segment_id IS NULL GROUP BY 1, 2"""
+    ).fetchall():
+        errors.append(f"{inst}/{src}: {n} stitched bars not assigned to a contract segment")
+    has_table = store.conn.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'cont_segments'").fetchall()[0][0]
+    if has_table:
+        for inst, src, sid, lo_d, hi_d, m, c in store.conn.execute(
+            """SELECT instrument, source, segment_id, start_day, end_day, matched_bars, checked_bars
+               FROM cont_segments WHERE confidence = 'CONFLICT'"""
+        ).fetchall():
+            errors.append(f"{inst}/{src} segment {sid} ({lo_d}..{hi_d}): contract identity CONFLICT ({m}/{c} bars "
+                          "match the expected real contract)")
+    from nifty_engine.research.contracts import identical_days
+    for und in ("NIFTY", "BANKNIFTY"):
+        same = identical_days(store, und)
+        if same:
+            errors.append(f"{und}: NEAR and NEXT stitched series are the same contract on {len(same)} day(s), "
+                          f"e.g. {same[:3]}")
+    return errors
 
 
 def classify_series_days(
@@ -162,9 +223,24 @@ def build_manifest(
             warnings.append(f"{key}: single-signal possible contract switch {b['prev_day']}->{b['day']} "
                             f"votes={b['votes']} (not treated as a boundary)")
 
+    errors.extend(_integrity_errors(store, cal, trading_days, required))
+    contract_ids = []
+    has_table = store.conn.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'cont_segments'").fetchall()[0][0]
+    if has_table:
+        for r in store.conn.execute(
+            """SELECT instrument, source, segment_id, start_day, end_day, contract_expiry, contract_symbol,
+                      confidence, matched_bars, checked_bars FROM cont_segments ORDER BY 1, 2, 3"""
+        ).fetchall():
+            contract_ids.append({"instrument": r[0], "source": r[1], "segment_id": r[2], "start": str(r[3]),
+                                 "end": str(r[4]), "contract_expiry": str(r[5]), "contract_symbol": r[6],
+                                 "confidence": r[7], "matched_bars": r[8], "checked_bars": r[9]})
+
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "git_commit": _git_commit(),
+        "dataset_fingerprint": dataset_fingerprint(store),
+        "contract_segments": contract_ids,
         "range": {"start": start.isoformat(), "end": end.isoformat(), "trading_days": len(trading_days)},
         "ok": not errors,
         "errors": errors,
@@ -183,8 +259,10 @@ def write_manifest(manifest: Dict, path: Union[str, Path] = DEFAULT_MANIFEST) ->
     return p
 
 
-def require_valid_manifest(start: date, end: date, path: Union[str, Path] = DEFAULT_MANIFEST) -> Dict:
-    """Gate for backtests: raise unless a manifest exists, is ok, and covers [start, end]."""
+def require_valid_manifest(start: date, end: date, store: Optional[ResearchHistoryStore],
+                           path: Union[str, Path] = DEFAULT_MANIFEST) -> Dict:
+    """Gate for backtests: raise unless a manifest exists, is ok, covers [start, end], and still
+    describes the data in `store` (fingerprint unchanged since validation)."""
     p = Path(path)
     if not p.exists():
         raise ManifestError(f"No dataset manifest at {p}; run scripts/build_history.py first")
@@ -194,6 +272,12 @@ def require_valid_manifest(start: date, end: date, path: Union[str, Path] = DEFA
     r = m["range"]
     if date.fromisoformat(r["start"]) > start or date.fromisoformat(r["end"]) < end:
         raise ManifestError(f"Manifest covers {r['start']}..{r['end']}, backtest needs {start}..{end}")
+    if store is None:
+        raise ManifestError("A store is required to verify the manifest still matches the data")
+    current = dataset_fingerprint(store)
+    if m.get("dataset_fingerprint") != current:
+        raise ManifestError(f"Dataset changed since validation (manifest {m.get('dataset_fingerprint')}, "
+                            f"data now {current}); re-run scripts/build_history.py --validate-only")
     return m
 
 

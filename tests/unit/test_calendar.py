@@ -146,3 +146,14 @@ def test_fo_closing_time_follows_dated_history(calendar):
     assert calendar.get_session_state(after, is_derivative=True) == SessionState.DERIVATIVES_EXT
     assert calendar.derivatives_close_on(date(2026, 7, 30)).strftime("%H:%M") == "15:30"
     assert calendar.derivatives_close_on(date(2026, 7, 31)).strftime("%H:%M") == "15:40"
+
+
+def test_special_session_respects_fo_close_and_exclusive_end(calendar):
+    """Muhurat 8-Nov-2026: cash 14:20-15:30, futures to 15:40 (FYERS history: 70 / 80 bars)."""
+    t = lambda h, m: IST.localize(datetime(2026, 11, 8, h, m, 0))  # noqa: E731
+    assert calendar.get_session_state(t(15, 29), is_derivative=False) == SessionState.SPECIAL_SESSION
+    assert calendar.get_session_state(t(15, 30), is_derivative=False) == SessionState.CLOSED
+    assert calendar.get_session_state(t(15, 30), is_derivative=True) == SessionState.SPECIAL_SESSION
+    assert calendar.get_session_state(t(15, 35), is_derivative=True) == SessionState.SPECIAL_SESSION
+    assert calendar.get_session_state(t(15, 40), is_derivative=True) == SessionState.CLOSED
+    assert calendar.get_session_state(t(14, 19), is_derivative=True) == SessionState.CLOSED

@@ -122,8 +122,13 @@ class ExchangeCalendar:
         if current_date in self.special_sessions:
             cfg = self.special_sessions[current_date]
             start_t = datetime.strptime(cfg["session_start"], "%H:%M:%S").time()
-            end_t = datetime.strptime(cfg["session_end"], "%H:%M:%S").time()
-            if start_t <= current_time <= end_t:
+            cash_end = datetime.strptime(cfg["session_end"], "%H:%M:%S").time()
+            # F&O may trade past the cash close in a special session (Muhurat 2026: futures to 15:39).
+            fno_end = (datetime.strptime(cfg["derivatives_close"], "%H:%M:%S").time()
+                       if cfg.get("derivatives_close") else cash_end)
+            end_t = fno_end if is_derivative else cash_end
+            # End is exclusive, like the regular session: at exactly the close the market is closed.
+            if start_t <= current_time < end_t:
                 return SessionState.SPECIAL_SESSION
             return SessionState.CLOSED
 

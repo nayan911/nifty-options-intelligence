@@ -12,8 +12,10 @@ signals:
 
 A boundary is ACCEPTED with >= 2 votes; a single vote is recorded as DISPUTED for review.
 Evidence from the 2026 data: the OI rule missed the NIFTY near-month Feb switch (OI only 1.6x,
-basis -13 -> +158) and the calendar missed a BANKNIFTY next-month switch FYERS made on 25-Sep
-(OI 2.1x, basis 433 -> 156). No single rule is reliable; two agreeing rules were in every case.
+basis -13 -> +173), and basis alone fires on market-wide moves (29-May -> 1-Jun in all series).
+(An apparent off-calendar BANKNIFTY "switch" on 25-Sep was later traced to a refresh that had
+overwritten the next-month series with near-month bars; see research.contracts. The vote did flag
+it, which is how it was found.) Contract identity is verified separately in research.contracts.
 """
 
 from datetime import date
