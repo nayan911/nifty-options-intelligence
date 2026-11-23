@@ -112,7 +112,10 @@ def test_repaired_engine_matches_clean_restart_after_mid_candle_outage(store, mo
     assert "live again" in bf.observe(t(13, 47, 20), {FUT: t(13, 47, 20)}, True).lower()
     clock["now"] = t(13, 48, 6)
     assert "repairing" in bf.observe(clock["now"], {FUT: clock["now"]}, True).lower()
-    bf._worker.join(timeout=5)
+    # Real DuckDB + full warmup in the worker: ~3s locally, ~7.5s under CI coverage tracing.
+    # Wait generously; a genuine hang still fails loudly here.
+    bf._worker.join(timeout=60)
+    assert not bf._worker.is_alive(), "repair worker hung"
     msg = bf.observe(clock["now"], {FUT: clock["now"]}, True)
     assert "repaired" in msg.lower() and not bf.active
 
@@ -215,7 +218,7 @@ def test_entire_repair_runs_off_the_maintenance_loop_and_retries_on_failure():
     assert _t.monotonic() - start < 0.2
 
     release.set()
-    bf._worker.join(timeout=5)
+    bf._worker.join(timeout=30)
     msg = bf.observe(t(10, 3, 12), {FUT: t(10, 3, 12)}, True)
     assert "failed" in msg and bf.active
     engine.adopt_states.assert_not_called()  # never touch live state on failure
@@ -239,7 +242,7 @@ def test_rebuild_exception_does_not_crash_and_leaves_live_state_untouched():
     engine = MagicMock()
     bf = FeedGapBackfiller(hm, engine, MagicMock(), lambda: [FUT], gap_seconds=15)
     drive_to_repair(bf)
-    bf._worker.join(timeout=5)
+    bf._worker.join(timeout=30)
     msg = bf.observe(t(10, 3, 7), {FUT: t(10, 3, 7)}, True)
     assert "failed" in msg and "daily levels missing" in msg
     assert bf.active and bf.state == bf.AWAITING_SETTLE
@@ -252,7 +255,7 @@ def test_swap_failure_and_state_machine_errors_never_raise():
     engine.adopt_states.side_effect = RuntimeError("boom")
     bf = FeedGapBackfiller(hm, engine, MagicMock(), lambda: [FUT], gap_seconds=15)
     drive_to_repair(bf)
-    bf._worker.join(timeout=5)
+    bf._worker.join(timeout=30)
     msg = bf.observe(t(10, 3, 7), {FUT: t(10, 3, 7)}, True)
     assert "swap failed" in msg and bf.active
 
@@ -275,7 +278,7 @@ def test_repair_rejected_when_fyers_did_not_return_outage_bars():
     engine = MagicMock()
     bf = FeedGapBackfiller(hm, engine, MagicMock(), lambda: [FUT], gap_seconds=15)
     drive_to_repair(bf)
-    bf._worker.join(timeout=5)
+    bf._worker.join(timeout=30)
     msg = bf.observe(t(10, 3, 7), {FUT: t(10, 3, 7)}, True)
     assert "did not return" in msg and "10:00" in msg and bf.active
     engine.adopt_states.assert_not_called()
@@ -303,7 +306,7 @@ def test_bar_closing_during_rebuild_is_replayed_not_lost():
     late = bar("1m", t(10, 3))
     assert bf.hold(late) is True  # closes while the worker is busy
     release.set()
-    bf._worker.join(timeout=5)
+    bf._worker.join(timeout=30)
     assert "repaired" in bf.observe(t(10, 3, 7), {FUT: t(10, 3, 7)}, True).lower()
     shadow.bootstrap_candles.assert_called_once_with([late])
     engine.adopt_states.assert_called_once_with(shadow, [FUT])
