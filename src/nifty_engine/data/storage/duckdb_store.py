@@ -231,36 +231,45 @@ class DuckDBStore(IStorageEngine):
             )
 
     def insert_candles_batch(self, candles: List[Candle]) -> int:
-        """Efficiently batch-inserts candles using DuckDB parameter binding."""
+        """Bulk upsert candles in one statement (INSERT OR REPLACE semantics preserved).
+
+        Previously executemany() inserted row by row (~3.5 ms/candle: ~7 s per 2,000 bars at every
+        live warmup/reconcile). Rows are now bulk-loaded from a DataFrame. Within a batch the LAST
+        occurrence of a (symbol, timeframe, timestamp) wins, exactly as sequential upserts did.
+        """
         if not candles:
             return 0
-        rows = [
-            (
-                c.symbol,
-                c.timeframe,
-                c.timestamp,
-                c.open,
-                c.high,
-                c.low,
-                c.close,
-                c.volume,
-                c.oi,
-                c.is_closed,
-                c.observed_at,
-            )
-            for c in candles
-        ]
+        import pandas as pd
+
+        df = pd.DataFrame(
+            [
+                (c.symbol, c.timeframe, c.timestamp, c.open, c.high, c.low, c.close, c.volume, c.oi,
+                 c.is_closed, c.observed_at)
+                for c in candles
+            ],
+            columns=["symbol", "timeframe", "timestamp", "open", "high", "low", "close", "volume", "oi",
+                     "is_closed", "observed_at"],
+        )
+        df = df.drop_duplicates(subset=["symbol", "timeframe", "timestamp"], keep="last")
+        df["oi"] = df["oi"].astype("Int64")
+        df["observed_at"] = pd.to_datetime(df["observed_at"], utc=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         with self._lock:
             cur = self._conn.cursor()
-            cur.executemany(
-                """
-                INSERT OR REPLACE INTO candles (
-                    symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed, observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
-        return len(rows)
+            cur.register("candle_batch", df)
+            try:
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO candles (
+                        symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed, observed_at
+                    )
+                    SELECT symbol, timeframe, timestamp, open, high, low, close, volume, oi, is_closed, observed_at
+                    FROM candle_batch
+                    """
+                )
+            finally:
+                cur.unregister("candle_batch")
+        return len(candles)
 
     def get_latest_candle_timestamp(self, symbol: str, timeframe: str) -> Optional[datetime]:
         """Returns the latest candle timestamp for a symbol and timeframe, or None if empty."""
