@@ -284,7 +284,12 @@ class MarketDataEngine:
 
         # 1. Technical indicator and reference level assessment
         core_tracked = [settings.PRIMARY_INDEX, self.technical_engine.primary_futures]
-        assessed_readiness, details = self.historical_manager.assess_readiness(self.technical_engine, core_tracked)
+        now = now_ist()
+        assessed_readiness, details = self.historical_manager.assess_readiness(
+            self.technical_engine,
+            core_tracked,
+            as_of_date=now.date(),
+        )
         effective_readiness = assessed_readiness
 
         # 2. Live feed health & connection gating during active market hours

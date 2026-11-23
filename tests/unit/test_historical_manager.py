@@ -748,9 +748,11 @@ def test_reconcile_session_candles_overwrites_corrupted_candles(store):
 
     manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
 
-    # 3. Run reconciliation
-    res = manager.reconcile_session_candles([sym], target_date=date(2026, 11, 23), timeframes=["15m"])
+    # 3. Run reconciliation as of 09:30 AM (exactly 1 15m candle expected)
+    t_as_of = IST.localize(datetime(2026, 11, 23, 9, 30))
+    res = manager.reconcile_session_candles([sym], target_date=date(2026, 11, 23), timeframes=["15m"], as_of=t_as_of)
     assert res[sym]["15m"] == 1
+    assert manager.is_symbol_reconciled(sym, session_date=date(2026, 11, 23), timeframes=["15m"]) is True
 
     # 4. Verify DuckDB row has been repaired and replaced with official values
     stored_after = store.get_candles(sym, "15m", start_time=t_0915, end_time=t_0915)[0]
@@ -826,6 +828,81 @@ def test_missing_cdo_during_active_session_blocks_readiness(store, monkeypatch):
 
     assert details[sym]["has_cdo"] is False
     assert readiness == SystemReadiness.NOT_READY
+
+
+def test_empty_reconciliation_response_fails_readiness_on_missing_intervals(store, monkeypatch):
+    """Verify that when FYERS returns 0 completed candles when intervals were expected,
+
+    reconciliation is marked incomplete and readiness is NOT_READY.
+    """
+    sym = "NSE:NIFTY26NOVFUT"
+    mock_10am = IST.localize(datetime(2026, 11, 23, 10, 0))
+    monkeypatch.setattr("nifty_engine.data.historical_manager.now_ist", lambda: mock_10am)
+
+    # 1. Seed prior daily candle and 09:15 opening candle so CDO is established
+    d_candle = make_candle(sym, "D", IST.localize(datetime(2026, 11, 20, 15, 30)), 25000.0, 25200.0, 24900.0, 25150.0)
+    store.insert_candle(d_candle)
+
+    # Mock broker returning empty candle list (0 candles)
+    mock_rest = MagicMock()
+    mock_rest.get_historical_candles_sync.return_value = []
+
+    manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
+    engine = TechnicalAnalysisEngine(primary_index="NSE:NIFTY50-INDEX", primary_futures=sym)
+    engine.prepare_session(date(2026, 11, 23))
+    engine.set_daily_references(symbol=sym, pdh=25200.0, pdl=24900.0, pdc=25150.0, cdo=25100.0)
+
+    # Simulate indicators warmed up from prior day bars
+    snap_5m = MagicMock()
+    snap_5m.is_warmed_up = True
+    snap_1m = MagicMock()
+    snap_1m.is_warmed_up = True
+    engine.states[sym].latest_snapshots["5m"] = snap_5m
+    engine.states[sym].latest_snapshots["1m"] = snap_1m
+
+    # 2. Reconcile session candles at 10:00 AM (expected 3 15m, 9 5m, 45 1m bars)
+    results = manager.reconcile_session_candles([sym], target_date=date(2026, 11, 23))
+    assert results[sym]["15m"] == 0
+    assert results[sym]["5m"] == 0
+
+    # 3. CRITICAL: Reconciliation must be marked False because expected intervals are missing
+    assert manager.is_symbol_reconciled(sym, session_date=date(2026, 11, 23)) is False
+    errors = manager.get_reconciliation_errors(sym, session_date=date(2026, 11, 23))
+    assert "15m" in errors and "missing" in errors["15m"].lower()
+    assert "5m" in errors and "missing" in errors["5m"].lower()
+
+    # 4. Readiness must evaluate to NOT_READY
+    readiness, details = manager.assess_readiness(engine, [sym], as_of_date=date(2026, 11, 23))
+    assert readiness == SystemReadiness.NOT_READY
+    assert details[sym]["is_reconciled"] is False
+    assert details[sym]["data_complete"] is False
+
+
+def test_reconciliation_status_tied_to_session_date(store):
+    """Verify that successful reconciliation on one date does NOT validate another trading date."""
+    sym = "NSE:NIFTY26NOVFUT"
+    mock_rest = MagicMock()
+    # Return 3 15m candles
+    t_0915 = IST.localize(datetime(2026, 11, 20, 9, 15))
+    bars = [
+        make_candle(sym, "15m", t_0915, 25000, 25050, 24950, 25020),
+        make_candle(sym, "15m", t_0915 + timedelta(minutes=15), 25020, 25080, 25010, 25060),
+        make_candle(sym, "15m", t_0915 + timedelta(minutes=30), 25060, 25100, 25040, 25090),
+    ]
+    mock_rest.get_historical_candles_sync.return_value = bars
+
+    manager = HistoricalCandleManager(rest_client=mock_rest, store=store)
+
+    # 1. Reconcile on Friday 2026-11-20 at 10:00 AM
+    t_fri_10am = IST.localize(datetime(2026, 11, 20, 10, 0))
+    manager.reconcile_session_candles([sym], target_date=date(2026, 11, 20), timeframes=["15m"], as_of=t_fri_10am)
+
+    # Friday is reconciled
+    assert manager.is_symbol_reconciled(sym, session_date=date(2026, 11, 20), timeframes=["15m"]) is True
+
+    # 2. Monday 2026-11-23 is NOT reconciled!
+    assert manager.is_symbol_reconciled(sym, session_date=date(2026, 11, 23), timeframes=["15m"]) is False
+
 
 
 

@@ -10,7 +10,7 @@ Manages incremental caching of multi-timeframe completed candles from FYERS into
 
 import logging
 from datetime import date, datetime, time, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pytz
 
@@ -45,21 +45,65 @@ class HistoricalCandleManager:
         self.rest_client = rest_client
         self.store = store
         self.calendar = calendar or ExchangeCalendar()
-        self.reconciliation_status: Dict[Tuple[str, str], bool] = {}
-        self.reconciliation_errors: Dict[Tuple[str, str], str] = {}
-        self.reconciliation_counts: Dict[Tuple[str, str], int] = {}
+        self.reconciliation_status: Dict[Tuple[str, str, date], bool] = {}
+        self.reconciliation_errors: Dict[Tuple[str, str, date], str] = {}
+        self.reconciliation_counts: Dict[Tuple[str, str, date], int] = {}
+        self.reconciliation_required_sessions: Set[date] = set()
 
-    def is_symbol_reconciled(self, symbol: str, timeframes: Optional[List[str]] = None) -> bool:
-        """Returns True if reconciliation succeeded for all requested timeframes of symbol."""
+    @classmethod
+    def get_expected_closed_intervals(
+        cls,
+        session_date: date,
+        timeframe: str,
+        as_of: Optional[datetime] = None,
+    ) -> List[datetime]:
+        """Calculates expected completed interval start timestamps for session_date up to as_of.
+
+        Session trading window: 09:15 to 15:30 IST.
+        An interval starting at T with duration M minutes is closed when T + M <= min(as_of, 15:30).
+        """
+        now = as_of or now_ist()
+        session_start = IST.localize(datetime.combine(session_date, time(9, 15)))
+        session_end = IST.localize(datetime.combine(session_date, time(15, 30)))
+
+        interval_mins = 15 if timeframe == "15m" else (5 if timeframe == "5m" else 1)
+        bar_delta = timedelta(minutes=interval_mins)
+
+        # If as_of is before session start or before first bar completion
+        if now < session_start + bar_delta:
+            return []
+
+        effective_cutoff = min(now, session_end)
+        expected: List[datetime] = []
+        curr = session_start
+        while curr + bar_delta <= effective_cutoff:
+            expected.append(curr)
+            curr += bar_delta
+
+        return expected
+
+    def is_symbol_reconciled(
+        self,
+        symbol: str,
+        session_date: Optional[date] = None,
+        timeframes: Optional[List[str]] = None,
+    ) -> bool:
+        """Returns True if reconciliation succeeded and bar coverage is complete for all requested timeframes."""
+        s_date = session_date or now_ist().date()
         tfs = timeframes or ["15m", "5m", "1m"]
-        return all(self.reconciliation_status.get((symbol, tf), False) for tf in tfs)
+        return all(self.reconciliation_status.get((symbol, tf, s_date), False) for tf in tfs)
 
-    def get_reconciliation_errors(self, symbol: str) -> Dict[str, str]:
-        """Returns map of {timeframe: error_message} for any failed reconciliation calls."""
+    def get_reconciliation_errors(
+        self,
+        symbol: str,
+        session_date: Optional[date] = None,
+    ) -> Dict[str, str]:
+        """Returns map of {timeframe: error_message} for any failed reconciliation calls for session_date."""
+        s_date = session_date or now_ist().date()
         return {
             tf: err
-            for (sym, tf), err in self.reconciliation_errors.items()
-            if sym == symbol
+            for (sym, tf, dt), err in self.reconciliation_errors.items()
+            if sym == symbol and dt == s_date
         }
 
     def sync_candles(
@@ -194,16 +238,24 @@ class HistoricalCandleManager:
         symbols: List[str],
         target_date: Optional[date] = None,
         timeframes: Optional[List[str]] = None,
+        as_of: Optional[datetime] = None,
     ) -> Dict[str, Dict[str, int]]:
         """Reconciles and overwrites intraday candles for target_date against FYERS historical API.
 
-        Fetches verified broker candles (15m, 5m, 1m) directly for target_date and batch-upserts
-        them into DuckDB, repairing any truncated or corrupted candles recorded during live streaming.
+        Fetches verified broker candles (15m, 5m, 1m) directly for target_date, batch-upserts
+        them into DuckDB, and validates that all expected closed intervals are present in storage.
         """
         t_date = target_date or now_ist().date()
         date_str = t_date.strftime("%Y-%m-%d")
         tfs = timeframes or ["15m", "5m", "1m"]
+        as_of_dt = as_of or now_ist()
         results: Dict[str, Dict[str, int]] = {}
+
+        # Mark this session date as requiring verified reconciliation
+        self.reconciliation_required_sessions.add(t_date)
+
+        session_start = IST.localize(datetime.combine(t_date, time(9, 15)))
+        session_end = IST.localize(datetime.combine(t_date, time(15, 30)))
 
         for sym in symbols:
             results[sym] = {}
@@ -228,15 +280,44 @@ class HistoricalCandleManager:
                             date_str,
                         )
                     results[sym][tf] = count
-                    self.reconciliation_status[(sym, tf)] = True
-                    self.reconciliation_counts[(sym, tf)] = count
-                    self.reconciliation_errors.pop((sym, tf), None)
+
+                    # Validate expected bar coverage:
+                    expected_intervals = self.get_expected_closed_intervals(t_date, tf, as_of=as_of_dt)
+                    expected_count = len(expected_intervals)
+
+                    # Check store's total completed candles for today
+                    stored_candles = self.store.get_candles(
+                        sym,
+                        tf,
+                        start_time=session_start,
+                        end_time=session_end,
+                    )
+                    stored_closed = [c for c in stored_candles if c.is_closed]
+                    stored_timestamps = {c.timestamp for c in stored_closed}
+
+                    missing_intervals = [ts for ts in expected_intervals if ts not in stored_timestamps]
+
+                    if expected_count > 0 and missing_intervals:
+                        error_msg = (
+                            f"Incomplete candle coverage for {sym} ({tf}) on {date_str}: "
+                            f"missing {len(missing_intervals)}/{expected_count} expected intervals "
+                            f"(first missing: {missing_intervals[0].strftime('%H:%M:%S')})"
+                        )
+                        logger.warning(error_msg)
+                        self.reconciliation_status[(sym, tf, t_date)] = False
+                        self.reconciliation_counts[(sym, tf, t_date)] = len(stored_closed)
+                        self.reconciliation_errors[(sym, tf, t_date)] = error_msg
+                    else:
+                        self.reconciliation_status[(sym, tf, t_date)] = True
+                        self.reconciliation_counts[(sym, tf, t_date)] = len(stored_closed)
+                        self.reconciliation_errors.pop((sym, tf, t_date), None)
+
                 except Exception as e:
                     logger.warning("Reconciliation failed for %s (%s) on %s: %s", sym, tf, date_str, e)
                     results[sym][tf] = 0
-                    self.reconciliation_status[(sym, tf)] = False
-                    self.reconciliation_counts[(sym, tf)] = 0
-                    self.reconciliation_errors[(sym, tf)] = str(e)
+                    self.reconciliation_status[(sym, tf, t_date)] = False
+                    self.reconciliation_counts[(sym, tf, t_date)] = 0
+                    self.reconciliation_errors[(sym, tf, t_date)] = str(e)
 
         return results
 
@@ -283,22 +364,28 @@ class HistoricalCandleManager:
         self,
         engine: TechnicalAnalysisEngine,
         symbols: List[str],
-        require_reconciliation: bool = False,
+        require_reconciliation: Optional[bool] = None,
         as_of_date: Optional[date] = None,
     ) -> Tuple[SystemReadiness, Dict[str, Any]]:
         """Assesses system operational readiness across all tracked symbols.
 
         Rules:
         - READY: All tracked symbols have complete daily reference levels (PDH, PDL, PDC, and verified CDO if session active),
-          both 5m and 1m indicators are warmed up, and broker reconciliation succeeded (if required).
+          both 5m and 1m indicators are warmed up, and broker reconciliation succeeded with full bar coverage for target_date.
         - DEGRADED: All tracked symbols have daily levels, verified data completeness/reconciliation, and 5m indicators are warmed up,
           but 1m indicators are still cold (< 21 bars).
         - NOT_READY: Any tracked symbol is missing daily reference levels, has cold 5m indicators, missing opening price during active session,
-          or failed broker reconciliation when required.
+          or failed broker reconciliation / missing expected interval bars when required.
         """
         target_date = as_of_date or now_ist().date()
         now = now_ist()
         is_active_session = target_date < now.date() or (target_date == now.date() and now.time() >= time(9, 15))
+
+        enforce_recon = (
+            require_reconciliation
+            if require_reconciliation is not None
+            else (target_date in self.reconciliation_required_sessions)
+        )
 
         details: Dict[str, Any] = {}
         all_have_daily = True
@@ -318,8 +405,8 @@ class HistoricalCandleManager:
 
             has_cdo = bool(daily_refs.get("CDO") is not None) if is_active_session else True
 
-            is_reconciled = self.is_symbol_reconciled(sym) if require_reconciliation else True
-            recon_errors = self.get_reconciliation_errors(sym) if require_reconciliation else {}
+            is_reconciled = self.is_symbol_reconciled(sym, session_date=target_date) if enforce_recon else True
+            recon_errors = self.get_reconciliation_errors(sym, session_date=target_date) if enforce_recon else {}
 
             snap_5m = state.latest_snapshots.get("5m") if state else None
             is_5m = snap_5m.is_warmed_up if snap_5m else False
@@ -354,7 +441,7 @@ class HistoricalCandleManager:
             if not is_1m:
                 all_1m_warmed = False
 
-        if not all_have_daily or not all_have_cdo or not all_5m_warmed or (require_reconciliation and not all_reconciled):
+        if not all_have_daily or not all_have_cdo or not all_5m_warmed or (enforce_recon and not all_reconciled):
             readiness = SystemReadiness.NOT_READY
         elif not all_1m_warmed:
             readiness = SystemReadiness.DEGRADED

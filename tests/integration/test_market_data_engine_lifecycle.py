@@ -380,3 +380,65 @@ def test_runner_drops_incomplete_initial_15m_bar_and_prevents_duplicate_close():
     store.close()
 
 
+def test_runner_continuous_checks_preserve_failed_reconciliation_not_ready(monkeypatch):
+    """Verify that when historical session reconciliation fails, continuous runner checks
+
+    never upgrade readiness to READY even if subsequent candle-close events arrive.
+    """
+    from unittest.mock import MagicMock
+
+    from nifty_engine.core.config import settings
+
+    store = DuckDBStore(db_path=":memory:")
+    engine = MarketDataEngine(store=store)
+
+    t_now = IST.localize(datetime(2026, 11, 23, 10, 0, 0))
+    monkeypatch.setattr(engine.calendar, "get_session_state", lambda is_derivative=True: SessionState.REGULAR_CASH)
+    monkeypatch.setattr("run_market_data.now_ist", lambda: t_now)
+
+    sym_idx = settings.PRIMARY_INDEX
+    sym_fut = engine.technical_engine.primary_futures
+    session_dt = date(2026, 11, 23)
+
+    # 1. Simulate failed reconciliation recorded for today's session
+    engine.historical_manager.reconciliation_required_sessions.add(session_dt)
+    for tf in ["15m", "5m", "1m"]:
+        engine.historical_manager.reconciliation_status[(sym_idx, tf, session_dt)] = False
+        engine.historical_manager.reconciliation_status[(sym_fut, tf, session_dt)] = False
+
+    # 2. Seed daily references and simulate 100% warmed up indicators for both 5m and 1m
+    engine.technical_engine.prepare_session(session_dt)
+    engine.technical_engine.set_daily_references(sym_idx, pdh=25200.0, pdl=24900.0, pdc=25100.0, cdo=25105.0)
+    engine.technical_engine.set_daily_references(sym_fut, pdh=25250.0, pdl=24950.0, pdc=25150.0, cdo=25155.0)
+
+    snap_warmed = MagicMock()
+    snap_warmed.is_warmed_up = True
+    snap_warmed.trend_bias = "BULLISH"
+    engine.technical_engine.states[sym_idx].latest_snapshots["5m"] = snap_warmed
+    engine.technical_engine.states[sym_idx].latest_snapshots["1m"] = snap_warmed
+    engine.technical_engine.states[sym_fut].latest_snapshots["5m"] = snap_warmed
+    engine.technical_engine.states[sym_fut].latest_snapshots["1m"] = snap_warmed
+
+    engine.ws_client._is_connected = True
+    engine.last_primary_tick_time = t_now
+
+    # 3. Continuous readiness check: MUST be NOT_READY because reconciliation failed!
+    r1 = engine.evaluate_and_update_readiness()
+    assert r1 == SystemReadiness.NOT_READY
+    assert engine.paper_engine.system_readiness == SystemReadiness.NOT_READY
+
+    # 4. Simulate subsequent candle close event advancing time
+    t_later = t_now + timedelta(minutes=5)
+    monkeypatch.setattr("run_market_data.now_ist", lambda: t_later)
+    engine.last_primary_tick_time = t_later
+
+    r2 = engine.evaluate_and_update_readiness()
+    assert r2 == SystemReadiness.NOT_READY
+    assert engine.paper_engine.system_readiness == SystemReadiness.NOT_READY, (
+        "Subsequent candle close event must NEVER bypass failed reconciliation state"
+    )
+
+    store.close()
+
+
+
