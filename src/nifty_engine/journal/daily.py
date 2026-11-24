@@ -63,7 +63,7 @@ def _quotes(ticks: pd.DataFrame) -> pd.DataFrame:
         if c not in t:
             t[c] = None
     t["ts"] = pd.to_datetime(t["local_timestamp"], utc=True).dt.tz_convert("Asia/Kolkata")
-    t = t[t["event_class"].fillna("LIVE") == "LIVE"].copy()
+    t = t[t["event_class"] == "LIVE"].copy()   # fail closed: a missing classification is not LIVE
     for c in ("bid", "ask", "ltp", "bid_qty", "ask_qty"):
         t[c] = pd.to_numeric(t[c], errors="coerce")
     for c in ("bid", "ask", "ltp"):
@@ -96,7 +96,8 @@ def premium_analysis(ticks: pd.DataFrame, decided_at: datetime, nifty: Dict[str,
     """
     q = _quotes(ticks)
     dec = pd.Timestamp(decided_at)
-    excluded = 0 if ticks.empty or "event_class" not in ticks else int((ticks["event_class"].fillna("LIVE") != "LIVE").sum())
+    excluded = 0 if ticks.empty else (int((ticks["event_class"] != "LIVE").sum()) if "event_class" in ticks
+                                      else len(ticks))
     snap = q[(q["ts"] <= dec) & (q["ask"].notna() | q["bid"].notna())]
     out: Dict[str, Any] = {"signal_snapshot": None if snap.empty else {
         "bid": None if pd.isna(snap["bid"].iloc[-1]) else float(snap["bid"].iloc[-1]),
@@ -210,7 +211,9 @@ def _premium_lines(o: Dict[str, Any], pm: Optional[Dict[str, Any]]) -> List[str]
     snap = pm.get("signal_snapshot")
     snap_s = (f"signal snapshot bid {_fmt(snap['bid'])} / ask {_fmt(snap['ask'])} ({snap['age_s']}s old)"
               if snap else "no quote before the signal")
-    lines = [f"- Option {o['contract']} ({o.get('contract_source')}): {snap_s}"]
+    match = o.get("contract_match")
+    match_s = "" if match in (None, "representative") else f" [FALLBACK: {match}, not the representative's contract]"
+    lines = [f"- Option {o['contract']} ({o.get('contract_source')}){match_s}: {snap_s}"]
     if pm.get("status") != "OK":
         return lines + [f"- Paper entry: {pm.get('status')} (no executable ask within {ENTRY_MAX_DELAY_S:.0f}s)"]
     lines.append(f"- Executable entry: ask {pm['entry_ask']} after {pm['entry_delay_s']}s "

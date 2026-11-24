@@ -13,8 +13,8 @@ T0 = IST.localize(datetime(2026, 11, 25, 10, 16))
 
 
 def ticks(rows):
-    return pd.DataFrame([{"local_timestamp": T0 + timedelta(seconds=s), "ltp": l, "bid": b, "ask": a}
-                         for s, l, b, a in rows])
+    return pd.DataFrame([{"local_timestamp": T0 + timedelta(seconds=s), "ltp": l, "bid": b, "ask": a,
+                          "event_class": "LIVE"} for s, l, b, a in rows])
 
 
 def test_entry_is_the_first_executable_ask_after_the_decision_not_an_older_quote():
@@ -149,3 +149,27 @@ def test_premium_uses_the_representative_candidates_own_contract():
     tr, how = daily.tracked_contract(op, {"low": tracking["low"]})
     assert tr["contract"] == "NSE:NIFTY26D0125100CE" and how == "other_candidate:low"
     assert daily.tracked_contract(op, {}) == (None, "none")
+
+
+def test_missing_classification_is_never_executable():
+    t = _ticks2([(2, 90.0, 91.0, None, 50, 50),                # unclassified, artificially favourable
+                 (5, 100.0, 101.0, "LIVE", 50, 50)])
+    r = daily.premium_analysis(t, T0, {})
+    assert r["entry_ask"] == 101.0 and r["non_live_quotes_excluded"] == 1
+    unclassified_only = pd.DataFrame([{"local_timestamp": T0 + timedelta(seconds=3), "ltp": 91.0, "bid": 90.0,
+                                       "ask": 91.0}])          # no event_class column at all
+    r2 = daily.premium_analysis(unclassified_only, T0, {})
+    assert r2["status"] == "NO_EXECUTABLE_ENTRY" and r2["non_live_quotes_excluded"] == 1
+
+
+def test_markdown_flags_a_fallback_contract():
+    r = daily.premium_analysis(ticks([(1, 100.0, 99.0, 101.0)]), T0, {})
+    base = {"day": "2026-11-25", "strategy": "S000 v1", "live_db": "x", "generated_at": "now",
+            "summary": {"setups": 0, "candidates": 2, "opportunities": 1, "decision_codes": {}, "paper_fills": 0,
+                        "paper_exits": 0}, "decision_parity": None, "bar_parity": {}}
+    op = {"decision_at": T0.isoformat(), "direction": "BULLISH", "n_candidates": 2, "level": "L",
+          "decision_codes": [], "nifty": {}, "contract": "NSE:X", "contract_source": "atm_fallback",
+          "premium": r, "features": {}}
+    assert "FALLBACK" not in daily.render_markdown({**base, "opportunities": [{**op, "contract_match": "representative"}]})
+    md = daily.render_markdown({**base, "opportunities": [{**op, "contract_match": "other_candidate:low"}]})
+    assert "[FALLBACK: other_candidate:low, not the representative's contract]" in md
