@@ -56,9 +56,147 @@
    ]
   }
  },
+ "day_block": {
+  "T30_S20_H60": {
+   "vs_other_day_matched": {
+    "days": 87,
+    "opportunities": 104,
+    "hit_diff_pp": 12.6,
+    "hit_diff_ci95": [
+     2.7,
+     22.2
+    ],
+    "p_hit_diff_le_0": 0.0061,
+    "points_diff": 5.46,
+    "points_diff_ci95": [
+     0.62,
+     10.19
+    ],
+    "p_points_diff_le_0": 0.0137
+   },
+   "vs_same_day_random": {
+    "days": 87,
+    "opportunities": 104,
+    "hit_diff_pp": 1.5,
+    "hit_diff_ci95": [
+     -8.2,
+     11.1
+    ],
+    "p_hit_diff_le_0": 0.3863,
+    "points_diff": 1.34,
+    "points_diff_ci95": [
+     -3.37,
+     5.94
+    ],
+    "p_points_diff_le_0": 0.2903
+   }
+  },
+  "T30_SS000_H60": {
+   "vs_other_day_matched": {
+    "days": 87,
+    "opportunities": 104,
+    "hit_diff_pp": 8.7,
+    "hit_diff_ci95": [
+     0.5,
+     17.2
+    ],
+    "p_hit_diff_le_0": 0.0185,
+    "points_diff": 3.93,
+    "points_diff_ci95": [
+     0.11,
+     7.75
+    ],
+    "p_points_diff_le_0": 0.0216
+   },
+   "vs_same_day_random": {
+    "days": 87,
+    "opportunities": 104,
+    "hit_diff_pp": -1.9,
+    "hit_diff_ci95": [
+     -10.2,
+     6.7
+    ],
+    "p_hit_diff_le_0": 0.6692,
+    "points_diff": 0.5,
+    "points_diff_ci95": [
+     -3.18,
+     4.27
+    ],
+    "p_points_diff_le_0": 0.4023
+   }
+  },
+  "T30_S15_H60": {
+   "vs_other_day_matched": {
+    "days": 87,
+    "opportunities": 104,
+    "hit_diff_pp": 11.0,
+    "hit_diff_ci95": [
+     1.8,
+     20.3
+    ],
+    "p_hit_diff_le_0": 0.0099,
+    "points_diff": 4.81,
+    "points_diff_ci95": [
+     0.65,
+     8.94
+    ],
+    "p_points_diff_le_0": 0.0114
+   },
+   "vs_same_day_random": {
+    "days": 87,
+    "opportunities": 104,
+    "hit_diff_pp": 1.3,
+    "hit_diff_ci95": [
+     -8.1,
+     10.7
+    ],
+    "p_hit_diff_le_0": 0.3961,
+    "points_diff": 1.53,
+    "points_diff_ci95": [
+     -2.62,
+     5.68
+    ],
+    "p_points_diff_le_0": 0.2354
+   }
+  },
+  "T40_S20_H60": {
+   "vs_other_day_matched": {
+    "days": 87,
+    "opportunities": 104,
+    "hit_diff_pp": 11.7,
+    "hit_diff_ci95": [
+     2.2,
+     21.6
+    ],
+    "p_hit_diff_le_0": 0.0079,
+    "points_diff": 5.35,
+    "points_diff_ci95": [
+     -0.33,
+     11.1
+    ],
+    "p_points_diff_le_0": 0.0338
+   },
+   "vs_same_day_random": {
+    "days": 87,
+    "opportunities": 104,
+    "hit_diff_pp": 0.6,
+    "hit_diff_ci95": [
+     -8.2,
+     10.0
+    ],
+    "p_hit_diff_le_0": 0.4537,
+    "points_diff": 0.18,
+    "points_diff_ci95": [
+     -5.05,
+     5.55
+    ],
+    "p_points_diff_le_0": 0.4839
+   }
+  }
+ },
  "meta": {
-  "generated_at": "2026-11-24T14:37:44",
-  "git_commit": "acd1833",
+  "generated_at": "2026-11-24T16:49:24",
+  "git_commit": "426d33b",
   "baseline_commit": "4e5856c",
   "dataset_fingerprint": "e4aa37159f650e97fe67fd3b"
  }
