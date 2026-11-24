@@ -79,14 +79,14 @@ def test_holdout_only_accepts_a_selection_report_from_the_same_preregistration()
     assert any("range" in x for x in p3.check_selection_report(other_range, _reg(), "abc", man))
 
 
-def test_day_block_p_respects_same_day_dependence():
+def test_day_bootstrap_respects_same_day_dependence():
     # strong effect spread over many days -> small p
     hits, mask, days = [], [], []
     for d in range(20):
         hits += [True, False]
         mask += [True, False]
         days += [f"d{d}", f"d{d}"]
-    assert p3.day_block_p(hits, mask, days, "higher", n=2000) < 0.01
+    assert p3.day_bootstrap_tail(hits, mask, days, "higher", n=2000) < 0.01
     # no effect on 20 ordinary days, plus ONE day contributing 20 correlated "pass" wins: opportunity-level
     # permutation treats those 8 as independent evidence; resampling whole days does not
     hits, mask, days = [], [], []
@@ -98,5 +98,49 @@ def test_day_block_p_respects_same_day_dependence():
     mask += [True] * 20
     days += ["X"] * 20
     p_perm = p3.permutation_p(hits, mask, "higher", n=4000)
-    p_day = p3.day_block_p(hits, mask, days, "higher", n=4000)
+    p_day = p3.day_bootstrap_tail(hits, mask, days, "higher", n=4000)
     assert p_perm < 0.05 and p_day > 0.15  # 'significant' only if same-day trades were independent
+
+    lo, hi = p3.day_bootstrap_ci(hits, mask, days, 0.95, n=2000)
+    assert lo < 0 < hi          # the day-cluster interval does not exclude zero for the one-day effect
+
+
+def test_inference_method_must_be_declared_and_supported():
+    assert p3.inference_method({"id": "P3C_v1"}) == "permutation_opportunity"   # archived protocol only
+    assert p3.inference_method({"id": "P3C_v2", "inference": "day_cluster_bootstrap_ci"}) == "day_cluster_bootstrap_ci"
+    for bad in ({"id": "P3C_v2"}, {"id": "P3C_v2", "inference": "day_block_bootstap"},
+                {"id": "P3C_v1", "inference": "typo"}):
+        try:
+            p3.inference_method(bad)
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
+
+
+def test_ci_verdicts():
+    r = {"predicts": "higher", "hit_diff_pp": 20.0, "pass": {"n": 10}, "fail": {"n": 10}}
+    assert p3.verdict_ci(r, [2.0, 35.0]) == "CONFIRMED"
+    assert p3.verdict_ci(r, [-5.0, 40.0]) == "SUPPORTED"
+    assert p3.verdict_ci({**r, "hit_diff_pp": 5.0}, [-5.0, 15.0]) == "NOT_SUPPORTED"
+    low = {**r, "predicts": "lower", "hit_diff_pp": -20.0}
+    assert p3.verdict_ci(low, [-35.0, -2.0]) == "CONFIRMED"
+    assert p3.verdict_ci({**r, "pass": {"n": 3}}, [2.0, 35.0]) == "INSUFFICIENT"
+
+
+def test_archived_v1_selection_report_validates_through_the_documented_legacy_path():
+    import json
+    from pathlib import Path
+
+    import yaml
+
+    root = Path(__file__).resolve().parents[2]
+    reg = yaml.safe_load((root / "research/preregistration/P3C_v1.yaml").read_text())
+    sel = json.loads((root / "reports/phase3c/P3C_v1_selection.json").read_text())
+    assert "strategy_fingerprint" not in sel["meta"]          # archived as written; never rewritten
+    man = {"dataset_fingerprint": reg["dataset_fingerprint"], "strategy": {"fingerprint": reg["strategy"]["fingerprint"]}}
+    assert p3.check_selection_report(sel, reg, sel["meta"]["prereg_commit"], man) == []
+    wrong = {**man, "strategy": {"fingerprint": "other"}}
+    assert any("legacy" in x for x in p3.check_selection_report(sel, reg, sel["meta"]["prereg_commit"], wrong))
+    new_style = {**reg, "id": "P3C_v2"}
+    assert any("no strategy_fingerprint" in x for x in p3.check_selection_report(sel, new_style,
+                                                                                  sel["meta"]["prereg_commit"], man))

@@ -7,6 +7,10 @@ import pandas as pd
 
 from nifty_engine.research.outcomes import EXECUTED, wilson
 
+# Inference methods a pre-registration may declare. Every new pre-registration MUST declare one;
+# only the archived P3C_v1 protocol (registered before the field existed) defaults to its original method.
+INFERENCE_METHODS = ("permutation_opportunity", "day_cluster_bootstrap_ci")
+LEGACY_INFERENCE = {"P3C_v1": "permutation_opportunity"}
 MIN_GATE_GROUP = 10
 MIN_HOLDOUT_GROUP = 5
 PERMUTATIONS = 10000
@@ -107,29 +111,67 @@ def gate(r: Dict[str, Any]) -> bool:
     return r["hit_diff_pp"] > 0 if r["predicts"] == "higher" else r["hit_diff_pp"] < 0
 
 
-def day_block_p(hits: List[bool], mask: List[bool], days: List[str], predicts: str, n: int = PERMUTATIONS,
-                seed: int = SEED) -> float:
-    """Day-aware one-sided p-value: resample whole trading DAYS with replacement (opportunities on one day
-    share market conditions) and report the share of resamples whose pass-minus-fail difference is not in
-    the predicted direction. Resamples lacking either group are skipped."""
+def inference_method(reg: Dict[str, Any]) -> str:
+    m = reg.get("inference")
+    if m is None:
+        if reg.get("id") in LEGACY_INFERENCE:
+            return LEGACY_INFERENCE[reg["id"]]
+        raise ValueError("the pre-registration must declare `inference` (one of "
+                         f"{', '.join(INFERENCE_METHODS)})")
+    if m not in INFERENCE_METHODS:
+        raise ValueError(f"unsupported inference method {m!r}; allowed: {', '.join(INFERENCE_METHODS)}")
+    return m
+
+
+def _day_resamples(hits, mask, days, n, seed):
     rng = random.Random(seed)
     by_day: Dict[str, List[tuple]] = {}
     for h, m, d in zip(hits, mask, days):
         by_day.setdefault(d, []).append((h, m))
     keys = sorted(by_day)
-    sign = 1 if predicts == "higher" else -1
-    bad = total = 0
     for _ in range(n):
         rows = [x for d in (rng.choice(keys) for _ in keys) for x in by_day[d]]
         a = [h for h, m in rows if m]
         b = [h for h, m in rows if not m]
-        if not a or not b:
-            continue
-        total += 1
-        if sign * (sum(a) / len(a) - sum(b) / len(b)) <= 0:
-            bad += 1
-    return bad / total if total else 1.0
+        if a and b:
+            yield 100 * (sum(a) / len(a) - sum(b) / len(b))
 
+
+def day_bootstrap_ci(hits: List[bool], mask: List[bool], days: List[str], level: float = 0.95,
+                     n: int = PERMUTATIONS, seed: int = SEED) -> List[float]:
+    """Percentile confidence interval (pp) for the pass-minus-fail hit-rate difference, resampling whole
+    trading DAYS (same-day opportunities share market conditions). Used for decisions in day-cluster
+    studies: an effect counts only if the (multiplicity-adjusted) interval excludes zero."""
+    diffs = pd.Series(list(_day_resamples(hits, mask, days, n, seed)))
+    if diffs.empty:
+        return [float("nan"), float("nan")]
+    a = (1 - level) / 2
+    return [round(float(diffs.quantile(a)), 1), round(float(diffs.quantile(1 - a)), 1)]
+
+
+def day_bootstrap_tail(hits: List[bool], mask: List[bool], days: List[str], predicts: str, n: int = PERMUTATIONS,
+                       seed: int = SEED) -> float:
+    """Share of whole-day bootstrap resamples whose pass-minus-fail difference is NOT in the predicted
+    direction. A descriptive directional bootstrap probability that respects same-day dependence - NOT a
+    calibrated null-hypothesis p-value (there is no null distribution here); decisions use
+    day_bootstrap_ci."""
+    sign = 1 if predicts == "higher" else -1
+    diffs = list(_day_resamples(hits, mask, days, n, seed))
+    return sum(sign * d <= 0 for d in diffs) / len(diffs) if diffs else 1.0
+
+
+def verdict_ci(r: Dict[str, Any], ci: List[float]) -> str:
+    """Verdict for day-cluster studies: CONFIRMED only if the multiplicity-adjusted day-bootstrap interval
+    excludes zero in the predicted direction."""
+    if r["pass"]["n"] < MIN_HOLDOUT_GROUP or r["fail"]["n"] < MIN_HOLDOUT_GROUP:
+        return "INSUFFICIENT"
+    d = r["hit_diff_pp"] if r["predicts"] == "higher" else -r["hit_diff_pp"]
+    excludes = (ci[0] > 0) if r["predicts"] == "higher" else (ci[1] < 0)
+    if excludes and d > 0:
+        return "CONFIRMED"
+    if d >= 10:
+        return "SUPPORTED"
+    return "NOT_SUPPORTED"
 
 def check_selection_report(sel: Dict[str, Any], reg: Dict[str, Any], prereg_commit: str,
                            feature_manifest: Dict[str, Any]) -> List[str]:
@@ -148,8 +190,19 @@ def check_selection_report(sel: Dict[str, Any], reg: Dict[str, Any], prereg_comm
         problems.append("selection feature dataset/version differs from the pre-registration")
     if fm.get("dataset_fingerprint") != feature_manifest.get("dataset_fingerprint"):
         problems.append("selection feature dataset differs from the current one")
-    if m.get("strategy_fingerprint") != reg["strategy"]["fingerprint"]:
-        problems.append(f"selection strategy {m.get('strategy_fingerprint')} != {reg['strategy']['fingerprint']}")
+    if "strategy_fingerprint" in m:
+        if m["strategy_fingerprint"] != reg["strategy"]["fingerprint"]:
+            problems.append(f"selection strategy {m['strategy_fingerprint']} != {reg['strategy']['fingerprint']}")
+    elif reg.get("id") in LEGACY_INFERENCE:
+        # Documented compatibility path for the archived P3C_v1 selection report, written before the field
+        # existed (the report itself is never rewritten): its feature dataset matched above, and that dataset's
+        # manifest records the strategy it was built for.
+        fm_strategy = (feature_manifest.get("strategy") or {}).get("fingerprint")
+        if fm_strategy != reg["strategy"]["fingerprint"]:
+            problems.append(f"legacy selection report: feature dataset strategy {fm_strategy} != "
+                            f"{reg['strategy']['fingerprint']}")
+    else:
+        problems.append("selection report has no strategy_fingerprint")
     if [str(x) for x in sel.get("range", [])] != [str(x) for x in reg["split"]["selection"]]:
         problems.append(f"selection range {sel.get('range')} != pre-registered {reg['split']['selection']}")
     return problems

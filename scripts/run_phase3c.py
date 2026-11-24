@@ -63,6 +63,10 @@ def main():
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
     reg = yaml.safe_load(PREREG.read_text())
+    try:
+        method = p3.inference_method(reg)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
     commit = prereg_commit()
     df, man = load(reg)
     primary = reg["outcome"]["primary"]
@@ -72,7 +76,7 @@ def main():
             "feature_manifest": {k: man[k] for k in ("dataset_fingerprint", "feature_version", "git_commit")},
             "generated_at": datetime.now().isoformat(timespec="seconds"), "primary": primary,
             "strategy_fingerprint": man["strategy"]["fingerprint"],
-            "inference": reg.get("inference", "permutation_opportunity")}
+            "inference": method}
 
     if a.stage == "selection":
         lo, hi = (str(date.fromisoformat(str(x))) for x in reg["split"]["selection"])
@@ -108,20 +112,27 @@ def main():
     lo, hi = (str(date.fromisoformat(str(x))) for x in reg["split"]["holdout"])
     res = p3.evaluate(df[(df["day"] >= lo) & (df["day"] <= hi)], primary, target)
     res = {k: v for k, v in res.items() if k in gated}
-    # inference method is part of the pre-registration (v1: opportunity-level permutation; later
-    # studies should pre-register "day_block_bootstrap", which respects same-day dependence)
-    method = reg.get("inference", "permutation_opportunity")
-    if method == "day_block_bootstrap":
-        pvals = {k: p3.day_block_p(v["_hits"], v["_mask"], v["_days"], v["predicts"]) for k, v in res.items()
-                 if v["pass"]["n"] and v["fail"]["n"]}
+    # The inference method is part of the pre-registration (validated above).
+    testable = {k: v for k, v in res.items() if v["pass"]["n"] and v["fail"]["n"]}
+    if method == "day_cluster_bootstrap_ci":
+        # Bonferroni-adjusted day-cluster bootstrap intervals; a descriptive directional tail is also reported
+        level = 1 - 0.05 / max(1, len(testable))
+        for k, v in res.items():
+            ci = p3.day_bootstrap_ci(v["_hits"], v["_mask"], v["_days"], level) if k in testable else [None, None]
+            v["ci_level"] = round(level, 4)
+            v["diff_ci_day_bootstrap"] = ci
+            v["bootstrap_tail"] = (p3.day_bootstrap_tail(v["_hits"], v["_mask"], v["_days"], v["predicts"])
+                                   if k in testable else None)
+            v["verdict"] = p3.verdict_ci(v, ci) if k in testable else "INSUFFICIENT"
+        extra = ["ci_level", "diff_ci_day_bootstrap", "bootstrap_tail", "verdict"]
     else:
-        pvals = {k: p3.permutation_p(v["_hits"], v["_mask"], v["predicts"]) for k, v in res.items()
-                 if v["pass"]["n"] and v["fail"]["n"]}
-    adj = p3.holm(pvals) if pvals else {}
-    for k, v in res.items():
-        v["p_one_sided"] = pvals.get(k)
-        v["p_holm"] = adj.get(k)
-        v["verdict"] = p3.verdict(v, adj.get(k, 1.0))
+        pvals = {k: p3.permutation_p(v["_hits"], v["_mask"], v["predicts"]) for k, v in testable.items()}
+        adj = p3.holm(pvals) if pvals else {}
+        for k, v in res.items():
+            v["p_one_sided"] = pvals.get(k)
+            v["p_holm"] = adj.get(k)
+            v["verdict"] = p3.verdict(v, adj.get(k, 1.0))
+        extra = ["p_one_sided", "p_holm", "verdict"]
     out = {"meta": {**meta, "forced_rerun": bool(hold_path.exists() and a.force)}, "stage": "holdout",
            "range": [lo, hi], "gated": gated, "not_gated": [k for k in sel["results"] if k not in gated],
            "results": {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in res.items()}}
@@ -130,7 +141,7 @@ def main():
          f"Pre-registration commit `{commit}`, code `{meta['code_commit']}`, primary {primary}. Evaluated once"
          + (" (FORCED RE-RUN)" if out["meta"]["forced_rerun"] else "") + ".",
          f"Gated in selection: {gated or 'none'}; not gated: {out['not_gated'] or 'none'}.", ""]
-    L += table(out["results"], extra=["p_one_sided", "p_holm", "verdict"])
+    L += table(out["results"], extra=extra)
     L += ["", "SUPPORTED = worth re-testing on new data, not a rule to trade. NIFTY points, gross of costs."]
     (OUT / "P3C_v1_holdout.md").write_text("\n".join(L) + "\n")
     print("\n".join(L))
