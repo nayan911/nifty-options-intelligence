@@ -14,12 +14,16 @@ features computed from only the bars that had closed by then):
   in `unavailable` (e.g. before_or_complete, insufficient_rvol_history, next_month_missing).
 
 Indicators (columns):
- 1 vwap, vwap_sigma, vwap_z      futures session VWAP (engine's compute_vwap: typical price,
-                                 volume-weighted) and the volume-weighted price dispersion; z =
-                                 (futures close - vwap) / sigma
- 2 rvol_tod_1m, rvol_tod_5m      futures volume (near + next month, so rollover week is not
-                                 distorted) of the last 1 / 5 completed minutes vs the mean of the
-                                 same minutes over the previous `RVOL_SESSIONS` regular sessions
+ 1 vwap, vwap_sigma, vwap_z, vwap_up1/dn1/up2/dn2
+                                 futures session VWAP (engine's compute_vwap: typical price,
+                                 volume-weighted), the volume-weighted price dispersion sigma, the
+                                 +-1/2 sigma bands, and z = (futures close - vwap) / sigma
+ 2 rvol_tod_1m, rvol_tod_5m, rvol_basis
+                                 futures volume of the last 1 / 5 completed minutes vs the mean of
+                                 the same minutes over the previous `RVOL_SESSIONS` regular sessions,
+                                 LIKE FOR LIKE: near+next volume ("near_next", so rollover week is not
+                                 distorted) when today and every baseline session have next-month
+                                 data; otherwise near-only on both sides ("near_only")
  3 or_width_atr                  spot opening range (first 15 minutes) / spot daily ATR(14) of
                                  previous sessions; UNKNOWN until the range is complete
  4 fut_oi_chg_open_pct, fut_oi_chg_15m_pct
@@ -34,9 +38,12 @@ Indicators (columns):
                                  futures close - spot close at the same minute (no carry-over)
  7 vix, vix_chg_prev_close_pct, vix_chg_15m
  8 days_to_expiry, expiry_day    trading days to the near contract's (holiday-adjusted) expiry
- 9 hw_up_count, hw_agree_15m     heavyweights (5 stocks): how many are above their session open;
+ 9 hw_up_count, hw_agree_15m, hw_available_count
+                                 heavyweights (5 stocks): how many are above their session open;
                                  how many moved in the same direction as NIFTY spot over 15 min.
-                                 A five-stock confirmation, not market breadth
+                                 A five-stock confirmation, not market breadth. Unknown (NaN) unless
+                                 all five have data at that minute - a missing stock is never
+                                 counted as "down" or "disagreeing"
 10 day_type, day_type_stage      TRENDING_UP / TRENDING_DOWN / RANGE / MIXED / UNKNOWN, built only
                                  from information so far; stage provisional (OR complete -> +30m),
                                  early (-> +90m), established after that
@@ -44,7 +51,7 @@ Indicators (columns):
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -58,18 +65,19 @@ ROLLOVER_DAYS = 3
 DAILY_ATR_PERIOD = 14
 LOOKBACK = 15            # minutes for *_15m changes
 DAY_TYPE_WINDOW = 30     # minutes for VWAP side/slope in the day-type classifier
-FEATURE_VERSION = 1
+FEATURE_VERSION = 2
+HEAVYWEIGHT_COUNT = 5
 
 FEATURE_COLUMNS = [
-    "vwap", "vwap_sigma", "vwap_z",
-    "rvol_tod_1m", "rvol_tod_5m",
+    "vwap", "vwap_sigma", "vwap_z", "vwap_up1", "vwap_dn1", "vwap_up2", "vwap_dn2",
+    "rvol_tod_1m", "rvol_tod_5m", "rvol_basis",
     "or_width_atr",
     "fut_oi_chg_open_pct", "fut_oi_chg_15m_pct",
     "next_oi_chg_open_pct", "comb_oi_chg_open_pct", "rollover_window",
     "basis", "basis_pct", "basis_chg_15m",
     "vix", "vix_chg_prev_close_pct", "vix_chg_15m",
     "days_to_expiry", "expiry_day",
-    "hw_up_count", "hw_agree_15m",
+    "hw_up_count", "hw_agree_15m", "hw_available_count",
     "day_type", "day_type_stage",
 ]
 
@@ -85,7 +93,9 @@ class DayInputs:
     vix: Optional[pd.DataFrame] = None
     heavyweights: Dict[str, pd.DataFrame] = field(default_factory=dict)
     # prior context (strictly earlier sessions)
-    prior_volume_profiles: List[pd.Series] = field(default_factory=list)  # index: minute-of-day (int)
+    # one entry per earlier regular session: (near-month volume, next-month volume or None), each
+    # indexed by minute of day (see volume_profile)
+    prior_volume_profiles: List[Tuple[pd.Series, Optional[pd.Series]]] = field(default_factory=list)
     prior_spot_daily: Optional[pd.DataFrame] = None   # daily bars before `day` (open/high/low/close)
     prev_vix_close: Optional[float] = None
     days_to_expiry: Optional[int] = None
@@ -97,13 +107,15 @@ def minute_of_day(ts: pd.Series) -> pd.Series:
     return t.dt.hour * 60 + t.dt.minute
 
 
-def volume_profile(fut: pd.DataFrame, fut_next: Optional[pd.DataFrame] = None) -> pd.Series:
-    """Per-minute-of-day futures volume (near + next) of one session, for later RVOL baselines."""
-    v = fut.set_index(minute_of_day(fut["ts"]))["volume"].astype(float)
-    if fut_next is not None and not fut_next.empty:
-        nv = fut_next.set_index(minute_of_day(fut_next["ts"]))["volume"].astype(float)
-        v = v.add(nv, fill_value=0.0)
-    return v.groupby(level=0).sum()
+def _by_minute(df: pd.DataFrame) -> pd.Series:
+    return df.set_index(minute_of_day(df["ts"]))["volume"].astype(float).groupby(level=0).sum()
+
+
+def volume_profile(fut: pd.DataFrame, fut_next: Optional[pd.DataFrame] = None
+                   ) -> Tuple[pd.Series, Optional[pd.Series]]:
+    """One session's per-minute-of-day volume: (near month, next month or None if unavailable)."""
+    nxt = _by_minute(fut_next) if fut_next is not None and not fut_next.empty else None
+    return _by_minute(fut), nxt
 
 
 def _on(index: pd.DatetimeIndex, df: Optional[pd.DataFrame], col: str) -> pd.Series:
@@ -128,6 +140,7 @@ def compute_day_features(inp: DayInputs) -> pd.DataFrame:
     # ---- 1. VWAP bands (futures) - the engine's own compute_vwap
     fut = inp.fut.copy()
     fut_close = _ffill(idx, fut, "close")
+    vwap_cols = ("vwap", "vwap_sigma", "vwap_z", "vwap_up1", "vwap_dn1", "vwap_up2", "vwap_dn2")
     if not fut.empty and fut["volume"].sum() > 0:
         f = fut.reset_index(drop=True)
         vwap, up1, _ = compute_vwap(f)
@@ -135,18 +148,28 @@ def compute_day_features(inp: DayInputs) -> pd.DataFrame:
         sig = pd.Series((up1 - vwap).values, index=pd.to_datetime(f["ts"])).reindex(idx).ffill()
         out["vwap"], out["vwap_sigma"] = s, sig
         out["vwap_z"] = (fut_close - s) / sig.where(sig > 0)
+        out["vwap_up1"], out["vwap_dn1"] = s + sig, s - sig
+        out["vwap_up2"], out["vwap_dn2"] = s + 2 * sig, s - 2 * sig
     else:
-        out["vwap"] = out["vwap_sigma"] = out["vwap_z"] = np.nan
-        reasons["vwap"] = reasons["vwap_sigma"] = reasons["vwap_z"] = "no_futures_volume"
+        for c in vwap_cols:
+            out[c] = np.nan
+            reasons[c] = "no_futures_volume"
 
     # ---- 2. time-of-day RVOL (near + next volume vs the same minutes in previous sessions)
     vol_now = _on(idx, fut, "volume")  # a missing near-month minute stays unknown (not zero volume)
-    if inp.fut_next is not None and not inp.fut_next.empty:
-        vol_now = vol_now + _on(idx, inp.fut_next, "volume").fillna(0.0)
     mod = pd.Series(idx.hour * 60 + idx.minute, index=idx)
     profiles = inp.prior_volume_profiles[-RVOL_SESSIONS:]
-    if len(profiles) >= RVOL_MIN_SESSIONS:
-        prof = pd.concat(profiles, axis=1)
+    has_next_today = inp.fut_next is not None and not inp.fut_next.empty
+    like_for_like = has_next_today and len(profiles) > 0 and all(nx is not None for _, nx in profiles)
+    if like_for_like:  # near+next on both sides
+        vol_now = vol_now + _on(idx, inp.fut_next, "volume").fillna(0.0)
+        series = [near.add(nx, fill_value=0.0) for near, nx in profiles]
+        out["rvol_basis"] = "near_next"
+    else:              # near-only on both sides
+        series = [near for near, _ in profiles]
+        out["rvol_basis"] = "near_only"
+    if len(series) >= RVOL_MIN_SESSIONS:
+        prof = pd.concat(series, axis=1)
         base1 = mod.map(prof.mean(axis=1))
         roll5 = prof.sort_index().rolling(5, min_periods=5).sum().mean(axis=1)
         base5 = mod.map(roll5)
@@ -226,21 +249,29 @@ def compute_day_features(inp: DayInputs) -> pd.DataFrame:
         reasons["days_to_expiry"] = "unknown_expiry"
 
     # ---- 9. heavyweights
-    if inp.heavyweights:
-        nifty_ret = spot_close - spot_close.shift(LOOKBACK)
-        up = pd.Series(0, index=idx, dtype=float)
-        agree = pd.Series(0, index=idx, dtype=float)
-        for _, hw in sorted(inp.heavyweights.items()):
-            c = _ffill(idx, hw, "close")
-            o = hw["open"].iloc[0] if not hw.empty else np.nan
-            up += (c > o).astype(float)
-            r = c - c.shift(LOOKBACK)
-            agree += ((np.sign(r) == np.sign(nifty_ret)) & (np.sign(r) != 0)).astype(float)
-        out["hw_up_count"] = up
-        out["hw_agree_15m"] = agree.where(nifty_ret.notna())
-    else:
-        out["hw_up_count"] = out["hw_agree_15m"] = np.nan
-        reasons["hw_up_count"] = reasons["hw_agree_15m"] = "no_heavyweights"
+    nifty_ret = spot_close - spot_close.shift(LOOKBACK)
+    up = pd.Series(0.0, index=idx)
+    agree = pd.Series(0.0, index=idx)
+    avail = pd.Series(0.0, index=idx)
+    agree_known = pd.Series(0.0, index=idx)
+    for _, hw in sorted(inp.heavyweights.items()):
+        if hw is None or hw.empty:
+            continue
+        c = _ffill(idx, hw, "close")
+        o = float(hw["open"].iloc[0])
+        known = c.notna()
+        avail += known.astype(float)
+        up += (known & (c > o)).astype(float)
+        r = c - c.shift(LOOKBACK)
+        r_known = r.notna() & nifty_ret.notna()
+        agree_known += r_known.astype(float)
+        agree += (r_known & (np.sign(r) == np.sign(nifty_ret)) & (np.sign(r) != 0)).astype(float)
+    out["hw_available_count"] = avail
+    complete = avail >= HEAVYWEIGHT_COUNT
+    out["hw_up_count"] = up.where(complete)
+    out["hw_agree_15m"] = agree.where(agree_known >= HEAVYWEIGHT_COUNT)
+    if not complete.all():
+        reasons["hw_up_count"] = reasons["hw_agree_15m"] = "heavyweights_incomplete"
 
     # ---- 10. day type (causal, staged)
     out["day_type"], out["day_type_stage"] = _day_type(idx, spot_close, fut_close, out["vwap"], or_hi, or_lo, atr_d)

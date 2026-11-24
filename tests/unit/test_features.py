@@ -43,7 +43,8 @@ def inputs(n_spot=375, n_fut=385, profiles=10, special=False, with_next=True, dt
            enumerate(("HDFCBANK", "RELIANCE", "ICICIBANK", "INFY", "BHARTIARTL"))}
     daily = pd.DataFrame({"high": [25100 + 10 * i for i in range(30)], "low": [24900 + 10 * i for i in range(30)],
                           "close": [25000 + 10 * i for i in range(30)]})
-    prof = [volume_profile(series(n_fut, 25120, 40, 23, vol=lambda i, k=k: 900 + (i * 41 + k * 13) % 600))
+    prof = [volume_profile(series(n_fut, 25120, 40, 23, vol=lambda i, k=k: 900 + (i * 41 + k * 13) % 600),
+                           series(n_fut, 25300, 40, 23, vol=lambda i, k=k: 150 + (i * 7 + k) % 90))
             for k in range(profiles)]
     return DayInputs(day=DAY, spot=spot, fut=fut, fut_next=nxt if with_next else None, vix=vix, heavyweights=hws,
                      prior_volume_profiles=prof, prior_spot_daily=daily, prev_vix_close=12.5,
@@ -126,9 +127,13 @@ def test_values_on_known_inputs():
     # futures minutes after the cash close: basis unknown (no carried-over spot price)
     assert pd.isna(f.iloc[-1]["basis"])
     # time-of-day RVOL: today's near+next volume over the 10-session mean at that minute
-    prof = pd.concat(inp.prior_volume_profiles, axis=1).mean(axis=1)
+    prof = pd.concat([n.add(x, fill_value=0) for n, x in inp.prior_volume_profiles], axis=1).mean(axis=1)
     mod = 9 * 60 + 15 + 60
+    assert r["rvol_basis"] == "near_next"
     assert r["rvol_tod_1m"] == pytest.approx((fut["volume"] + inp.fut_next.iloc[60]["volume"]) / prof.loc[mod])
+    assert r["vwap_up2"] == pytest.approx(r["vwap"] + 2 * r["vwap_sigma"])
+    assert r["vwap_dn1"] == pytest.approx(r["vwap"] - r["vwap_sigma"])
+    assert r["hw_available_count"] == 5
 
 
 def test_features_at_returns_only_rows_already_available():
@@ -137,3 +142,26 @@ def test_features_at_returns_only_rows_already_available():
     row = features_at(f, t)
     assert row.name == pd.Timestamp(OPEN + timedelta(minutes=29))   # the 09:44 bar closed at 09:45
     assert features_at(f, OPEN) is None
+
+
+def test_rvol_is_like_for_like_when_next_month_history_is_incomplete():
+    inp = inputs()
+    near, _ = inp.prior_volume_profiles[3]
+    inp.prior_volume_profiles[3] = (near, None)          # one baseline session lacks next-month data
+    r = compute_day_features(inp).iloc[60]
+    prof = pd.concat([n for n, _ in inp.prior_volume_profiles], axis=1).mean(axis=1)
+    assert r["rvol_basis"] == "near_only"
+    assert r["rvol_tod_1m"] == pytest.approx(inp.fut.iloc[60]["volume"] / prof.loc[9 * 60 + 15 + 60])
+    today_without_next = compute_day_features(inputs(with_next=False)).iloc[60]
+    assert today_without_next["rvol_basis"] == "near_only"
+
+
+def test_missing_heavyweight_is_unknown_not_disagreement():
+    inp = inputs()
+    hw = inp.heavyweights["INFY"]
+    inp.heavyweights["INFY"] = hw[hw["ts"] >= pd.Timestamp(OPEN + timedelta(minutes=100))].reset_index(drop=True)
+    f = compute_day_features(inp)
+    early, late = f.iloc[50], f.iloc[200]
+    assert early["hw_available_count"] == 4 and pd.isna(early["hw_up_count"]) and pd.isna(early["hw_agree_15m"])
+    assert "hw_up_count:heavyweights_incomplete" in early["unavailable"]
+    assert late["hw_available_count"] == 5 and not pd.isna(late["hw_up_count"])

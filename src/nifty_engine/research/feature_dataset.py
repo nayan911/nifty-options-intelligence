@@ -23,7 +23,7 @@ from nifty_engine.features.library import (
     trading_days_between,
     volume_profile,
 )
-from nifty_engine.research.bars import in_session_1m, trading_days
+from nifty_engine.research.bars import build_intraday_candles, in_session_1m, trading_days
 from nifty_engine.research.contracts import contract_expiry_for
 from nifty_engine.research.history_store import ResearchHistoryStore
 from nifty_engine.research.sessions import CASH, FNO
@@ -94,6 +94,11 @@ class FeatureDatasetBuilder:
             special_session=d in self.cal.special_sessions,
         )
 
+    def spot_5m_closes(self) -> List:
+        """observed_at of every 5m spot bar the live-equivalent builder emits."""
+        spot = self._frames["spot"].drop(columns="day")
+        return [c.observed_at for c in build_intraday_candles(spot, self.cal, CASH, "NSE:NIFTY50-INDEX")["5m"]]
+
     def minute_tables(self, start: date, end: date) -> Dict[date, pd.DataFrame]:
         days = sorted(self._by_day["spot"])
         out = {}
@@ -122,13 +127,11 @@ def _attach(records: List[dict], tables: Dict[date, pd.DataFrame], time_key: str
     return pd.DataFrame(rows)
 
 
-def bar_level(tables: Dict[date, pd.DataFrame]) -> pd.DataFrame:
-    """Every closed 5m bar: features as of its close (the row of its last minute)."""
-    recs = []
-    for d, tbl in tables.items():
-        for t in tbl["available_at"]:
-            if t.minute % 5 == 0:
-                recs.append({"day": d, "observed_at": t})
+def bar_level(tables: Dict[date, pd.DataFrame], spot_5m_closes: List) -> pd.DataFrame:
+    """Every 5m NIFTY spot bar the live builder actually emits (research.bars, live drop rules
+    included): features as of its close."""
+    recs = [{"day": pd.Timestamp(t).date(), "observed_at": pd.Timestamp(t)} for t in spot_5m_closes
+            if pd.Timestamp(t).date() in tables]
     return _attach(recs, tables, "observed_at")
 
 
@@ -150,3 +153,17 @@ def opportunity_level(baseline_report: dict, tables) -> pd.DataFrame:
                 rec[f"mfe_{key}"], rec[f"mae_{key}"] = res["mfe"], res["mae"]
         recs.append(rec)
     return _attach(recs, tables, "decision_at")
+
+
+def check_baseline_compatible(baseline: dict, dataset_fp: str, strategy) -> None:
+    """Outcomes may only be joined to features computed from the SAME data and strategy version."""
+    meta = baseline["meta"]
+    if meta.get("dataset_fingerprint") != dataset_fp:
+        raise ValueError(f"baseline was built on dataset {meta.get('dataset_fingerprint')}, current data is "
+                         f"{dataset_fp}: regenerate the baseline (scripts/run_baseline.py) first")
+    s = meta.get("strategy", {})
+    if (s.get("id"), s.get("version"), s.get("fingerprint")) != (strategy.id, strategy.version,
+                                                                 strategy.fingerprint()):
+        raise ValueError(f"baseline strategy {s.get('id')} v{s.get('version')} {s.get('fingerprint')} does not match "
+                         f"the registry ({strategy.id} v{strategy.version} {strategy.fingerprint()}): "
+                         "regenerate the baseline first")

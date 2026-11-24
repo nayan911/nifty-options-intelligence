@@ -23,6 +23,7 @@ from nifty_engine.research import feature_dataset as fd
 from nifty_engine.research.history_store import ResearchHistoryStore
 from nifty_engine.research.manifest import dataset_fingerprint, require_valid_manifest
 from nifty_engine.research.replay import ReplayDriver, _git_commit
+from nifty_engine.strategy.registry import load_registry
 
 OUT = Path("data/features")
 BASELINE = Path("reports/baseline/S000_v1.json")
@@ -39,6 +40,13 @@ def main():
         "SELECT min(CAST(ts AS DATE)), max(CAST(ts AS DATE)) FROM hist_bars "
         "WHERE instrument = 'NIFTY_SPOT' AND resolution = '1'").fetchall()[0]
     require_valid_manifest(first, last, st)
+    baseline = json.loads(BASELINE.read_text())
+    fp = dataset_fingerprint(st)
+    strat = load_registry().get(baseline["meta"]["strategy"]["id"])
+    try:
+        fd.check_baseline_compatible(baseline, fp, strat)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
 
     b = fd.FeatureDatasetBuilder(st)
     b.load()
@@ -57,9 +65,8 @@ def main():
 
     minutes = pd.concat([t.assign(day=d) for d, t in tables.items()]).reset_index()
     save("minutes", minutes)
-    bars = fd.bar_level(tables)
+    bars = fd.bar_level(tables, b.spot_5m_closes())
     save("bars", bars)
-    baseline = json.loads(BASELINE.read_text())
     opps = fd.opportunity_level(baseline, tables)
     save("opportunities", opps)
     counts = {"days": len(tables), "minutes": len(minutes), "bars": len(bars), "opportunities": len(opps)}
@@ -70,7 +77,8 @@ def main():
         counts["setups"] = len(setups)
     manifest = {
         "generated_at": datetime.now().isoformat(timespec="seconds"), "feature_version": v,
-        "dataset_fingerprint": dataset_fingerprint(st), "git_commit": _git_commit(),
+        "dataset_fingerprint": fp, "git_commit": _git_commit(),
+        "strategy": {"id": strat.id, "version": strat.version, "fingerprint": strat.fingerprint()},
         "baseline_report": str(BASELINE), "baseline_commit": baseline["meta"]["git_commit"],
         "range": [str(first), str(last)], "counts": counts,
         "unavailable_share_opportunities": {
