@@ -1,0 +1,125 @@
+{
+ "meta": {
+  "preregistration": "research/preregistration/P3C_v1.yaml",
+  "prereg_commit": "b4b2a2b",
+  "code_commit": "b4b2a2b",
+  "feature_manifest": {
+   "dataset_fingerprint": "e4aa37159f650e97fe67fd3b",
+   "feature_version": 3,
+   "git_commit": "426d33b"
+  },
+  "generated_at": "2026-11-24T16:49:48",
+  "primary": "T30_S20_H60"
+ },
+ "stage": "selection",
+ "range": [
+  "2025-12-29",
+  "2026-08-31"
+ ],
+ "results": {
+  "H1_day_type_aligned": {
+   "predicts": "higher",
+   "pass": {
+    "n": 31,
+    "hits": 15,
+    "hit_pct": 48.4,
+    "ci95": [
+     32.0,
+     65.2
+    ],
+    "avg_points": 8.04
+   },
+   "fail": {
+    "n": 43,
+    "hits": 16,
+    "hit_pct": 37.2,
+    "ci95": [
+     24.4,
+     52.1
+    ],
+    "avg_points": 3.08
+   },
+   "hit_diff_pp": 11.2,
+   "unavailable": 4,
+   "gate_passed": true
+  },
+  "H2_rvol_above_normal": {
+   "predicts": "higher",
+   "pass": {
+    "n": 48,
+    "hits": 25,
+    "hit_pct": 52.1,
+    "ci95": [
+     38.3,
+     65.5
+    ],
+    "avg_points": 8.69
+   },
+   "fail": {
+    "n": 30,
+    "hits": 9,
+    "hit_pct": 30.0,
+    "ci95": [
+     16.7,
+     47.9
+    ],
+    "avg_points": 1.35
+   },
+   "hit_diff_pp": 22.1,
+   "unavailable": 0,
+   "gate_passed": true
+  },
+  "H3_near_expiry": {
+   "predicts": "lower",
+   "pass": {
+    "n": 10,
+    "hits": 3,
+    "hit_pct": 30.0,
+    "ci95": [
+     10.8,
+     60.3
+    ],
+    "avg_points": 2.74
+   },
+   "fail": {
+    "n": 68,
+    "hits": 31,
+    "hit_pct": 45.6,
+    "ci95": [
+     34.3,
+     57.3
+    ],
+    "avg_points": 6.33
+   },
+   "hit_diff_pp": -15.6,
+   "unavailable": 0,
+   "gate_passed": true
+  },
+  "H4_heavyweights_confirm": {
+   "predicts": "higher",
+   "pass": {
+    "n": 40,
+    "hits": 16,
+    "hit_pct": 40.0,
+    "ci95": [
+     26.3,
+     55.4
+    ],
+    "avg_points": 6.67
+   },
+   "fail": {
+    "n": 38,
+    "hits": 18,
+    "hit_pct": 47.4,
+    "ci95": [
+     32.5,
+     62.7
+    ],
+    "avg_points": 5.02
+   },
+   "hit_diff_pp": -7.4,
+   "unavailable": 0,
+   "gate_passed": false
+  }
+ }
+}
