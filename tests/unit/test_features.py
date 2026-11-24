@@ -165,3 +165,29 @@ def test_missing_heavyweight_is_unknown_not_disagreement():
     assert early["hw_available_count"] == 4 and pd.isna(early["hw_up_count"]) and pd.isna(early["hw_agree_15m"])
     assert "hw_up_count:heavyweights_incomplete" in early["unavailable"]
     assert late["hw_available_count"] == 5 and not pd.isna(late["hw_up_count"])
+
+
+def test_missing_next_month_minute_is_unknown_not_zero_volume():
+    inp = inputs()
+    inp.fut_next = inp.fut_next.drop(index=60).reset_index(drop=True)   # one next-month minute missing today
+    f = compute_day_features(inp)
+    assert f.iloc[60]["rvol_basis"] == "near_next" and pd.isna(f.iloc[60]["rvol_tod_1m"])
+    assert all(pd.isna(f.iloc[i]["rvol_tod_5m"]) for i in range(60, 65))  # every 5m window containing it
+    assert not pd.isna(f.iloc[59]["rvol_tod_1m"]) and not pd.isna(f.iloc[65]["rvol_tod_5m"])
+    # a gap in ONE baseline session lowers that minute's baseline count instead of adding a zero
+    inp2 = inputs()
+    near, nxt = inp2.prior_volume_profiles[0]
+    inp2.prior_volume_profiles[0] = (near, nxt.drop(index=nxt.index[60]))
+    r = compute_day_features(inp2).iloc[60]
+    assert r["rvol_baseline_n"] == 9
+    prof = pd.concat([n.add(x) for n, x in inp2.prior_volume_profiles[1:]], axis=1).mean(axis=1)
+    today = inp2.fut.iloc[60]["volume"] + inp2.fut_next.iloc[60]["volume"]
+    assert r["rvol_tod_1m"] == pytest.approx(today / prof.loc[9 * 60 + 15 + 60])
+
+
+def test_rvol_records_how_many_sessions_back_the_baseline():
+    assert compute_day_features(inputs()).iloc[60]["rvol_baseline_n"] == 10
+    short = compute_day_features(inputs(profiles=6)).iloc[60]
+    assert short["rvol_baseline_n"] == 6 and not pd.isna(short["rvol_tod_1m"])
+    thin = compute_day_features(inputs(profiles=4)).iloc[60]
+    assert thin["rvol_baseline_n"] == 4 and pd.isna(thin["rvol_tod_1m"])

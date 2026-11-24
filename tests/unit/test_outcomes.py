@@ -173,3 +173,27 @@ def test_matched_benchmark_uses_same_minute_direction_and_rules():
     r = benchmark([op], other, [(30.0, 20.0, 60)], draws=20, resamples=200)["configs"]["T30_S20_H60"]
     assert r["benchmark_hit_pct"] == 0.0 and r["p_hit_at_least_s000"] == 0.0   # the op's own day is never drawn
     assert r["s000_avg_points"] == 30.0 and r["benchmark_avg_points"] == -20.0
+
+
+def test_day_block_bootstrap_pairs_s000_with_its_random_draws_and_resamples_days():
+    from nifty_engine.research.benchmark import day_block_bootstrap
+
+    rows = [{"day": date(2026, 6, d), "s000_hit": True, "s000_points": 30.0,
+             "random": [(True, 30.0), (False, -20.0)]} for d in (10, 11, 12)]
+    r = day_block_bootstrap(rows, resamples=200)
+    assert r["hit_diff_pp"] == 50.0 and r["points_diff"] == 25.0 and r["p_hit_diff_le_0"] == 0.0
+    assert r["days"] == 3 and r["opportunities"] == 3
+    worse = [{**x, "s000_hit": False, "s000_points": -20.0} for x in rows]
+    assert day_block_bootstrap(worse, resamples=200)["p_hit_diff_le_0"] == 1.0
+
+
+def test_same_day_benchmark_never_draws_the_opportunity_minute_or_another_day():
+    from nifty_engine.research.benchmark import same_day_benchmark
+
+    path = [(25100, 25110, 25098, 25108)] * 30
+    op = op_for(cand())
+    b = {D: bars(path)}
+    op.outcomes["T30_S20_H60"] = label(op, b[D], 30, 20.0, 60)
+    out = same_day_benchmark([op], b, 30.0, 20.0, 60, draws=40)
+    assert out["key"] == "T30_S20_H60" and len(out["rows"]) == 1 and len(out["rows"][0]["random"]) > 0
+    assert all(not h for h, _ in out["rows"][0]["random"])  # flat day: random same-day entries never hit +30

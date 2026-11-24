@@ -23,7 +23,10 @@ Indicators (columns):
                                  the same minutes over the previous `RVOL_SESSIONS` regular sessions,
                                  LIKE FOR LIKE: near+next volume ("near_next", so rollover week is not
                                  distorted) when today and every baseline session have next-month
-                                 data; otherwise near-only on both sides ("near_only")
+                                 data; otherwise near-only on both sides ("near_only"). A minute
+                                 missing from either contract (today or in a baseline session) is
+                                 unknown, never zero volume. rvol_baseline_n = sessions actually
+                                 behind the 1m baseline at that minute (5..10; < 5 -> unknown)
  3 or_width_atr                  spot opening range (first 15 minutes) / spot daily ATR(14) of
                                  previous sessions; UNKNOWN until the range is complete
  4 fut_oi_chg_open_pct, fut_oi_chg_15m_pct
@@ -65,12 +68,12 @@ ROLLOVER_DAYS = 3
 DAILY_ATR_PERIOD = 14
 LOOKBACK = 15            # minutes for *_15m changes
 DAY_TYPE_WINDOW = 30     # minutes for VWAP side/slope in the day-type classifier
-FEATURE_VERSION = 2
+FEATURE_VERSION = 3
 HEAVYWEIGHT_COUNT = 5
 
 FEATURE_COLUMNS = [
     "vwap", "vwap_sigma", "vwap_z", "vwap_up1", "vwap_dn1", "vwap_up2", "vwap_dn2",
-    "rvol_tod_1m", "rvol_tod_5m", "rvol_basis",
+    "rvol_tod_1m", "rvol_tod_5m", "rvol_basis", "rvol_baseline_n",
     "or_width_atr",
     "fut_oi_chg_open_pct", "fut_oi_chg_15m_pct",
     "next_oi_chg_open_pct", "comb_oi_chg_open_pct", "rollover_window",
@@ -155,29 +158,35 @@ def compute_day_features(inp: DayInputs) -> pd.DataFrame:
             out[c] = np.nan
             reasons[c] = "no_futures_volume"
 
-    # ---- 2. time-of-day RVOL (near + next volume vs the same minutes in previous sessions)
-    vol_now = _on(idx, fut, "volume")  # a missing near-month minute stays unknown (not zero volume)
+    # ---- 2. time-of-day RVOL (like for like; a missing minute is unknown, never zero volume)
+    vol_now = _on(idx, fut, "volume")
     mod = pd.Series(idx.hour * 60 + idx.minute, index=idx)
     profiles = inp.prior_volume_profiles[-RVOL_SESSIONS:]
     has_next_today = inp.fut_next is not None and not inp.fut_next.empty
     like_for_like = has_next_today and len(profiles) > 0 and all(nx is not None for _, nx in profiles)
-    if like_for_like:  # near+next on both sides
-        vol_now = vol_now + _on(idx, inp.fut_next, "volume").fillna(0.0)
-        series = [near.add(nx, fill_value=0.0) for near, nx in profiles]
+    if like_for_like:  # near+next on both sides; a minute missing from either contract -> NaN
+        vol_now = vol_now + _on(idx, inp.fut_next, "volume")
+        series = [near.add(nx) for near, nx in profiles]
         out["rvol_basis"] = "near_next"
     else:              # near-only on both sides
         series = [near for near, _ in profiles]
         out["rvol_basis"] = "near_only"
-    if len(series) >= RVOL_MIN_SESSIONS:
-        prof = pd.concat(series, axis=1)
-        base1 = mod.map(prof.mean(axis=1))
-        roll5 = prof.sort_index().rolling(5, min_periods=5).sum().mean(axis=1)
-        base5 = mod.map(roll5)
+    out["rvol_tod_1m"] = out["rvol_tod_5m"] = np.nan
+    out["rvol_baseline_n"] = 0
+    if series:
+        full = [x.reindex(range(int(x.index.min()), int(x.index.max()) + 1)) for x in series if len(x)]
+        prof = pd.concat(full, axis=1)                                  # minute-of-day x session
+        prof5 = prof.rolling(5, min_periods=5).sum()                    # NaN if any of the 5 minutes is missing
+        n1, n5 = prof.notna().sum(axis=1), prof5.notna().sum(axis=1)
+        base1 = mod.map(prof.mean(axis=1).where(n1 >= RVOL_MIN_SESSIONS))
+        base5 = mod.map(prof5.mean(axis=1).where(n5 >= RVOL_MIN_SESSIONS))
+        out["rvol_baseline_n"] = mod.map(n1).fillna(0).astype(int)    # sessions behind the 1m baseline
         out["rvol_tod_1m"] = vol_now / base1.where(base1 > 0)
         out["rvol_tod_5m"] = vol_now.rolling(5, min_periods=5).sum() / base5.where(base5 > 0)
-    else:
-        out["rvol_tod_1m"] = out["rvol_tod_5m"] = np.nan
+    if len(series) < RVOL_MIN_SESSIONS:
         reasons["rvol_tod_1m"] = reasons["rvol_tod_5m"] = "insufficient_rvol_history"
+    else:
+        reasons["rvol_tod_1m"] = reasons["rvol_tod_5m"] = "volume_minute_missing_or_thin_baseline"
 
     # ---- 3. opening range width / daily ATR (spot)
     spot_close = _ffill(idx, inp.spot, "close")

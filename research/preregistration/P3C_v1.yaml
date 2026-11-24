@@ -1,0 +1,61 @@
+# Phase 3C pre-registration: do research indicators improve S000's +30 outcomes?
+#
+# Written and committed BEFORE any outcome was examined conditional on an indicator.
+# scripts/run_phase3c.py refuses to evaluate unless this file is committed and unchanged, records
+# the commit it ran against, and evaluates the holdout ONCE (a second run needs --force and is
+# reported as such).
+
+id: P3C_v1
+registered: 2026-11-24
+strategy: {id: S000, version: 1, fingerprint: 431a35bf64947b56}
+baseline_report: reports/baseline/S000_v1.json
+dataset_fingerprint: e4aa37159f650e97fe67fd3b
+feature_version: 3
+
+disclosure: >
+  Seen before registration: S000's unconditional outcomes for the whole period (including per-month
+  hit rates for the holdout months), the matched and same-day random benchmarks, and unconditional
+  indicator distributions over all 5m bars. NOT seen: any outcome split by an indicator value.
+  The hypotheses below come from trading logic and from the same-day benchmark finding (S000's edge
+  is in day/direction selection rather than intraday timing), not from indicator/outcome data.
+
+split:
+  selection: [2025-12-29, 2026-08-31]   # 78 opportunities: gate only (no threshold tuning)
+  holdout:   [2026-09-01, 2026-11-23]   # 26 opportunities: one evaluation
+
+outcome:
+  primary: T30_S20_H60      # +30 NIFTY points before -20, within 60 minutes; ambiguous = not a hit
+  secondary: none            # one primary outcome only (fewer comparisons); S000-stop results stay in Phase 3A
+  metric: hit rate (TARGET share of executed opportunities) and mean gross NIFTY points
+
+hypotheses:
+  H1_day_type_aligned:
+    rule: "direction matches the trending day type known at decision time (any stage): (BULLISH and day_type == TRENDING_UP) or (BEARISH and day_type == TRENDING_DOWN); UNKNOWN day type = unavailable"
+    predicts: higher
+  H2_rvol_above_normal:
+    rule: "rvol_tod_5m >= 1.0 (futures activity at or above normal for that time of day)"
+    predicts: higher
+  H3_near_expiry:
+    rule: "days_to_expiry <= 2"
+    predicts: lower
+  H4_heavyweights_confirm:
+    rule: "(BULLISH and hw_up_count >= 4) or (BEARISH and hw_up_count <= 1)"
+    predicts: higher
+
+procedure:
+  - Thresholds are fixed above; nothing is tuned on either period.
+  - Selection gate: a hypothesis goes to the holdout only if, in the selection period, its
+    pass-minus-fail hit-rate difference has the predicted sign and each group has >= 10 opportunities.
+  - Holdout: for each gated hypothesis, pass vs fail hit rate (Wilson 95%), difference, and a one-sided
+    permutation p-value (10,000 label shuffles, seed 2026) in the predicted direction.
+  - Multiple testing: Holm correction across the gated hypotheses.
+  - Opportunities with the indicator unavailable are excluded from that hypothesis and counted.
+
+verdicts:
+  CONFIRMED: Holm-adjusted p < 0.05 and difference in the predicted direction
+  SUPPORTED: difference in the predicted direction of at least 10 percentage points, not significant
+  NOT_SUPPORTED: otherwise
+  INSUFFICIENT: either holdout group has fewer than 5 opportunities
+  note: >
+    With 26 holdout opportunities only very large effects can be CONFIRMED. SUPPORTED means "worth
+    re-testing on new data" (more history or live), never "use it".

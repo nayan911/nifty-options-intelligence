@@ -79,3 +79,89 @@ def benchmark(ops: List[Opportunity], bars_by_day: Dict[Any, pd.DataFrame], conf
                                          if rates else None),
         }
     return out
+
+
+def same_day_benchmark(ops: List[Opportunity], bars_by_day: Dict[Any, pd.DataFrame], target: float, stop: Any,
+                       horizon: int, draws: int = 50, seed: int = 11) -> Dict[str, Any]:
+    """Random entries on the SAME day as each opportunity (same direction and stop distance, any other
+    session minute). If S000 still beats these, its edge is in WHEN it enters within a day, not only in
+    which days it trades. Returns per-opportunity matched draws for paired analysis."""
+    rng = random.Random(seed)
+    key = f"T{int(target)}_S{stop if stop == 'S000' else int(stop)}_H{horizon}"
+    rows = []
+    for op in ops:
+        res = op.outcomes.get(key, {})
+        if res.get("outcome") not in EXECUTED:
+            continue
+        stop_pts = float(res["stop_points"]) if stop == "S000" else float(stop)
+        b = bars_by_day[op.day]
+        own = pd.Timestamp(op.decision_at)
+        minutes = [t for t in b["ts"] if t != own]
+        labelled = []
+        for t in (rng.choice(minutes) for _ in range(draws)):
+            fake = Opportunity(day=op.day, decision_at=t.to_pydatetime(), direction=op.direction, candidates=[],
+                               rep={"stop_loss": None})
+            r = label(fake, b, target, stop_pts, horizon)
+            if r.get("outcome") in EXECUTED:
+                labelled.append((r["outcome"] == "TARGET", points(r, target)))
+        rows.append({"day": op.day, "s000_hit": res["outcome"] == "TARGET", "s000_points": points(res, target),
+                     "random": labelled})
+    return {"key": key, "rows": rows}
+
+
+def day_block_bootstrap(rows: List[Dict[str, Any]], resamples: int = 10000, seed: int = 13) -> Dict[str, Any]:
+    """Paired S000-minus-matched-random difference, resampling whole DAYS (opportunities on one day share
+    market conditions, so they are not treated as independent). rows: s000_hit, s000_points, random."""
+    rng = random.Random(seed)
+    by_day: Dict[Any, List[Dict[str, Any]]] = {}
+    for r in rows:
+        if r["random"]:
+            by_day.setdefault(r["day"], []).append(r)
+    days = sorted(by_day)
+
+    def diff(sel):
+        rs = [r for d in sel for r in by_day[d]]
+        hit = sum(r["s000_hit"] for r in rs) / len(rs) - sum(
+            sum(h for h, _ in r["random"]) / len(r["random"]) for r in rs) / len(rs)
+        pts = sum(r["s000_points"] for r in rs) / len(rs) - sum(
+            sum(p for _, p in r["random"]) / len(r["random"]) for r in rs) / len(rs)
+        return 100 * hit, pts
+
+    obs_hit, obs_pts = diff(days)
+    boots = [diff([rng.choice(days) for _ in days]) for _ in range(resamples)]
+    hits, pts = pd.Series([b[0] for b in boots]), pd.Series([b[1] for b in boots])
+    return {
+        "days": len(days), "opportunities": sum(len(v) for v in by_day.values()),
+        "hit_diff_pp": round(obs_hit, 1),
+        "hit_diff_ci95": [round(float(hits.quantile(0.025)), 1), round(float(hits.quantile(0.975)), 1)],
+        "p_hit_diff_le_0": round(float((hits <= 0).mean()), 4),
+        "points_diff": round(obs_pts, 2),
+        "points_diff_ci95": [round(float(pts.quantile(0.025)), 2), round(float(pts.quantile(0.975)), 2)],
+        "p_points_diff_le_0": round(float((pts <= 0).mean()), 4),
+    }
+
+
+def matched_rows(ops: List[Opportunity], bars_by_day: Dict[Any, pd.DataFrame], target: float, stop: Any,
+                 horizon: int, draws: int = 50, seed: int = 7) -> List[Dict[str, Any]]:
+    """Other-day matched draws (same minute of day, direction, stop distance) as rows for day_block_bootstrap."""
+    rng = random.Random(seed)
+    key = f"T{int(target)}_S{stop if stop == 'S000' else int(stop)}_H{horizon}"
+    days = sorted(bars_by_day)
+    rows = []
+    for op in ops:
+        res = op.outcomes.get(key, {})
+        if res.get("outcome") not in EXECUTED:
+            continue
+        stop_pts = float(res["stop_points"]) if stop == "S000" else float(stop)
+        t = pd.Timestamp(op.decision_at).tz_convert("Asia/Kolkata")
+        pool = [d for d in days if d != op.day
+                and ((bars_by_day[d]["ts"].dt.hour == t.hour) & (bars_by_day[d]["ts"].dt.minute == t.minute)).any()]
+        labelled = []
+        for d in (rng.choice(pool) for _ in range(draws)) if pool else []:
+            b = bars_by_day[d]
+            r = label(_shift(op, d, b, stop_pts), b, target, stop_pts, horizon)
+            if r.get("outcome") in EXECUTED:
+                labelled.append((r["outcome"] == "TARGET", points(r, target)))
+        rows.append({"day": op.day, "s000_hit": res["outcome"] == "TARGET", "s000_points": points(res, target),
+                     "random": labelled})
+    return rows

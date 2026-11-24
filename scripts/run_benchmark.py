@@ -17,7 +17,7 @@ import pandas as pd
 from nifty_engine.core.calendar import ExchangeCalendar
 from nifty_engine.research import outcomes as oc
 from nifty_engine.research.bars import in_session_1m
-from nifty_engine.research.benchmark import benchmark
+from nifty_engine.research.benchmark import benchmark, day_block_bootstrap, matched_rows, same_day_benchmark
 from nifty_engine.research.history_store import ResearchHistoryStore
 from nifty_engine.research.manifest import dataset_fingerprint
 from nifty_engine.research.replay import _git_commit
@@ -46,6 +46,17 @@ def main():
         "AND source = 'SPOT' AND resolution = '1' ORDER BY ts").df()
     bars = oc.bars_by_day(in_session_1m(spot, ExchangeCalendar(), CASH))
     res = benchmark(ops, bars, CONFIGS, draws=a.draws, resamples=a.resamples)
+    # Sensitivity: whole-day resampling (opportunities on one day are not independent), against
+    # other-day matched entries and against same-day random entries.
+    res["day_block"] = {}
+    for t, s, h in CONFIGS:
+        k = f"T{int(t)}_S{s if s == 'S000' else int(s)}_H{h}"
+        res["day_block"][k] = {
+            "vs_other_day_matched": day_block_bootstrap(matched_rows(ops, bars, t, s, h, draws=a.draws),
+                                                        resamples=a.resamples),
+            "vs_same_day_random": day_block_bootstrap(same_day_benchmark(ops, bars, t, s, h, draws=a.draws)["rows"],
+                                                      resamples=a.resamples),
+        }
     res["meta"] = {"generated_at": datetime.now().isoformat(timespec="seconds"), "git_commit": _git_commit(),
                    "baseline_commit": rep["meta"]["git_commit"], "dataset_fingerprint": rep["meta"]["dataset_fingerprint"]}
     out = BASE.with_name("S000_v1_benchmark.json")
@@ -62,6 +73,17 @@ def main():
         L.append(f"| {k} | {v['n']} | {v['s000_hit_pct']}% | {v['benchmark_hit_pct']}% ({lo}-{hi}) | "
                  f"{v['p_hit_at_least_s000']} | {v['s000_avg_points']:+.2f} | {v['benchmark_avg_points']:+.2f} | "
                  f"{v['p_points_at_least_s000']} |")
+    L += ["", "## Sensitivity: whole-day resampling (paired S000 minus random, per opportunity)", "",
+          "Days are resampled with replacement, so opportunities sharing a day's conditions are not treated as "
+          "independent. Same-day random entries keep the day fixed and vary only the minute: if S000 still "
+          "beats them, the edge is in WHEN it enters within a day, not only WHICH days it trades.", "",
+          "| Config | Versus | Hit diff (pp) [95% CI] | p(diff <= 0) | Points diff [95% CI] | p(diff <= 0) |",
+          "|---|---|---|---|---|---|"]
+    for k, v in res["day_block"].items():
+        for name, d in v.items():
+            L.append(f"| {k} | {name.replace('_', ' ')} | {d['hit_diff_pp']:+.1f} {d['hit_diff_ci95']} | "
+                     f"{d['p_hit_diff_le_0']} | {d['points_diff']:+.2f} {d['points_diff_ci95']} | "
+                     f"{d['p_points_diff_le_0']} |")
     out.with_suffix(".md").write_text("\n".join(L) + "\n")
     print("\n".join(L))
 

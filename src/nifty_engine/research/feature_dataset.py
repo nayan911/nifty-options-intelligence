@@ -151,6 +151,8 @@ def opportunity_level(baseline_report: dict, tables) -> pd.DataFrame:
             rec[f"out_{key}"] = res.get("outcome")
             if "mfe" in res:
                 rec[f"mfe_{key}"], rec[f"mae_{key}"] = res["mfe"], res["mae"]
+            rec[f"stop_{key}"] = res.get("stop_points")
+            rec[f"close_{key}"] = res.get("close_points")
         recs.append(rec)
     return _attach(recs, tables, "decision_at")
 
