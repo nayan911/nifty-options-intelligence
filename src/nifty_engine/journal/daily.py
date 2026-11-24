@@ -54,11 +54,24 @@ EXIT_MAX_AGE_S = 120.0       # an exit/valuation quote must be at most this old 
 
 
 def _quotes(ticks: pd.DataFrame) -> pd.DataFrame:
-    t = ticks.copy() if not ticks.empty else pd.DataFrame(columns=["local_timestamp", "ltp", "bid", "ask"])
+    """Usable quotes only: event_class LIVE (UNVERIFIED/SNAPSHOT ticks are never executable or used for
+    valuation), positive prices, and a consistent book (a crossed quote with bid > ask is dropped).
+    An ask with a recorded ask quantity of 0 is not executable."""
+    cols = ["local_timestamp", "ltp", "bid", "ask", "event_class", "bid_qty", "ask_qty"]
+    t = ticks.copy() if not ticks.empty else pd.DataFrame(columns=cols)
+    for c in cols:
+        if c not in t:
+            t[c] = None
     t["ts"] = pd.to_datetime(t["local_timestamp"], utc=True).dt.tz_convert("Asia/Kolkata")
-    for c in ("bid", "ask", "ltp"):
+    t = t[t["event_class"].fillna("LIVE") == "LIVE"].copy()
+    for c in ("bid", "ask", "ltp", "bid_qty", "ask_qty"):
         t[c] = pd.to_numeric(t[c], errors="coerce")
+    for c in ("bid", "ask", "ltp"):
         t.loc[t[c] <= 0, c] = float("nan")   # a zero/negative price is no quote
+    crossed = t["bid"].notna() & t["ask"].notna() & (t["bid"] > t["ask"])
+    t.loc[crossed, ["bid", "ask"]] = float("nan")
+    t.loc[t["ask_qty"] == 0, "ask"] = float("nan")
+    t.loc[t["bid_qty"] == 0, "bid"] = float("nan")
     return t.sort_values("ts").reset_index(drop=True)
 
 
@@ -83,11 +96,13 @@ def premium_analysis(ticks: pd.DataFrame, decided_at: datetime, nifty: Dict[str,
     """
     q = _quotes(ticks)
     dec = pd.Timestamp(decided_at)
+    excluded = 0 if ticks.empty or "event_class" not in ticks else int((ticks["event_class"].fillna("LIVE") != "LIVE").sum())
     snap = q[(q["ts"] <= dec) & (q["ask"].notna() | q["bid"].notna())]
     out: Dict[str, Any] = {"signal_snapshot": None if snap.empty else {
         "bid": None if pd.isna(snap["bid"].iloc[-1]) else float(snap["bid"].iloc[-1]),
         "ask": None if pd.isna(snap["ask"].iloc[-1]) else float(snap["ask"].iloc[-1]),
-        "age_s": round((dec - snap["ts"].iloc[-1]).total_seconds(), 1)}}
+        "age_s": round((dec - snap["ts"].iloc[-1]).total_seconds(), 1)},
+        "non_live_quotes_excluded": excluded}
     entry = q[(q["ts"] >= dec) & q["ask"].notna()]
     if entry.empty or (entry["ts"].iloc[0] - dec).total_seconds() > ENTRY_MAX_DELAY_S:
         out["status"] = "NO_EXECUTABLE_ENTRY"
@@ -208,7 +223,8 @@ def _premium_lines(o: Dict[str, Any], pm: Optional[Dict[str, Any]]) -> List[str]
     x = pm.get("at_nifty_exit_T30_S20_H60")
     if x:
         net = f", est. net {_fmt(x.get('est_net_points'), True)}" if "est_net_points" in x else ""
-        lines.append(f"- When NIFTY resolved +30/-20 ({x['nifty_outcome']}): gross {_fmt(x['gross_points'], True)}{net}")
+        lines.append(f"- When NIFTY resolved +30/-20 ({x['nifty_outcome']}): gross {_fmt(x['gross_points'], True)}{net} "
+                     "(quote-based estimate, not a proven fill)")
     return lines
 
 
@@ -251,3 +267,16 @@ def render_markdown(rep: Dict[str, Any]) -> str:
                 "vix", "days_to_expiry", "hw_up_count")))
         L.append("")
     return "\n".join(L) + "\n"
+
+
+def tracked_contract(op: Any, tracking: Dict[str, Dict[str, Any]]) -> "tuple":
+    """The tracked option for an opportunity: the REPRESENTATIVE candidate's own contract (the one whose
+    stop and level the NIFTY outcome uses). Falls back to another merged candidate's contract only if the
+    representative has none, and says so."""
+    rep = op.rep.get("candidate_id")
+    if rep in tracking:
+        return tracking[rep], "representative"
+    for c in op.candidates:
+        if c["candidate_id"] in tracking:
+            return tracking[c["candidate_id"]], f"other_candidate:{c['candidate_id']}"
+    return None, "none"

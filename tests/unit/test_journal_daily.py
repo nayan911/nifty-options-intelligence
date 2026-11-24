@@ -113,3 +113,39 @@ def test_journal_candidates_get_backtest_outcomes_and_render():
                                     "level": "SWING", "decision_codes": ["NET_RR_BELOW_MIN", "SAME_DIRECTION_OPEN"],
                                     "nifty": ops[0].outcomes, "contract": None, "premium": None, "features": {}}]})
     assert "Decision parity (replay vs live): IDENTICAL" in md and "T30_S20_H60: TARGET" in md
+
+
+def _ticks2(rows):
+    return pd.DataFrame([{"local_timestamp": T0 + timedelta(seconds=sec), "ltp": a, "bid": b, "ask": a,
+                          "event_class": ec, "bid_qty": bq, "ask_qty": aq} for sec, b, a, ec, bq, aq in rows])
+
+
+def test_only_live_consistent_quotes_are_executable():
+    t = _ticks2([(2, 90.0, 91.0, "UNVERIFIED", 50, 50),     # artificially favourable, unverified
+                 (4, 92.0, 93.0, "SNAPSHOT", 50, 50),
+                 (6, 99.0, 98.0, "LIVE", 50, 50),           # crossed book: bid > ask
+                 (8, 99.0, 100.0, "LIVE", 50, 0),           # no ask quantity
+                 (10, 100.0, 101.0, "LIVE", 50, 50)])
+    r = daily.premium_analysis(t, T0, {})
+    assert r["entry_ask"] == 101.0 and r["entry_delay_s"] == 10.0
+    assert r["non_live_quotes_excluded"] == 2
+    # a favourable non-live quote is never used for valuation either
+    t2 = _ticks2([(1, 100.0, 101.0, "LIVE", 50, 50), (60, 140.0, 141.0, "UNVERIFIED", 50, 50)])
+    assert daily.premium_analysis(t2, T0, {})["max_gain"] == -1.0
+
+
+def test_premium_uses_the_representative_candidates_own_contract():
+    from nifty_engine.research.outcomes import group_opportunities
+    from nifty_engine.research.replay import ReplaySignal
+
+    def sig(cid, conf):
+        return ReplaySignal("CANDIDATE", T0.date(), T0 - timedelta(minutes=1), "NSE:NIFTY50-INDEX", "1m", "BULLISH",
+                            {"candidate_id": cid, "decision_at": T0.isoformat(), "entry": 25100.0,
+                             "stop_loss": 25088.0, "confluence": conf})
+    op = group_opportunities([sig("low", 65.0), sig("high", 85.0)])[0]   # higher confluence listed second
+    tracking = {"low": {"contract": "NSE:NIFTY26D0125100CE"}, "high": {"contract": "NSE:NIFTY26D0125150CE"}}
+    tr, how = daily.tracked_contract(op, tracking)
+    assert op.rep["candidate_id"] == "high" and tr["contract"] == "NSE:NIFTY26D0125150CE" and how == "representative"
+    tr, how = daily.tracked_contract(op, {"low": tracking["low"]})
+    assert tr["contract"] == "NSE:NIFTY26D0125100CE" and how == "other_candidate:low"
+    assert daily.tracked_contract(op, {}) == (None, "none")

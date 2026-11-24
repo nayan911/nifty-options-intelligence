@@ -17,7 +17,10 @@ from nifty_engine.utils.timezone import now_ist, to_ist
 
 logger = logging.getLogger(__name__)
 
-TRACK_MINUTES = 60
+# Subscription window after a decision. The end-of-day valuation runs 60 minutes from the executable
+# entry, which may come up to ENTRY_MAX_DELAY_S (60 s) after the decision, and needs a quote at its end:
+# 60 + 1 + 1 minute of margin, so the subscription always outlives the valuation window.
+TRACK_MINUTES = 62
 
 
 class JournalRecorder:

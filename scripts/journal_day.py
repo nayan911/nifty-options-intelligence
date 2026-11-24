@@ -106,10 +106,11 @@ def main():
     report_ops = []
     for op in ops:
         cids = [c["candidate_id"] for c in op.candidates]
-        tr = next((tracking[c] for c in cids if c in tracking), None)
+        tr, tr_match = daily.tracked_contract(op, tracking)
         prem = None
         if tr is not None:
-            ticks = live.execute("SELECT local_timestamp, ltp, bid, ask FROM ticks WHERE symbol = ? AND "
+            ticks = live.execute("SELECT local_timestamp, ltp, bid, ask, event_class, bid_qty, ask_qty FROM ticks "
+                                 "WHERE symbol = ? AND "
                                  "local_timestamp BETWEEN ? AND ? ORDER BY local_timestamp",
                                  [tr["contract"], pd.Timestamp(tr["decided_at"]) - pd.Timedelta(minutes=5),
                                   pd.Timestamp(tr["track_until"]) + pd.Timedelta(minutes=5)]).df()
@@ -122,7 +123,9 @@ def main():
             "candidate_ids": cids, "level": op.rep.get("level_id"),
             "decision_codes": sorted({c.get("decision_code") for c in op.candidates}),
             "nifty": op.outcomes, "contract": tr["contract"] if tr else None,
-            "contract_source": tr["source"] if tr else None, "premium": prem,
+            "contract_source": tr["source"] if tr else None, "contract_match": tr_match,
+            "candidate_contracts": {c: (tracking[c]["contract"] if c in tracking else None) for c in cids},
+            "premium": prem,
             "features": ({c: (None if pd.isna(frow[c]) else (round(float(frow[c]), 3) if isinstance(frow[c], float)
                                                              else frow[c])) for c in FEATURE_COLUMNS}
                          if frow is not None else None),

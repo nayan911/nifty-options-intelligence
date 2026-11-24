@@ -93,10 +93,17 @@ def test_option_tracking_window():
     assert rec.track_option(c, "NSE:NIFTY26D0125100CE", {"bid": 100.0, "ask": 101.0}, "paper_engine") == "NSE:NIFTY26D0125100CE"
     assert rec.track_option(c, None, None, "none") is None
     t0 = c.decision_at
-    assert j.active_tracking(t0 + timedelta(minutes=59)) == ["NSE:NIFTY26D0125100CE"]
-    assert j.active_tracking(t0 + timedelta(minutes=60)) == []
+    assert j.active_tracking(t0 + timedelta(minutes=61)) == ["NSE:NIFTY26D0125100CE"]
+    assert j.active_tracking(t0 + timedelta(minutes=62)) == []
     tr = j.tracking(T.date())[0]
-    assert tr["source"] == "paper_engine" and tr["track_until"] == t0 + timedelta(minutes=60)
+    assert tr["source"] == "paper_engine" and tr["track_until"] == t0 + timedelta(minutes=62)
+
+
+def test_tracking_window_outlives_the_valuation_window():
+    from nifty_engine.journal import daily
+    from nifty_engine.journal.recorder import TRACK_MINUTES
+    # valuation: 60 min from an entry that may come ENTRY_MAX_DELAY_S after the decision
+    assert TRACK_MINUTES * 60 >= 60 * 60 + daily.ENTRY_MAX_DELAY_S + 60
 
 
 def test_journal_failure_never_raises():
