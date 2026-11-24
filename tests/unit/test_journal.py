@@ -141,3 +141,30 @@ def test_rotation_keeps_tracked_contracts_subscribed(runner):
         runner.check_and_rotate_options()
     unsubscribed = runner.ws_client.unsubscribe.call_args[0][0]
     assert "NSE:OLD" in unsubscribed and "NSE:NIFTY26D0125100CE" not in unsubscribed
+
+
+def test_next_month_futures_is_recorded_but_never_a_signal_symbol(runner):
+    runner.master.resolve_future.side_effect = lambda u, expiry=None, nth=0: {
+        ("NIFTY", 0): "NSE:NIFTY26DECFUT", ("NIFTY", 1): "NSE:NIFTY27JANFUT",
+        ("BANKNIFTY", 0): "NSE:BANKNIFTY26DECFUT"}[(u, nth)]
+    assert runner._resolve_futures()
+    runner.current_spot_price = 25100.0
+    runner.master.get_active_expiries.return_value = []
+    wl = runner._build_watchlist()
+    assert "NSE:NIFTY27JANFUT" in wl and "NSE:NIFTY26DECFUT" in wl
+    assert runner._signal_symbols() == {"NSE:NIFTY50-INDEX", "NSE:NIFTY26DECFUT"}
+    assert "NSE:NIFTY27JANFUT" not in runner.technical_engine.futures_index_map
+
+
+def test_instrument_master_resolves_the_next_month_contract():
+    import pandas as pd
+
+    from nifty_engine.data.fyers.instrument_master import FyersInstrumentMaster
+    m = FyersInstrumentMaster.__new__(FyersInstrumentMaster)
+    m._df = pd.DataFrame({"short_sym": ["NIFTY"] * 3, "opt": ["XX"] * 3,
+                          "expiry_date": pd.to_datetime(["2099-01-27", "2099-02-24", "2099-03-30"]).date,
+                          "symbol": ["NSE:NIFTY99JANFUT", "NSE:NIFTY99FEBFUT", "NSE:NIFTY99MARFUT"]})
+    assert m.resolve_future("NIFTY") == "NSE:NIFTY99JANFUT"
+    assert m.resolve_future("NIFTY", nth=1) == "NSE:NIFTY99FEBFUT"
+    with pytest.raises(LookupError):
+        m.resolve_future("NIFTY", nth=5)

@@ -204,9 +204,12 @@ class FyersInstrumentMaster(IInstrumentMaster):
     def resolve_future(
         self,
         underlying: str,
-        expiry: Optional[date] = None
+        expiry: Optional[date] = None,
+        nth: int = 0,
     ) -> str:
-        """Resolve the official FYERS futures ticker for the underlying (e.g. NSE:NIFTY26NOVFUT)."""
+        """Resolve the official FYERS futures ticker for the underlying (e.g. NSE:NIFTY26NOVFUT).
+
+        nth: 0 = near month (default), 1 = next month, ... among unexpired contracts."""
         if self._df is None:
             raise RuntimeError("Instrument master not loaded. Call load_master() first.")
 
@@ -225,8 +228,10 @@ class FyersInstrumentMaster(IInstrumentMaster):
                 raise LookupError(f"No futures contract found for {underlying} on {expiry}")
             return str(matched.iloc[0]["symbol"])
 
-        # Return near-month future by default
-        return str(futs.iloc[0]["symbol"])
+        # Near-month future by default; nth=1 the next month
+        if nth >= len(futs):
+            raise LookupError(f"No futures contract #{nth} for {underlying} ({len(futs)} active)")
+        return str(futs.iloc[nth]["symbol"])
 
     def get_atm_strike(self, underlying: str, spot_price: float) -> float:
         """Calculate the nearest At-The-Money (ATM) strike price based on index interval."""

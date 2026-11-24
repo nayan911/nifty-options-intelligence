@@ -162,6 +162,7 @@ class MarketDataEngine:
         self.option_chain_rate_limited_until: Optional[datetime] = None
         self.chain_expiries: List[tuple] = []  # [(date, fyers_epoch)] from the last chain response
         self.banknifty_futures: Optional[str] = None
+        self.nifty_next_futures: Optional[str] = None
         self._chain_expiry_note: Optional[str] = None
 
     def _get_live_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -681,6 +682,13 @@ class MarketDataEngine:
             print(f"[OK] Active NIFTY futures: {nifty_fut} (was {self.technical_engine.primary_futures})")
         self.technical_engine.set_futures_ticker(nifty_fut)
         self.technical_engine.set_index_futures_mapping(settings.PRIMARY_INDEX, nifty_fut)
+        # Next-month NIFTY futures: RECORDED ONLY (ticks/bars for research: combined OI, rollover).
+        # Deliberately not a signal symbol, so it never reaches the technical engine or readiness.
+        try:
+            self.nifty_next_futures = self.master.resolve_future("NIFTY", nth=1)
+        except Exception as e:
+            self.nifty_next_futures = None
+            print(f"[WARN] NIFTY next-month futures resolution (recording only): {e}")
         try:
             self.banknifty_futures = self.master.resolve_future("BANKNIFTY")
             self.technical_engine.set_index_futures_mapping(settings.BANKNIFTY_INDEX, self.banknifty_futures)
@@ -708,6 +716,8 @@ class MarketDataEngine:
         watchlist.append(self.technical_engine.primary_futures)
         if self.banknifty_futures:
             watchlist.append(self.banknifty_futures)
+        if getattr(self, "nifty_next_futures", None):
+            watchlist.append(self.nifty_next_futures)  # recording only (see _resolve_futures)
 
         # Dynamic Options: nearest expiry + next weekly expiry
         spot = self.current_spot_price or self._get_initial_spot()
