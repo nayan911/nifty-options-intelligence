@@ -1,0 +1,65 @@
+{
+ "draws_per_opportunity": 50,
+ "resamples": 10000,
+ "seed": 7,
+ "configs": {
+  "T30_S20_H60": {
+   "n": 104,
+   "s000_hit_pct": 45.2,
+   "benchmark_hit_pct": 32.6,
+   "p_hit_at_least_s000": 0.0029,
+   "s000_avg_points": 5.65,
+   "benchmark_avg_points": 0.19,
+   "p_points_at_least_s000": 0.0062,
+   "benchmark_hit_pct_p5_p95": [
+    25.0,
+    39.4
+   ]
+  },
+  "T30_SS000_H60": {
+   "n": 104,
+   "s000_hit_pct": 35.6,
+   "benchmark_hit_pct": 27.0,
+   "p_hit_at_least_s000": 0.0294,
+   "s000_avg_points": 4.15,
+   "benchmark_avg_points": 0.11,
+   "p_points_at_least_s000": 0.0204,
+   "benchmark_hit_pct_p5_p95": [
+    20.2,
+    33.7
+   ]
+  },
+  "T30_S15_H60": {
+   "n": 104,
+   "s000_hit_pct": 39.4,
+   "benchmark_hit_pct": 27.6,
+   "p_hit_at_least_s000": 0.005,
+   "s000_avg_points": 5.11,
+   "benchmark_avg_points": -0.15,
+   "p_points_at_least_s000": 0.0032,
+   "benchmark_hit_pct_p5_p95": [
+    21.2,
+    34.6
+   ]
+  },
+  "T40_S20_H60": {
+   "n": 104,
+   "s000_hit_pct": 35.6,
+   "benchmark_hit_pct": 23.3,
+   "p_hit_at_least_s000": 0.0025,
+   "s000_avg_points": 5.63,
+   "benchmark_avg_points": -0.35,
+   "p_points_at_least_s000": 0.0094,
+   "benchmark_hit_pct_p5_p95": [
+    17.3,
+    29.8
+   ]
+  }
+ },
+ "meta": {
+  "generated_at": "2026-11-24T14:37:44",
+  "git_commit": "acd1833",
+  "baseline_commit": "4e5856c",
+  "dataset_fingerprint": "e4aa37159f650e97fe67fd3b"
+ }
+}
