@@ -33,6 +33,9 @@ TARGETS = (30.0, 40.0)
 STOPS: Tuple[Any, ...] = ("S000", 15.0, 20.0)
 HORIZONS = (45, 60)
 MIN_SAMPLE = 30
+# Outcomes that are executed trades (have an entry AND an exit). Everything else (NO_ENTRY, NO_DATA,
+# INVALID_AT_OPEN) is not a trade: excluded from statistics and never occupies the position.
+EXECUTED = ("TARGET", "STOP", "AMBIGUOUS", "TIMEOUT")
 
 
 @dataclass
@@ -135,7 +138,7 @@ def one_position_at_a_time(ops: List[Opportunity], key: str) -> List[Opportunity
     taken, busy_until = [], None
     for op in sorted(ops, key=lambda o: o.decision_at):
         o = op.outcomes.get(key, {})
-        if "entry_at" not in o:
+        if o.get("outcome") not in EXECUTED:
             continue
         start = pd.Timestamp(o["entry_at"])
         if busy_until is not None and start < busy_until:  # exit at bar end; next open may enter
@@ -156,9 +159,8 @@ def wilson(k: int, n: int, z: float = 1.96) -> Tuple[Optional[float], Optional[f
 
 
 def summarize(ops: List[Opportunity], key: str) -> Dict[str, Any]:
-    excluded = ("NO_ENTRY", "NO_DATA", "INVALID_AT_OPEN")
     invalid = sum(op.outcomes.get(key, {}).get("outcome") == "INVALID_AT_OPEN" for op in ops)
-    rows = [op.outcomes[key] for op in ops if op.outcomes.get(key, {}).get("outcome") not in (None,) + excluded]
+    rows = [op.outcomes[key] for op in ops if op.outcomes.get(key, {}).get("outcome") in EXECUTED]
     n = len(rows)
     counts = {k: sum(r["outcome"] == k for r in rows) for k in ("TARGET", "STOP", "AMBIGUOUS", "TIMEOUT")}
     lo, hi = wilson(counts["TARGET"], n)

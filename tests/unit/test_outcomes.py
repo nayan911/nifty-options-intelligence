@@ -136,3 +136,17 @@ def test_exit_at_bar_end_lets_the_next_open_enter():
               {"outcome": "STOP", "entry_at": (T0 + timedelta(minutes=3)).isoformat(),
                "exit_at": (T0 + timedelta(minutes=5)).isoformat(), "minutes": 2})
     assert [o.rep["candidate_id"] for o in one_position_at_a_time([a, b], "K")] == ["a", "b"]
+
+
+def test_invalid_at_open_neither_crashes_nor_blocks_the_next_trade():
+    k = "T30_SS000_H60"
+    invalid = op_for(cand(stop=25080.0, cid="bad"))
+    invalid.outcomes[k] = label(invalid, bars([(25075, 25140, 25070, 25130)]), 30, "S000", 60)
+    assert invalid.outcomes[k]["outcome"] == "INVALID_AT_OPEN" and "entry_at" in invalid.outcomes[k]
+    valid = _with(op_for(cand(decision=T0, cid="ok")), k, {
+        "outcome": "TARGET", "entry_at": T0.isoformat(), "exit_at": (T0 + timedelta(minutes=4)).isoformat(),
+        "minutes": 4, "mfe": 31, "mae": 2, "stop_points": 12.0})
+    taken = one_position_at_a_time([invalid, valid], k)
+    assert [o.rep["candidate_id"] for o in taken] == ["ok"]
+    s = summarize([invalid, valid], k)
+    assert s["n"] == 1 and s["TARGET"] == 1 and s["invalid_at_open"] == 1
