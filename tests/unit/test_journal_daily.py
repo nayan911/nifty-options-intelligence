@@ -17,31 +17,51 @@ def ticks(rows):
                          for s, l, b, a in rows])
 
 
-def test_premium_path_uses_latest_fresh_tick_each_minute():
-    t = ticks([(-5, 100.0, 99.5, 100.5), (65, 104.0, 103.5, 104.5), (130, 110.0, 109.0, 111.0)])
-    p = daily.premium_path(t, T0, minutes=5)
-    assert p.loc[0, "ask"] == 100.5 and p.loc[1, "bid"] == 99.5          # minute 1: last tick is still the -5s one
-    assert p.loc[2, "bid"] == 103.5 and p.loc[3, "bid"] == 109.0
-    assert pd.isna(p.loc[5, "bid"])                                       # 170 s since the last tick: stale
-    zero_bid = daily.premium_path(ticks([(-1, 100.0, 0.0, 100.5)]), T0, minutes=0)
-    assert pd.isna(zero_bid.loc[0, "bid"])                                # a zero bid is no quote
-    no_ask = daily.premium_path(ticks([(-1, 100.0, 99.0, 0.0)]), T0, minutes=2)
-    assert daily.premium_summary(no_ask, {})["status"] == "NO_ENTRY_QUOTE"   # NaN ask is not a price
+def test_entry_is_the_first_executable_ask_after_the_decision_not_an_older_quote():
+    t = ticks([(-75, 100.0, 99.5, 100.5), (3, 101.0, 100.8, 101.2), (65, 104.0, 103.5, 104.5)])
+    r = daily.premium_analysis(t, T0, {})
+    assert r["signal_snapshot"] == {"bid": 99.5, "ask": 100.5, "age_s": 75.0}   # context only
+    assert r["status"] == "OK" and r["entry_ask"] == 101.2 and r["entry_delay_s"] == 3.0
+    late = daily.premium_analysis(ticks([(-5, 100.0, 99.5, 100.5), (75, 101.0, 100.5, 101.5)]), T0, {})
+    assert late["status"] == "NO_EXECUTABLE_ENTRY" and late["signal_snapshot"]["ask"] == 100.5
+    assert daily.premium_analysis(ticks([]), T0, {})["status"] == "NO_EXECUTABLE_ENTRY"
 
 
-def test_premium_summary_buys_at_ask_and_values_at_bid():
-    t = ticks([(-1, 100.0, 99.0, 101.0), (60, 110.0, 109.0, 111.0), (180, 125.0, 123.0, 126.0),
-               (300, 95.0, 94.0, 96.0)])
-    path = daily.premium_path(t, T0, minutes=5)
-    nifty = {"T30_S20_H60": {"outcome": "TARGET", "exit_at": (T0 + timedelta(minutes=3)).isoformat()}}
-    s = daily.premium_summary(path, nifty)
-    assert s["entry_ask"] == 101.0 and s["entry_spread"] == 2.0
-    assert s["max_gain_at_bid"] == 22.0 and s["max_gain_minute"] == 3        # 123 bid - 101 ask
-    assert s["reached_plus15"] and s["reached_plus20"]
-    assert s["max_drawdown_at_bid"] == 7.0                                   # 101 - 94
-    assert s["at_nifty_exit_T30_S20_H60"] == {"nifty_outcome": "TARGET", "premium_points": 22.0, "minute": 3}
-    assert s["at_60m"] == -7.0
-    assert daily.premium_summary(daily.premium_path(ticks([]), T0, 3), nifty)["status"] == "NO_ENTRY_QUOTE"
+def test_targets_use_every_quote_and_horizon_needs_a_fresh_quote():
+    # a spike between minute samples (+90 s) reaches +16 and falls back; quotes stop after minute 34
+    t = ticks([(1, 100.0, 99.0, 101.0), (90, 117.0, 117.0, 118.0), (120, 103.0, 102.0, 104.0),
+               (34 * 60, 105.0, 104.0, 106.0)])
+    r = daily.premium_analysis(t, T0, {})
+    assert r["first_plus15_after_min"] == 1.5 and r["first_plus20_after_min"] is None
+    assert r["max_gain"] == 16.0 and r["max_drawdown"] == 2.0
+    assert r["gross_at_horizon"] is None             # the minute-34 quote is not a 60-minute value
+    t2 = ticks([(1, 100.0, 99.0, 101.0), (60 * 60, 110.0, 109.0, 111.0)])
+    assert daily.premium_analysis(t2, T0, {})["gross_at_horizon"] == 8.0
+
+
+def test_valuation_at_nifty_exit_with_estimated_net():
+    from nifty_engine.analysis.derivatives.cost_model import PremiumCostModel
+
+    t = ticks([(1, 100.0, 99.0, 101.0), (170, 125.0, 123.0, 126.0)])
+    nifty = {"T30_S20_H60": {"outcome": "TARGET", "exit_at": (T0 + timedelta(minutes=3)).isoformat()},
+             "T40_S20_H60": {"outcome": "STOP", "exit_at": (T0 + timedelta(minutes=30)).isoformat()}}
+    r = daily.premium_analysis(t, T0, nifty, lot_size=65, cost_model=PremiumCostModel())
+    x = r["at_nifty_exit_T30_S20_H60"]
+    assert x["gross_points"] == 22.0 and 0 < x["est_cost_points"] < 2 and x["est_net_points"] < 22.0
+    assert r["at_nifty_exit_T40_S20_H60"]["gross_points"] is None   # no fresh quote at that exit
+
+
+def test_ask_without_any_bid_renders_without_crashing():
+    r = daily.premium_analysis(ticks([(1, 100.0, 0.0, 101.0)]), T0, {})
+    assert r["status"] == "OK" and r["max_gain"] is None and r["gross_at_horizon"] is None
+    md = daily.render_markdown({
+        "day": "2026-11-25", "strategy": "S000 v1", "live_db": "x", "generated_at": "now",
+        "summary": {"setups": 0, "candidates": 1, "opportunities": 1, "decision_codes": {}, "paper_fills": 0,
+                    "paper_exits": 0}, "decision_parity": None, "bar_parity": {},
+        "opportunities": [{"decision_at": T0.isoformat(), "direction": "BULLISH", "n_candidates": 1, "level": "L",
+                           "decision_codes": ["NET_RR_BELOW_MIN"], "nifty": {}, "contract": "NSE:X",
+                           "contract_source": "atm_fallback", "premium": r, "features": {}}]})
+    assert "best n/a" in md and "at 60m n/a" in md and "eligible for a paper trade: no" in md
 
 
 def test_bar_parity_reports_missing_and_mismatched_minutes():
@@ -55,10 +75,15 @@ def test_bar_parity_reports_missing_and_mismatched_minutes():
     assert r["mismatched_count"] == 1 and r["max_abs_diff"] == 5.0            # 0.04 is within tolerance
 
 
-def test_decision_parity():
-    r = daily.decision_parity(["a", "b"], ["b", "c"])
-    assert r == {"journal": 2, "replay": 2, "both": 1, "only_live": ["a"], "only_replay": ["c"], "identical": False}
-    assert daily.decision_parity(["a"], ["a"])["identical"]
+def test_decision_parity_compares_details_not_just_ids():
+    base = {"direction": "BULLISH", "decision_at": T0.isoformat(), "level_id": "PDH", "entry": 25100.0,
+            "stop_loss": 25088.0}
+    r = daily.decision_parity({"a": base, "b": base}, {"b": base, "c": base})
+    assert (r["only_live"], r["only_replay"], r["identical"]) == (["a"], ["c"], False)
+    same = daily.decision_parity({"a": base}, {"a": {**base, "decision_at": T0}})   # str vs datetime: same time
+    assert same["identical"] and same["detail_mismatches"] == []
+    moved = daily.decision_parity({"a": base}, {"a": {**base, "stop_loss": 25080.0}})
+    assert not moved["identical"] and moved["detail_mismatches"][0]["differences"] == {"stop_loss": (25088.0, 25080.0)}
 
 
 def test_journal_candidates_get_backtest_outcomes_and_render():

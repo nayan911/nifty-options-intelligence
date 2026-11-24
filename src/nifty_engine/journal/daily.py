@@ -25,7 +25,6 @@ from nifty_engine.research.outcomes import config_key, group_opportunities, labe
 from nifty_engine.research.replay import ReplaySignal
 
 PREMIUM_CONFIGS = [(30.0, 20.0, 60), (40.0, 20.0, 60), (30.0, "S000", 60)]
-MAX_TICK_AGE_S = 120.0
 PRICE_TOL = 0.051  # points: live vs FYERS bar values within a tick size count as equal
 
 
@@ -50,58 +49,87 @@ def nifty_outcomes(signals: List[ReplaySignal], spot_bars_by_day: Dict[Any, pd.D
     return ops
 
 
-def premium_path(ticks: pd.DataFrame, decided_at: datetime, minutes: int = 60) -> pd.DataFrame:
-    """Per-minute option quote after a decision from stored ticks (columns local_timestamp, ltp, bid, ask).
-    Row k = the latest tick at or before decided_at + k minutes, if no older than MAX_TICK_AGE_S."""
+ENTRY_MAX_DELAY_S = 60.0     # an executable entry quote must arrive within this long after the decision
+EXIT_MAX_AGE_S = 120.0       # an exit/valuation quote must be at most this old at the time it is needed
+
+
+def _quotes(ticks: pd.DataFrame) -> pd.DataFrame:
     t = ticks.copy() if not ticks.empty else pd.DataFrame(columns=["local_timestamp", "ltp", "bid", "ask"])
     t["ts"] = pd.to_datetime(t["local_timestamp"], utc=True).dt.tz_convert("Asia/Kolkata")
-    t = t.sort_values("ts")
-    rows = []
-    for k in range(minutes + 1):
-        at = pd.Timestamp(decided_at) + pd.Timedelta(minutes=k)
-        prior = t[t["ts"] <= at]
-        if prior.empty or (at - prior["ts"].iloc[-1]).total_seconds() > MAX_TICK_AGE_S:
-            rows.append({"k": k, "at": at, "bid": None, "ask": None, "ltp": None})
-            continue
-        r = prior.iloc[-1]
-        rows.append({"k": k, "at": at, "bid": _pos(r["bid"]), "ask": _pos(r["ask"]), "ltp": _pos(r["ltp"])})
-    return pd.DataFrame(rows)
+    for c in ("bid", "ask", "ltp"):
+        t[c] = pd.to_numeric(t[c], errors="coerce")
+        t.loc[t[c] <= 0, c] = float("nan")   # a zero/negative price is no quote
+    return t.sort_values("ts").reset_index(drop=True)
 
 
-def _pos(x) -> Optional[float]:
-    return float(x) if x is not None and not pd.isna(x) and float(x) > 0 else None
+def _quote_at(q: pd.DataFrame, at: pd.Timestamp, col: str) -> Optional[Dict[str, Any]]:
+    """Latest valid `col` quote at or before `at`, if no older than EXIT_MAX_AGE_S."""
+    prior = q[(q["ts"] <= at) & q[col].notna()]
+    if prior.empty or (at - prior["ts"].iloc[-1]).total_seconds() > EXIT_MAX_AGE_S:
+        return None
+    return {"price": float(prior[col].iloc[-1]), "at": prior["ts"].iloc[-1]}
 
 
-def premium_summary(path: pd.DataFrame, nifty: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """Premium economics of a long option bought at the decision (ask) and valued at the bid."""
-    if path.empty or pd.isna(path.iloc[0]["ask"]):   # missing quotes are NaN inside the frame
-        return {"status": "NO_ENTRY_QUOTE"}
-    entry_ask = float(path.iloc[0]["ask"])
-    entry_bid = None if pd.isna(path.iloc[0]["bid"]) else float(path.iloc[0]["bid"])
-    bids = path.dropna(subset=["bid"])
-    gains = bids["bid"] - entry_ask
-    out: Dict[str, Any] = {
-        "status": "OK", "entry_ask": entry_ask, "entry_bid": entry_bid,
-        "entry_spread": round(entry_ask - entry_bid, 2) if entry_bid is not None else None,
-        "quoted_minutes": int(len(bids)), "missing_minutes": int(len(path) - len(bids)),
-        "max_gain_at_bid": round(float(gains.max()), 2) if len(gains) else None,
-        "max_gain_minute": int(bids.loc[gains.idxmax(), "k"]) if len(gains) else None,
-        "max_drawdown_at_bid": round(float(-gains.min()), 2) if len(gains) else None,
-        "reached_plus15": bool((gains >= 15).any()), "reached_plus20": bool((gains >= 20).any()),
-        "at_60m": round(float(bids.iloc[-1]["bid"] - entry_ask), 2) if len(bids) else None,
-    }
+def premium_analysis(ticks: pd.DataFrame, decided_at: datetime, nifty: Dict[str, Dict[str, Any]],
+                     horizon_min: int = 60, lot_size: Optional[int] = None,
+                     cost_model: Optional[Any] = None) -> Dict[str, Any]:
+    """Option premium economics of a long option for one decision, kept in four separate layers:
+      signal_snapshot  latest quote AT the decision, with its age (context only, not tradable)
+      entry            first valid ASK at/after the decision within ENTRY_MAX_DELAY_S (executable paper
+                       entry); without it there is no paper P&L ("NO_EXECUTABLE_ENTRY")
+      gross            bid-side value against the entry ask, over EVERY recorded quote (not minute samples);
+                       a valuation exists only if a fresh quote (<= EXIT_MAX_AGE_S) exists at that time
+      net_estimate     gross minus statutory costs and brokerage for one lot (when a cost model is given)
+    """
+    q = _quotes(ticks)
+    dec = pd.Timestamp(decided_at)
+    snap = q[(q["ts"] <= dec) & (q["ask"].notna() | q["bid"].notna())]
+    out: Dict[str, Any] = {"signal_snapshot": None if snap.empty else {
+        "bid": None if pd.isna(snap["bid"].iloc[-1]) else float(snap["bid"].iloc[-1]),
+        "ask": None if pd.isna(snap["ask"].iloc[-1]) else float(snap["ask"].iloc[-1]),
+        "age_s": round((dec - snap["ts"].iloc[-1]).total_seconds(), 1)}}
+    entry = q[(q["ts"] >= dec) & q["ask"].notna()]
+    if entry.empty or (entry["ts"].iloc[0] - dec).total_seconds() > ENTRY_MAX_DELAY_S:
+        out["status"] = "NO_EXECUTABLE_ENTRY"
+        return out
+    e = entry.iloc[0]
+    entry_at, entry_ask = e["ts"], float(e["ask"])
+    out.update({"status": "OK", "entry_at": entry_at.isoformat(), "entry_delay_s": round((entry_at - dec).total_seconds(), 1),
+                "entry_ask": entry_ask, "entry_bid": None if pd.isna(e["bid"]) else float(e["bid"])})
+    out["entry_spread"] = round(entry_ask - out["entry_bid"], 2) if out["entry_bid"] is not None else None
+    end = entry_at + pd.Timedelta(minutes=horizon_min)
+    path = q[(q["ts"] >= entry_at) & (q["ts"] <= end) & q["bid"].notna()]
+    gains = path["bid"] - entry_ask
+    out["bid_quotes"] = int(len(path))
+    if len(path):
+        i_max, i_min = gains.idxmax(), gains.idxmin()
+        out["max_gain"] = round(float(gains[i_max]), 2)
+        out["max_gain_after_min"] = round((path.loc[i_max, "ts"] - entry_at).total_seconds() / 60, 1)
+        out["max_drawdown"] = round(float(-gains[i_min]), 2)
+        for x in (15, 20):
+            hit = path[gains >= x]
+            out[f"first_plus{x}_after_min"] = (round((hit["ts"].iloc[0] - entry_at).total_seconds() / 60, 1)
+                                               if len(hit) else None)
+    else:
+        out.update({"max_gain": None, "max_gain_after_min": None, "max_drawdown": None,
+                    "first_plus15_after_min": None, "first_plus20_after_min": None})
+    q60 = _quote_at(q, end, "bid")
+    out["gross_at_horizon"] = round(q60["price"] - entry_ask, 2) if q60 else None
     for t, s, h in PREMIUM_CONFIGS:
         key = config_key(t, s, h)
         res = nifty.get(key, {})
         if "exit_at" not in res:
             out[f"at_nifty_exit_{key}"] = None
             continue
-        exit_at = pd.Timestamp(res["exit_at"])
-        after = bids[bids["at"] >= exit_at]
-        out[f"at_nifty_exit_{key}"] = ({"nifty_outcome": res["outcome"],
-                                        "premium_points": round(float(after.iloc[0]["bid"] - entry_ask), 2),
-                                        "minute": int(after.iloc[0]["k"])} if len(after) else
-                                       {"nifty_outcome": res["outcome"], "premium_points": None})
+        qx = _quote_at(q, pd.Timestamp(res["exit_at"]), "bid")
+        gross = round(qx["price"] - entry_ask, 2) if qx else None
+        rec = {"nifty_outcome": res["outcome"], "gross_points": gross}
+        if gross is not None and cost_model is not None and lot_size:
+            costs = (cost_model.compute_fill_costs("BUY", entry_ask, lot_size)["total_costs"]
+                     + cost_model.compute_fill_costs("SELL", qx["price"], lot_size)["total_costs"])
+            rec["est_cost_points"] = round(costs / lot_size, 2)
+            rec["est_net_points"] = round(gross - costs / lot_size, 2)
+        out[f"at_nifty_exit_{key}"] = rec
     return out
 
 
@@ -124,10 +152,64 @@ def bar_parity(live: pd.DataFrame, hist: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def decision_parity(journal_ids: List[str], replay_ids: List[str]) -> Dict[str, Any]:
-    j, r = set(journal_ids), set(replay_ids)
-    return {"journal": len(j), "replay": len(r), "both": len(j & r),
-            "only_live": sorted(j - r), "only_replay": sorted(r - j), "identical": j == r}
+DETAIL_FIELDS = ("direction", "decision_at", "level_id", "entry", "stop_loss")
+
+
+def decision_parity(journal: Dict[str, Dict[str, Any]], replay: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """journal/replay: candidate_id -> decision details. Same ids AND same direction, decision time,
+    level, entry and stop are required for parity."""
+    j, r = set(journal), set(replay)
+    mismatched = []
+    for cid in sorted(j & r):
+        diffs = {f: (journal[cid].get(f), replay[cid].get(f)) for f in DETAIL_FIELDS
+                 if not _same(journal[cid].get(f), replay[cid].get(f))}
+        if diffs:
+            mismatched.append({"candidate_id": cid, "differences": diffs})
+    return {"journal": len(j), "replay": len(r), "both": len(j & r), "only_live": sorted(j - r),
+            "only_replay": sorted(r - j), "detail_mismatches": mismatched,
+            "identical": j == r and not mismatched}
+
+
+def _same(a, b) -> bool:
+    if a is None or b is None:
+        return a is b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(float(a) - float(b)) < 1e-6
+    try:
+        return pd.Timestamp(a) == pd.Timestamp(b)
+    except (ValueError, TypeError):
+        return str(a) == str(b)
+
+
+def _fmt(x, signed=False) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return "n/a"
+    return f"{x:+}" if signed else f"{x}"
+
+
+def _premium_lines(o: Dict[str, Any], pm: Optional[Dict[str, Any]]) -> List[str]:
+    if not o.get("contract"):
+        return ["- Option: none tracked"]
+    if not pm:
+        return [f"- Option {o['contract']}: no quotes"]
+    snap = pm.get("signal_snapshot")
+    snap_s = (f"signal snapshot bid {_fmt(snap['bid'])} / ask {_fmt(snap['ask'])} ({snap['age_s']}s old)"
+              if snap else "no quote before the signal")
+    lines = [f"- Option {o['contract']} ({o.get('contract_source')}): {snap_s}"]
+    if pm.get("status") != "OK":
+        return lines + [f"- Paper entry: {pm.get('status')} (no executable ask within {ENTRY_MAX_DELAY_S:.0f}s)"]
+    lines.append(f"- Executable entry: ask {pm['entry_ask']} after {pm['entry_delay_s']}s "
+                 f"(bid {_fmt(pm['entry_bid'])}, spread {_fmt(pm['entry_spread'])}); eligible for a paper trade: "
+                 f"{'yes' if 'ACCEPTED' in o.get('decision_codes', []) else 'no'}")
+    lines.append(f"- Gross at bid ({pm['bid_quotes']} quotes): best {_fmt(pm['max_gain'], True)} "
+                 f"after {_fmt(pm['max_gain_after_min'])}m, worst {_fmt(-pm['max_drawdown'] if pm['max_drawdown'] is not None else None, True)}; "
+                 f"+15 after {_fmt(pm['first_plus15_after_min'])}m, +20 after {_fmt(pm['first_plus20_after_min'])}m; "
+                 f"at 60m {_fmt(pm['gross_at_horizon'], True)}")
+    x = pm.get("at_nifty_exit_T30_S20_H60")
+    if x:
+        net = f", est. net {_fmt(x.get('est_net_points'), True)}" if "est_net_points" in x else ""
+        lines.append(f"- When NIFTY resolved +30/-20 ({x['nifty_outcome']}): gross {_fmt(x['gross_points'], True)}{net}")
+    return lines
 
 
 def render_markdown(rep: Dict[str, Any]) -> str:
@@ -135,8 +217,9 @@ def render_markdown(rep: Dict[str, Any]) -> str:
     L = [f"# Journal {d}", "",
          f"Strategy {rep['strategy']} | live DB `{rep['live_db']}` | history window manifest "
          f"`{rep.get('history_fingerprint')}` | generated {rep['generated_at']}", "",
-         "> Live S000 decisions, what NIFTY did next (backtest rules) and what the option premium did "
-         "(bought at the ask, valued at the bid). Gross of brokerage and taxes.", "",
+         "> Four separate layers: what NIFTY did (backtest rules); what the tracked option's quotes did "
+         "(gross, bought at the first executable ask after the decision, valued at the bid); whether a "
+         "paper trade was eligible (entry decision code); and an estimated net after statutory costs.", "",
          "## Summary", ""]
     s = rep["summary"]
     L += [f"- Setups (NIFTY spot): {s['setups']}", f"- Candidates: {s['candidates']} -> opportunities: {s['opportunities']}",
@@ -145,7 +228,8 @@ def render_markdown(rep: Dict[str, Any]) -> str:
     dp = rep.get("decision_parity")
     if dp:
         L.append(f"- Decision parity (replay vs live): {'IDENTICAL' if dp['identical'] else 'DIFFERENT'} "
-                 f"(live {dp['journal']}, replay {dp['replay']}, both {dp['both']})")
+                 f"(live {dp['journal']}, replay {dp['replay']}, both {dp['both']}, "
+                 f"detail mismatches {len(dp.get('detail_mismatches', []))})")
     for sym, bp in (rep.get("bar_parity") or {}).items():
         L.append(f"- Bar parity {sym}: {bp['common']}/{bp['fyers_bars']} minutes compared, "
                  f"{bp['mismatched_count']} differ, {bp['missing_live_count']} missing live")
@@ -159,16 +243,7 @@ def render_markdown(rep: Dict[str, Any]) -> str:
                   f"{k}: {v.get('outcome')}" + (f" in {v['minutes']}m" if v.get("minutes") is not None else "")
                   for k, v in o["nifty"].items() if k in ("T30_S20_H60", "T40_S20_H60", "T30_SS000_H60"))]
         pm = o.get("premium")
-        if pm and pm.get("status") == "OK":
-            L.append(f"- Option {o['contract']} ({o['contract_source']}): ask {pm['entry_ask']} / bid {pm['entry_bid']} "
-                     f"(spread {pm['entry_spread']}); best +{pm['max_gain_at_bid']} at {pm['max_gain_minute']}m, "
-                     f"worst -{pm['max_drawdown_at_bid']}; +15 {'yes' if pm['reached_plus15'] else 'no'}, "
-                     f"+20 {'yes' if pm['reached_plus20'] else 'no'}; at 60m {pm['at_60m']:+}")
-            x = pm.get("at_nifty_exit_T30_S20_H60")
-            if x and x.get("premium_points") is not None:
-                L.append(f"- When NIFTY resolved +30/-20 ({x['nifty_outcome']}): premium {x['premium_points']:+} points")
-        elif o.get("contract"):
-            L.append(f"- Option {o['contract']}: {pm.get('status') if pm else 'no quotes'}")
+        L += _premium_lines(o, pm)
         f = o.get("features") or {}
         if f:
             L.append("- Indicators: " + ", ".join(f"{k}={v}" for k, v in f.items() if k in (

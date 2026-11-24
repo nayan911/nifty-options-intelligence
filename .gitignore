@@ -31,3 +31,6 @@ fyersRequests.log
 .idea/
 *.swp
 *.swo
+
+# Daily live journal: the readable .md reports are committed; full-detail .json stays local
+journal/**/*.json

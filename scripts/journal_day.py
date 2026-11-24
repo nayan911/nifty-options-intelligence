@@ -22,6 +22,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
+from nifty_engine.analysis.derivatives.cost_model import PremiumCostModel
 from nifty_engine.core.calendar import ExchangeCalendar
 from nifty_engine.features.library import FEATURE_COLUMNS, compute_day_features, features_at
 from nifty_engine.journal import daily
@@ -101,6 +102,7 @@ def main():
     inp = fb.day_inputs(d, sorted(fb._by_day["spot"]))
     ftable = compute_day_features(inp) if inp is not None else None
 
+    cost_model = PremiumCostModel()
     report_ops = []
     for op in ops:
         cids = [c["candidate_id"] for c in op.candidates]
@@ -109,9 +111,11 @@ def main():
         if tr is not None:
             ticks = live.execute("SELECT local_timestamp, ltp, bid, ask FROM ticks WHERE symbol = ? AND "
                                  "local_timestamp BETWEEN ? AND ? ORDER BY local_timestamp",
-                                 [tr["contract"], pd.Timestamp(tr["decided_at"]) - pd.Timedelta(minutes=2),
-                                  tr["track_until"]]).df()
-            prem = daily.premium_summary(daily.premium_path(ticks, tr["decided_at"]), op.outcomes)
+                                 [tr["contract"], pd.Timestamp(tr["decided_at"]) - pd.Timedelta(minutes=5),
+                                  pd.Timestamp(tr["track_until"]) + pd.Timedelta(minutes=5)]).df()
+            prem = daily.premium_analysis(ticks, tr["decided_at"], op.outcomes,
+                                          lot_size=cost_model.get_lot_size(underlying="NIFTY", symbol=tr["contract"]),
+                                          cost_model=cost_model)
         frow = features_at(ftable, op.decision_at) if ftable is not None else None
         report_ops.append({
             "decision_at": op.decision_at.isoformat(), "direction": op.direction, "n_candidates": len(cids),
@@ -143,8 +147,16 @@ def main():
     rep_dp = None
     try:
         rd = ReplayDriver(hist).run(d, d, manifest_path=Path(a.history_manifest))
-        rep_dp = daily.decision_parity([e["candidate_id"] for e in events if e["kind"] == "CANDIDATE"],
-                                       [s.detail["candidate_id"] for s in rd.candidates()])
+        live_c = {}
+        for e in events:
+            if e["kind"] == "CANDIDATE":
+                p = json.loads(e["payload"])
+                live_c[e["candidate_id"]] = {"direction": e["direction"], "decision_at": p.get("decision_at"),
+                                             "level_id": e["level_id"], "entry": p.get("entry"), "stop_loss": p.get("stop")}
+        replay_c = {s.detail["candidate_id"]: {"direction": s.direction, "decision_at": s.detail.get("decision_at"),
+                                               "level_id": s.detail.get("level_id"), "entry": s.detail.get("entry"),
+                                               "stop_loss": s.detail.get("stop_loss")} for s in rd.candidates()}
+        rep_dp = daily.decision_parity(live_c, replay_c)
     except Exception as e:
         rep_dp = {"error": str(e), "identical": False, "journal": None, "replay": None, "both": None}
 
