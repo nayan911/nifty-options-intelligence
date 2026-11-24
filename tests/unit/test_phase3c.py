@@ -43,3 +43,14 @@ def test_evaluate_gate_permutation_holm_and_verdicts():
     small = {**h1, "pass": {**h1["pass"], "n": 4}}
     assert p3.verdict(small, 0.01) == "INSUFFICIENT"
     assert not p3.gate({**h1, "predicts": "lower"})
+
+
+def test_preregistration_file_parses_and_matches_the_code():
+    from pathlib import Path
+
+    import yaml
+
+    reg = yaml.safe_load((Path(__file__).resolve().parents[2] / "research/preregistration/P3C_v1.yaml").read_text())
+    assert set(reg["hypotheses"]) == set(p3.PREDICTS)
+    assert {k: v["predicts"] for k, v in reg["hypotheses"].items()} == p3.PREDICTS
+    assert reg["outcome"]["primary"] == "T30_S20_H60" and len(reg["procedure"]) == 5

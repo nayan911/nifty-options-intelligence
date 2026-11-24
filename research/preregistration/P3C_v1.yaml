@@ -43,13 +43,13 @@ hypotheses:
     predicts: higher
 
 procedure:
-  - Thresholds are fixed above; nothing is tuned on either period.
-  - Selection gate: a hypothesis goes to the holdout only if, in the selection period, its
-    pass-minus-fail hit-rate difference has the predicted sign and each group has >= 10 opportunities.
-  - Holdout: for each gated hypothesis, pass vs fail hit rate (Wilson 95%), difference, and a one-sided
-    permutation p-value (10,000 label shuffles, seed 2026) in the predicted direction.
-  - Multiple testing: Holm correction across the gated hypotheses.
-  - Opportunities with the indicator unavailable are excluded from that hypothesis and counted.
+  - "Thresholds are fixed above; nothing is tuned on either period."
+  - "Selection gate: a hypothesis goes to the holdout only if, in the selection period, its
+    pass-minus-fail hit-rate difference has the predicted sign and each group has >= 10 opportunities."
+  - "Holdout: for each gated hypothesis, pass vs fail hit rate (Wilson 95%), difference, and a one-sided
+    permutation p-value (10,000 label shuffles, seed 2026) in the predicted direction."
+  - "Multiple testing: Holm correction across the gated hypotheses."
+  - "Opportunities with the indicator unavailable are excluded from that hypothesis and counted."
 
 verdicts:
   CONFIRMED: Holm-adjusted p < 0.05 and difference in the predicted direction
