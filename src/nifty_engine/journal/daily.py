@@ -135,6 +135,8 @@ def premium_analysis(ticks: pd.DataFrame, decided_at: datetime, nifty: Dict[str,
                     "first_plus15_after_min": None, "first_plus20_after_min": None})
     q60 = _quote_at(q, end, "bid", not_before=entry_at)
     out["gross_at_horizon"] = round(q60["price"] - entry_ask, 2) if q60 else None
+    if q60 is None:
+        out["gross_at_horizon_unavailable"] = "no_fresh_bid_at_horizon"
     for t, s, h in PREMIUM_CONFIGS:
         key = config_key(t, s, h)
         res = nifty.get(key, {})
@@ -233,11 +235,13 @@ def _premium_lines(o: Dict[str, Any], pm: Optional[Dict[str, Any]]) -> List[str]
     lines.append(f"- Gross at bid ({pm['bid_quotes']} quotes): best {_fmt(pm['max_gain'], True)} "
                  f"after {_fmt(pm['max_gain_after_min'])}m, worst {_fmt(-pm['max_drawdown'] if pm['max_drawdown'] is not None else None, True)}; "
                  f"+15 after {_fmt(pm['first_plus15_after_min'])}m, +20 after {_fmt(pm['first_plus20_after_min'])}m; "
-                 f"at 60m {_fmt(pm['gross_at_horizon'], True)}")
+                 f"at 60m {_fmt(pm['gross_at_horizon'], True)}"
+                 + (f" ({pm['gross_at_horizon_unavailable']})" if pm.get("gross_at_horizon_unavailable") else ""))
     x = pm.get("at_nifty_exit_T30_S20_H60")
     if x:
         net = f", est. net {_fmt(x.get('est_net_points'), True)}" if "est_net_points" in x else ""
-        lines.append(f"- When NIFTY resolved +30/-20 ({x['nifty_outcome']}): gross {_fmt(x['gross_points'], True)}{net} "
+        why = f" ({x['unavailable']})" if x.get("unavailable") else ""
+        lines.append(f"- When NIFTY resolved +30/-20 ({x['nifty_outcome']}): gross {_fmt(x['gross_points'], True)}{why}{net} "
                      "(quote-based estimate, not a proven fill)")
     return lines
 

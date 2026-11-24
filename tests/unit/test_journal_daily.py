@@ -191,3 +191,19 @@ def test_nifty_exit_is_valued_only_with_a_bid_from_after_the_option_entry():
     t2 = _ticks2([(40, 130.0, float("nan"), "LIVE", 50, 50), (50, 100.0, 101.0, "LIVE", 50, 50),
                   (55, 104.0, 105.0, "LIVE", 50, 50)])
     assert daily.premium_analysis(t2, T0, exit_60)["at_nifty_exit_T30_S20_H60"]["gross_points"] == 3.0
+
+
+def test_markdown_states_why_premium_values_are_unavailable():
+    t = _ticks2([(40, 130.0, float("nan"), "LIVE", 50, 50), (50, float("nan"), 101.0, "LIVE", 50, 50)])
+    nifty = {"T30_S20_H60": {"outcome": "TARGET", "exit_at": (T0 + timedelta(seconds=60)).isoformat()}}
+    r = daily.premium_analysis(t, T0, nifty)
+    assert r["gross_at_horizon_unavailable"] == "no_fresh_bid_at_horizon"
+    md = daily.render_markdown({
+        "day": "2026-11-25", "strategy": "S000 v1", "live_db": "x", "generated_at": "now",
+        "summary": {"setups": 0, "candidates": 1, "opportunities": 1, "decision_codes": {}, "paper_fills": 0,
+                    "paper_exits": 0}, "decision_parity": None, "bar_parity": {},
+        "opportunities": [{"decision_at": T0.isoformat(), "direction": "BULLISH", "n_candidates": 1, "level": "L",
+                           "decision_codes": [], "nifty": nifty, "contract": "NSE:X", "contract_source": "atm_fallback",
+                           "contract_match": "representative", "premium": r, "features": {}}]})
+    assert "at 60m n/a (no_fresh_bid_at_horizon)" in md
+    assert "gross n/a (no_fresh_bid_after_entry)" in md
