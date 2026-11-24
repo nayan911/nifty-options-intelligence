@@ -75,9 +75,13 @@ def _quotes(ticks: pd.DataFrame) -> pd.DataFrame:
     return t.sort_values("ts").reset_index(drop=True)
 
 
-def _quote_at(q: pd.DataFrame, at: pd.Timestamp, col: str) -> Optional[Dict[str, Any]]:
-    """Latest valid `col` quote at or before `at`, if no older than EXIT_MAX_AGE_S."""
+def _quote_at(q: pd.DataFrame, at: pd.Timestamp, col: str,
+              not_before: Optional[pd.Timestamp] = None) -> Optional[Dict[str, Any]]:
+    """Latest valid `col` quote at or before `at`, if no older than EXIT_MAX_AGE_S and (when given) recorded
+    at or after `not_before` - a position can only be valued with quotes from after it was opened."""
     prior = q[(q["ts"] <= at) & q[col].notna()]
+    if not_before is not None:
+        prior = prior[prior["ts"] >= not_before]
     if prior.empty or (at - prior["ts"].iloc[-1]).total_seconds() > EXIT_MAX_AGE_S:
         return None
     return {"price": float(prior[col].iloc[-1]), "at": prior["ts"].iloc[-1]}
@@ -129,7 +133,7 @@ def premium_analysis(ticks: pd.DataFrame, decided_at: datetime, nifty: Dict[str,
     else:
         out.update({"max_gain": None, "max_gain_after_min": None, "max_drawdown": None,
                     "first_plus15_after_min": None, "first_plus20_after_min": None})
-    q60 = _quote_at(q, end, "bid")
+    q60 = _quote_at(q, end, "bid", not_before=entry_at)
     out["gross_at_horizon"] = round(q60["price"] - entry_ask, 2) if q60 else None
     for t, s, h in PREMIUM_CONFIGS:
         key = config_key(t, s, h)
@@ -137,9 +141,16 @@ def premium_analysis(ticks: pd.DataFrame, decided_at: datetime, nifty: Dict[str,
         if "exit_at" not in res:
             out[f"at_nifty_exit_{key}"] = None
             continue
-        qx = _quote_at(q, pd.Timestamp(res["exit_at"]), "bid")
+        exit_at = pd.Timestamp(res["exit_at"])
+        if exit_at < entry_at:   # NIFTY resolved before the option could be bought: nothing to value
+            out[f"at_nifty_exit_{key}"] = {"nifty_outcome": res["outcome"], "gross_points": None,
+                                           "unavailable": "nifty_exit_before_option_entry"}
+            continue
+        qx = _quote_at(q, exit_at, "bid", not_before=entry_at)
         gross = round(qx["price"] - entry_ask, 2) if qx else None
         rec = {"nifty_outcome": res["outcome"], "gross_points": gross}
+        if qx is None:
+            rec["unavailable"] = "no_fresh_bid_after_entry"
         if gross is not None and cost_model is not None and lot_size:
             costs = (cost_model.compute_fill_costs("BUY", entry_ask, lot_size)["total_costs"]
                      + cost_model.compute_fill_costs("SELL", qx["price"], lot_size)["total_costs"])

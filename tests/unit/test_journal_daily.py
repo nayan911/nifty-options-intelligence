@@ -173,3 +173,21 @@ def test_markdown_flags_a_fallback_contract():
     assert "FALLBACK" not in daily.render_markdown({**base, "opportunities": [{**op, "contract_match": "representative"}]})
     md = daily.render_markdown({**base, "opportunities": [{**op, "contract_match": "other_candidate:low"}]})
     assert "[FALLBACK: other_candidate:low, not the representative's contract]" in md
+
+
+def test_nifty_exit_is_valued_only_with_a_bid_from_after_the_option_entry():
+    # +40 s: a bid but no ask (not executable); +50 s: first executable ask = entry; NIFTY resolves at +60 s
+    t = _ticks2([(40, 130.0, float("nan"), "LIVE", 50, 50), (50, float("nan"), 101.0, "LIVE", 50, 50)])
+    exit_60 = {"T30_S20_H60": {"outcome": "TARGET", "exit_at": (T0 + timedelta(seconds=60)).isoformat()}}
+    r = daily.premium_analysis(t, T0, exit_60)
+    assert r["entry_ask"] == 101.0 and r["entry_delay_s"] == 50.0
+    x = r["at_nifty_exit_T30_S20_H60"]
+    assert x["gross_points"] is None and x["unavailable"] == "no_fresh_bid_after_entry"   # +40 s bid is pre-entry
+    # NIFTY resolving before the option could be bought is never valued
+    early = {"T30_S20_H60": {"outcome": "STOP", "exit_at": (T0 + timedelta(seconds=30)).isoformat()}}
+    y = daily.premium_analysis(t, T0, early)["at_nifty_exit_T30_S20_H60"]
+    assert y["gross_points"] is None and y["unavailable"] == "nifty_exit_before_option_entry"
+    # a bid after the entry is used normally
+    t2 = _ticks2([(40, 130.0, float("nan"), "LIVE", 50, 50), (50, 100.0, 101.0, "LIVE", 50, 50),
+                  (55, 104.0, 105.0, "LIVE", 50, 50)])
+    assert daily.premium_analysis(t2, T0, exit_60)["at_nifty_exit_T30_S20_H60"]["gross_points"] == 3.0
