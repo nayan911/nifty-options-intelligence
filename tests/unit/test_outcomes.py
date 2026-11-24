@@ -150,3 +150,26 @@ def test_invalid_at_open_neither_crashes_nor_blocks_the_next_trade():
     assert [o.rep["candidate_id"] for o in taken] == ["ok"]
     s = summarize([invalid, valid], k)
     assert s["n"] == 1 and s["TARGET"] == 1 and s["invalid_at_open"] == 1
+
+
+def test_matched_benchmark_uses_same_minute_direction_and_rules():
+    from nifty_engine.research.benchmark import benchmark
+
+    up = [(25100, 25110, 25098, 25108), (25108, 25135, 25105, 25132)]      # +30 reached in minute 2
+    down = [(25100, 25102, 25085, 25086), (25086, 25088, 25070, 25072)]    # -20 stop first
+    days = [date(2026, 6, 10), date(2026, 6, 11), date(2026, 6, 12)]
+
+    def day_bars(d, path):
+        t0 = IST.localize(datetime(d.year, d.month, d.day, 10, 0))
+        return pd.DataFrame([{"ts": pd.Timestamp(t0 + timedelta(minutes=i)), "open": o, "high": h, "low": lo,
+                              "close": c} for i, (o, h, lo, c) in enumerate(path)])
+
+    op = op_for(cand())
+    op.outcomes["T30_S20_H60"] = label(op, bars(up), 30, 20.0, 60)
+    same = {d: day_bars(d, up) for d in days}
+    r = benchmark([op], same, [(30.0, 20.0, 60)], draws=20, resamples=200)["configs"]["T30_S20_H60"]
+    assert r["s000_hit_pct"] == 100.0 and r["benchmark_hit_pct"] == 100.0 and r["p_hit_at_least_s000"] == 1.0
+    other = {days[0]: day_bars(days[0], up), days[1]: day_bars(days[1], down), days[2]: day_bars(days[2], down)}
+    r = benchmark([op], other, [(30.0, 20.0, 60)], draws=20, resamples=200)["configs"]["T30_S20_H60"]
+    assert r["benchmark_hit_pct"] == 0.0 and r["p_hit_at_least_s000"] == 0.0   # the op's own day is never drawn
+    assert r["s000_avg_points"] == 30.0 and r["benchmark_avg_points"] == -20.0
