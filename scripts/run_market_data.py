@@ -40,6 +40,8 @@ from nifty_engine.data.gap_backfill import FeedGapBackfiller
 from nifty_engine.data.historical_manager import HistoricalCandleManager
 from nifty_engine.data.storage.duckdb_store import DuckDBStore
 from nifty_engine.data.tick_normalizer import TickNormalizer, TickStatus
+from nifty_engine.journal.recorder import JournalRecorder
+from nifty_engine.journal.store import JournalStore
 from nifty_engine.paper_trading.engine import PaperTradingEngine
 from nifty_engine.strategy.registry import load_registry
 from nifty_engine.utils.timezone import now_ist
@@ -79,6 +81,8 @@ class MarketDataEngine:
         self.strategy = load_registry().get("S000")
         logger.info("Strategy %s v%s (%s), fingerprint %s", self.strategy.id, self.strategy.version,
                     self.strategy.status, self.strategy.fingerprint())
+        # Live decision journal (observe-only; never changes a decision): data/market.duckdb tables
+        self.journal = JournalRecorder(JournalStore(self.store), self.strategy)
         self.technical_engine = TechnicalAnalysisEngine(
             primary_index=settings.PRIMARY_INDEX,
             primary_futures="NSE:NIFTY26NOVFUT",
@@ -198,6 +202,8 @@ class MarketDataEngine:
 
     def _on_paper_trade_event(self, ev: Dict[str, Any]) -> None:
         """Callback on simulated paper execution fills and position closures."""
+        if hasattr(self, "journal"):
+            self.journal.on_trade_event(ev, self._journal_context())
         if ev.get("event") == "ORDER_FILLED":
             print(
                 f"\n{'#'*78}\n"
@@ -471,6 +477,48 @@ class MarketDataEngine:
             f"{ema9_str}{atr_str}{vwap_str}{rsi_str}{rvol_str}{sr_str}"
         )
 
+    def _journal_context(self) -> Dict[str, Any]:
+        """Live-only context recorded with each journal event."""
+        sym, age = self._worst_signal_feed_age()
+        readiness = getattr(getattr(self, "paper_engine", None), "system_readiness", None)
+        return {"readiness": getattr(readiness, "value", readiness), "worst_feed_symbol": sym,
+                "worst_feed_age_s": round(age, 2) if age is not None else None}
+
+    def _tracking_contract(self, candidate: TechnicalCandidate, decision: Optional[Dict[str, Any]]) -> "tuple":
+        """The option contract to follow after a candidate: the one the paper engine chose/considered,
+        else the selector's choice, else the nearest-expiry ATM CE (bullish) / PE (bearish)."""
+        if decision and decision.get("contract"):
+            return decision["contract"], "paper_engine"
+        da = getattr(candidate, "derivatives_assessment", None)
+        sc = getattr(da, "selected_contract", None) if da is not None else None
+        if sc is not None:
+            return sc.symbol, "contract_selector"
+        try:
+            expiries = self.master.get_active_expiries("NIFTY")
+            if expiries:
+                atm = round(candidate.entry_price / 50.0) * 50.0
+                ot = OptionType.CE if candidate.direction.value == "BULLISH" else OptionType.PE
+                return self.master.resolve_option("NIFTY", expiries[0], atm, ot).symbol, "atm_fallback"
+        except Exception as e:
+            logger.warning("journal: no ATM contract for tracking: %s", e)
+        return None, "none"
+
+    def _journal_candidate(self, candidate: TechnicalCandidate) -> None:
+        """Record the candidate + entry decision and pin an option contract for premium tracking."""
+        decision = getattr(getattr(self, "paper_engine", None), "last_decision", None)
+        ctx = self._journal_context()
+        self.journal.on_candidate(candidate, decision, ctx)
+        contract, source = self._tracking_contract(candidate, decision)
+        if not contract:
+            return
+        quote = self._get_live_quote(contract)  # one non-blocking REST call through the shared limiter
+        if self.journal.track_option(candidate, contract, quote, source) and contract not in self.subscribed_option_symbols:
+            try:
+                self.ws_client.subscribe([contract])
+                self.subscribed_option_symbols.add(contract)
+            except Exception as e:
+                logger.warning("journal: could not subscribe %s for tracking: %s", contract, e)
+
     def _on_setup_candidate(self, setup: BreakoutContext, snap: TechnicalSnapshot) -> None:
         """Invoked when a high-probability technical breakout & retest completes.
 
@@ -486,6 +534,7 @@ class MarketDataEngine:
                 f"(confirmation only; trades come from NIFTY spot setups)"
             )
             return
+        self.journal.on_setup(setup, snap, self._journal_context())
         key = (snap.symbol, snap.timeframe, snap.timestamp, setup.direction.value)
         if key in self._alerted_setups:
             self._alerted_setups[key].append(setup.level_id)
@@ -565,6 +614,10 @@ class MarketDataEngine:
                         print(f"  [PAPER ENGINE] Subscribed to live WebSocket feed for {paper_pos.symbol}")
                     except Exception as e:
                         print(f"  [PAPER ENGINE] Failed to subscribe to {paper_pos.symbol}: {e}")
+        try:
+            self._journal_candidate(candidate)
+        except Exception as e:  # the journal never interrupts trading
+            logger.warning("journal: candidate recording failed: %s", e)
 
     def _get_initial_spot(self) -> float:
         """Determines reference NIFTY spot price from fresh DB records, live REST quotes, or master."""
@@ -738,7 +791,9 @@ class MarketDataEngine:
                     except LookupError:
                         pass
 
-            to_unsubscribe = (self.subscribed_option_symbols - new_opt_symbols) - self.active_paper_trade_symbols
+            # contracts pinned for journal premium tracking stay subscribed until their window ends
+            tracked = set(self.journal.journal.active_tracking(now_ist())) if hasattr(self, "journal") else set()
+            to_unsubscribe = (self.subscribed_option_symbols - new_opt_symbols) - self.active_paper_trade_symbols - tracked
             to_subscribe = new_opt_symbols - self.subscribed_option_symbols
 
             if to_unsubscribe:

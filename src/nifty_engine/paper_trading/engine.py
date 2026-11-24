@@ -16,6 +16,7 @@ from nifty_engine.analysis.derivatives.cost_model import PremiumCostModel
 from nifty_engine.analysis.technical.multi_timeframe import TechnicalCandidate
 from nifty_engine.core.calendar import ExchangeCalendar
 from nifty_engine.core.interfaces import Candle, IStorageEngine, SystemReadiness, Tick
+from nifty_engine.journal.codes import EntryDecision
 from nifty_engine.paper_trading.models import (
     ExitReason,
     OrderSide,
@@ -108,6 +109,9 @@ class PaperTradingEngine:
 
         # In-memory position and order storage
         self.active_positions: Dict[str, PaperPosition] = {}  # position_id -> PaperPosition
+        # Outcome of the most recent process_technical_candidate() call, for the live journal:
+        # {"candidate_id", "code" (journal.codes.EntryDecision), "detail", "contract", ["position_id"]}
+        self.last_decision: Optional[Dict[str, Any]] = None
         self.closed_positions: List[PaperPosition] = []
         self.orders: Dict[str, PaperOrder] = {}  # order_id -> PaperOrder
         self.subscribed_option_symbols: Set[str] = set()
@@ -144,13 +148,17 @@ class PaperTradingEngine:
 
         and executes a simulated market BUY order if all risk gates pass.
         """
+        # Journal: the outcome of THIS evaluation (stable code + detail), observe-only.
+        self.last_decision = {"candidate_id": candidate.candidate_id, "code": EntryDecision.NOT_EVALUATED.value,
+                              "detail": ""}
+
         # 0. System Readiness Gate: Fail-closed, entries strictly require READY
         if self.system_readiness != SystemReadiness.READY:
             logger.warning(
                 "Paper entry rejected: System readiness is %s (entries strictly require READY)",
                 self.system_readiness.value,
             )
-            return None
+            return self._reject(EntryDecision.READINESS_NOT_READY, f"readiness {self.system_readiness.value}")
 
         now = (
             current_time
@@ -165,7 +173,7 @@ class PaperTradingEngine:
         if self.calendar:
             if not self.calendar.is_market_open(now, is_derivative=True):
                 logger.info("Paper entry rejected: Market is closed (%s)", now)
-                return None
+                return self._reject(EntryDecision.MARKET_CLOSED, str(now))
 
             now_ist_dt = to_ist(now) if now else now_ist()
             current_date = now_ist_dt.date()
@@ -176,27 +184,27 @@ class PaperTradingEngine:
                 cutoff_t = (end_dt - timedelta(minutes=15)).time()
                 if t >= cutoff_t:
                     logger.info("Paper entry rejected: After special session cutoff (%s >= %s)", t, cutoff_t)
-                    return None
+                    return self._reject(EntryDecision.SPECIAL_SESSION_CUTOFF, f"{t} >= {cutoff_t}")
             else:
                 if t < self.market_open_time:
                     logger.info("Paper entry rejected: Market not yet open (%s)", t)
-                    return None
+                    return self._reject(EntryDecision.BEFORE_MARKET_OPEN, str(t))
                 if t >= self.no_new_entries_time:
                     logger.info("Paper entry rejected: After no-new-entries cutoff (%s >= %s)", t, self.no_new_entries_time)
-                    return None
+                    return self._reject(EntryDecision.AFTER_ENTRY_CUTOFF, f"{t} >= {self.no_new_entries_time}")
         else:
             if t < self.market_open_time:
                 logger.info("Paper entry rejected: Market not yet open (%s)", t)
-                return None
+                return self._reject(EntryDecision.BEFORE_MARKET_OPEN, str(t))
             if t >= self.no_new_entries_time:
                 logger.info("Paper entry rejected: After no-new-entries cutoff (%s >= %s)", t, self.no_new_entries_time)
-                return None
+                return self._reject(EntryDecision.AFTER_ENTRY_CUTOFF, f"{t} >= {self.no_new_entries_time}")
 
         # 2. Candidate prerequisites
         da = getattr(candidate, "derivatives_assessment", None)
         if da is None or getattr(da, "selected_contract", None) is None:
             logger.info("Paper entry rejected: No derivatives contract selected for candidate %s", candidate.candidate_id)
-            return None
+            return self._reject(EntryDecision.NO_CONTRACT_SELECTED, "")
 
         contract = da.selected_contract
 
@@ -209,7 +217,9 @@ class PaperTradingEngine:
                 costs.net_rr_t1,
                 self.min_net_rr,
             )
-            return None
+            return self._reject(EntryDecision.NET_RR_BELOW_MIN,
+                                f"{contract.symbol} net R:R {costs.net_rr_t1} (viable={costs.is_cost_viable}) "
+                                f"< {self.min_net_rr}", contract.symbol)
 
         # 4. Quote freshness gate
         if contract.quote_age_seconds > self.max_quote_age_seconds:
@@ -218,7 +228,8 @@ class PaperTradingEngine:
                 contract.quote_age_seconds,
                 self.max_quote_age_seconds,
             )
-            return None
+            return self._reject(EntryDecision.STALE_OPTION_QUOTE,
+                                f"{contract.symbol} quote age {contract.quote_age_seconds:.1f}s", contract.symbol)
 
         # 5. Position limit gate (concurrency)
         underlying = contract.underlying
@@ -231,7 +242,8 @@ class PaperTradingEngine:
                 self.max_open_positions,
                 underlying,
             )
-            return None
+            return self._reject(EntryDecision.MAX_OPEN_POSITIONS, f"{underlying} max {self.max_open_positions}",
+                                contract.symbol)
 
         # 5b. One position per underlying per direction. Two levels confirming on the same bar
         # produce two candidates (distinct level_ids) for ONE price move; entering both
@@ -245,13 +257,13 @@ class PaperTradingEngine:
                 "Paper entry rejected: %s %s position already open (%s)",
                 underlying, contract.option_type, same_direction[0].symbol,
             )
-            return None
+            return self._reject(EntryDecision.SAME_DIRECTION_OPEN, f"open {same_direction[0].symbol}", contract.symbol)
 
         # 5c. Session risk limits: trade count, realized daily loss, losing-streak cooldown
         risk_block = self._session_risk_block(now)
         if risk_block:
             logger.info("Paper entry rejected: %s", risk_block)
-            return None
+            return self._reject(EntryDecision.SESSION_RISK_LIMIT, risk_block, contract.symbol)
 
         # 6. Resolve lot size & quantity
         lot_size = self.cost_model.get_lot_size(
@@ -362,7 +374,16 @@ class PaperTradingEngine:
                 "costs": entry_costs["total_costs"],
             })
 
+        self.last_decision = {"candidate_id": candidate.candidate_id, "code": EntryDecision.ACCEPTED.value,
+                              "detail": f"filled {fill_price}", "contract": contract.symbol,
+                              "position_id": position_id}
         return position
+
+    def _reject(self, code: "EntryDecision", detail: str, contract: Optional[str] = None) -> None:
+        """Record why the current candidate was not entered (journal), then decline it."""
+        self.last_decision = {**(self.last_decision or {}), "code": code.value, "detail": detail,
+                              "contract": contract}
+        return None
 
     def _session_risk_block(self, now: datetime) -> Optional[str]:
         """Return a reason string if session-level risk limits forbid a new entry, else None."""
