@@ -70,7 +70,9 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     meta = {"preregistration": str(PREREG), "prereg_commit": commit, "code_commit": _git_commit(),
             "feature_manifest": {k: man[k] for k in ("dataset_fingerprint", "feature_version", "git_commit")},
-            "generated_at": datetime.now().isoformat(timespec="seconds"), "primary": primary}
+            "generated_at": datetime.now().isoformat(timespec="seconds"), "primary": primary,
+            "strategy_fingerprint": man["strategy"]["fingerprint"],
+            "inference": reg.get("inference", "permutation_opportunity")}
 
     if a.stage == "selection":
         lo, hi = (str(date.fromisoformat(str(x))) for x in reg["split"]["selection"])
@@ -93,13 +95,28 @@ def main():
     hold_path = OUT / "P3C_v1_holdout.json"
     if hold_path.exists() and not a.force:
         raise SystemExit(f"holdout already evaluated ({hold_path}); it is evaluated once. --force re-runs and is recorded.")
+    tracked = subprocess.run(["git", "ls-files", "--error-unmatch", str(sel_path)], capture_output=True).returncode == 0
+    sel_dirty = subprocess.run(["git", "status", "--porcelain", "--", str(sel_path)], capture_output=True,
+                               text=True).stdout.strip()
+    if not tracked or sel_dirty:
+        raise SystemExit(f"{sel_path} must be committed and unchanged before the holdout is opened")
     sel = json.loads(sel_path.read_text())
+    problems = p3.check_selection_report(sel, reg, commit, man)
+    if problems:
+        raise SystemExit("selection report does not belong to this pre-registration: " + "; ".join(problems))
     gated = [k for k, v in sel["results"].items() if v["gate_passed"]]
     lo, hi = (str(date.fromisoformat(str(x))) for x in reg["split"]["holdout"])
     res = p3.evaluate(df[(df["day"] >= lo) & (df["day"] <= hi)], primary, target)
     res = {k: v for k, v in res.items() if k in gated}
-    pvals = {k: p3.permutation_p(v["_hits"], v["_mask"], v["predicts"]) for k, v in res.items()
-             if v["pass"]["n"] and v["fail"]["n"]}
+    # inference method is part of the pre-registration (v1: opportunity-level permutation; later
+    # studies should pre-register "day_block_bootstrap", which respects same-day dependence)
+    method = reg.get("inference", "permutation_opportunity")
+    if method == "day_block_bootstrap":
+        pvals = {k: p3.day_block_p(v["_hits"], v["_mask"], v["_days"], v["predicts"]) for k, v in res.items()
+                 if v["pass"]["n"] and v["fail"]["n"]}
+    else:
+        pvals = {k: p3.permutation_p(v["_hits"], v["_mask"], v["predicts"]) for k, v in res.items()
+                 if v["pass"]["n"] and v["fail"]["n"]}
     adj = p3.holm(pvals) if pvals else {}
     for k, v in res.items():
         v["p_one_sided"] = pvals.get(k)

@@ -54,3 +54,49 @@ def test_preregistration_file_parses_and_matches_the_code():
     assert set(reg["hypotheses"]) == set(p3.PREDICTS)
     assert {k: v["predicts"] for k, v in reg["hypotheses"].items()} == p3.PREDICTS
     assert reg["outcome"]["primary"] == "T30_S20_H60" and len(reg["procedure"]) == 5
+
+
+def _reg():
+    return {"outcome": {"primary": "T30_S20_H60"}, "dataset_fingerprint": "ds", "feature_version": 3,
+            "strategy": {"fingerprint": "sf"}, "split": {"selection": ["2025-12-29", "2026-08-31"]}}
+
+
+def _sel(**meta):
+    m = {"prereg_commit": "abc", "primary": "T30_S20_H60", "strategy_fingerprint": "sf",
+         "feature_manifest": {"dataset_fingerprint": "ds", "feature_version": 3}}
+    m.update(meta)
+    return {"stage": "selection", "range": ["2025-12-29", "2026-08-31"], "meta": m}
+
+
+def test_holdout_only_accepts_a_selection_report_from_the_same_preregistration():
+    man = {"dataset_fingerprint": "ds"}
+    assert p3.check_selection_report(_sel(), _reg(), "abc", man) == []
+    assert any("pre-registration" in x for x in p3.check_selection_report(_sel(), _reg(), "zzz", man))
+    assert any("primary" in x for x in p3.check_selection_report(_sel(primary="T40_S20_H60"), _reg(), "abc", man))
+    assert any("strategy" in x for x in p3.check_selection_report(_sel(strategy_fingerprint="old"), _reg(), "abc", man))
+    assert any("current" in x for x in p3.check_selection_report(_sel(), _reg(), "abc", {"dataset_fingerprint": "new"}))
+    other_range = {**_sel(), "range": ["2026-01-01", "2026-08-31"]}
+    assert any("range" in x for x in p3.check_selection_report(other_range, _reg(), "abc", man))
+
+
+def test_day_block_p_respects_same_day_dependence():
+    # strong effect spread over many days -> small p
+    hits, mask, days = [], [], []
+    for d in range(20):
+        hits += [True, False]
+        mask += [True, False]
+        days += [f"d{d}", f"d{d}"]
+    assert p3.day_block_p(hits, mask, days, "higher", n=2000) < 0.01
+    # no effect on 20 ordinary days, plus ONE day contributing 20 correlated "pass" wins: opportunity-level
+    # permutation treats those 8 as independent evidence; resampling whole days does not
+    hits, mask, days = [], [], []
+    for d in range(20):
+        hits += [d % 2 == 0, d % 2 == 1]
+        mask += [True, False]
+        days += [f"d{d}", f"d{d}"]
+    hits += [True] * 20
+    mask += [True] * 20
+    days += ["X"] * 20
+    p_perm = p3.permutation_p(hits, mask, "higher", n=4000)
+    p_day = p3.day_block_p(hits, mask, days, "higher", n=4000)
+    assert p_perm < 0.05 and p_day > 0.15  # 'significant' only if same-day trades were independent

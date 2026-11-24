@@ -56,7 +56,8 @@ def evaluate(df: pd.DataFrame, primary: str, target: float) -> Dict[str, Dict[st
         diff = (g_pass["hit_pct"] - g_fail["hit_pct"]) if g_pass["n"] and g_fail["n"] else None
         res[name] = {"predicts": PREDICTS[name], "pass": g_pass, "fail": g_fail,
                      "hit_diff_pp": round(diff, 1) if diff is not None else None,
-                     "unavailable": int((~known).sum()), "_hits": h.tolist(), "_mask": mk.tolist()}
+                     "unavailable": int((~known).sum()), "_hits": h.tolist(), "_mask": mk.tolist(),
+                     "_days": executed.loc[known, "day"].astype(str).tolist() if "day" in executed else []}
     return res
 
 
@@ -104,3 +105,51 @@ def gate(r: Dict[str, Any]) -> bool:
     if r["pass"]["n"] < MIN_GATE_GROUP or r["fail"]["n"] < MIN_GATE_GROUP or r["hit_diff_pp"] is None:
         return False
     return r["hit_diff_pp"] > 0 if r["predicts"] == "higher" else r["hit_diff_pp"] < 0
+
+
+def day_block_p(hits: List[bool], mask: List[bool], days: List[str], predicts: str, n: int = PERMUTATIONS,
+                seed: int = SEED) -> float:
+    """Day-aware one-sided p-value: resample whole trading DAYS with replacement (opportunities on one day
+    share market conditions) and report the share of resamples whose pass-minus-fail difference is not in
+    the predicted direction. Resamples lacking either group are skipped."""
+    rng = random.Random(seed)
+    by_day: Dict[str, List[tuple]] = {}
+    for h, m, d in zip(hits, mask, days):
+        by_day.setdefault(d, []).append((h, m))
+    keys = sorted(by_day)
+    sign = 1 if predicts == "higher" else -1
+    bad = total = 0
+    for _ in range(n):
+        rows = [x for d in (rng.choice(keys) for _ in keys) for x in by_day[d]]
+        a = [h for h, m in rows if m]
+        b = [h for h, m in rows if not m]
+        if not a or not b:
+            continue
+        total += 1
+        if sign * (sum(a) / len(a) - sum(b) / len(b)) <= 0:
+            bad += 1
+    return bad / total if total else 1.0
+
+
+def check_selection_report(sel: Dict[str, Any], reg: Dict[str, Any], prereg_commit: str,
+                           feature_manifest: Dict[str, Any]) -> List[str]:
+    """The holdout may only use a selection report produced from this exact pre-registration, data,
+    strategy, primary outcome and selection range."""
+    m = sel.get("meta", {})
+    problems = []
+    if sel.get("stage") != "selection":
+        problems.append("not a selection report")
+    if m.get("prereg_commit") != prereg_commit:
+        problems.append(f"selection used pre-registration {m.get('prereg_commit')}, current is {prereg_commit}")
+    if m.get("primary") != reg["outcome"]["primary"]:
+        problems.append(f"primary outcome {m.get('primary')} != {reg['outcome']['primary']}")
+    fm = m.get("feature_manifest", {})
+    if fm.get("dataset_fingerprint") != reg["dataset_fingerprint"] or fm.get("feature_version") != reg["feature_version"]:
+        problems.append("selection feature dataset/version differs from the pre-registration")
+    if fm.get("dataset_fingerprint") != feature_manifest.get("dataset_fingerprint"):
+        problems.append("selection feature dataset differs from the current one")
+    if m.get("strategy_fingerprint") != reg["strategy"]["fingerprint"]:
+        problems.append(f"selection strategy {m.get('strategy_fingerprint')} != {reg['strategy']['fingerprint']}")
+    if [str(x) for x in sel.get("range", [])] != [str(x) for x in reg["split"]["selection"]]:
+        problems.append(f"selection range {sel.get('range')} != pre-registered {reg['split']['selection']}")
+    return problems
