@@ -34,3 +34,6 @@ fyersRequests.log
 
 # Daily live journal: the readable .md reports are committed; full-detail .json stays local
 journal/**/*.json
+
+# Build metadata from pip install -e
+*.egg-info/

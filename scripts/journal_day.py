@@ -41,10 +41,33 @@ OUT_DIR = Path("journal")
 WINDOW_DAYS = 30
 
 
+def refresh_start(day: date, db_path: Path) -> date:
+    """First day of the history window to download and validate for `day`.
+
+    The daily history DB accumulates bars across refreshes, and the replay requires the manifest to
+    cover everything from the DB's earliest 1m bar. A window of only the last WINDOW_DAYS would leave
+    older bars from earlier refreshes outside the manifest, and the replay would refuse to run. So the
+    window starts at whichever is earlier: WINDOW_DAYS before `day`, or the DB's earliest 1m bar.
+    """
+    start = day - timedelta(days=WINDOW_DAYS)
+    if db_path.exists():
+        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            row = con.execute("SELECT min(CAST(ts AS DATE)) FROM hist_bars WHERE resolution = '1'").fetchone()
+        except duckdb.Error:
+            row = None
+        finally:
+            con.close()
+        if row and row[0] is not None:
+            start = min(start, row[0])
+    return start
+
+
 def refresh(day: date) -> None:
     DAILY_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, "scripts/build_history.py", "--start", (day - timedelta(days=WINDOW_DAYS)).isoformat(),
-           "--end", day.isoformat(), "--db", str(DAILY_DIR / "history.duckdb"),
+    db_path = DAILY_DIR / "history.duckdb"
+    cmd = [sys.executable, "scripts/build_history.py", "--start", refresh_start(day, db_path).isoformat(),
+           "--end", day.isoformat(), "--db", str(db_path),
            "--manifest", str(DAILY_DIR / "manifest.json")]
     print("refreshing history window:", " ".join(cmd[1:]))
     rc = subprocess.run(cmd).returncode
