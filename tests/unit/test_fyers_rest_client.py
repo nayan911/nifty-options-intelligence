@@ -247,7 +247,9 @@ def test_fyers_option_chain_parser_synchronization_and_timestamp_provenance():
     # Must NOT assume synchronization by default
     assert snap_prod.is_synchronized_snapshot is False
 
-    t0 = snap_prod.api_timestamp
+    # The payload carries no server time, so the parser stamps the real receipt time. Pin it to the
+    # test's clock: otherwise the 26-Nov-2026 expiry counts as expired once the suite runs after that date.
+    snap_prod.api_timestamp = t0
 
     oi_analyzer = OpenInterestAnalyzer()
     profile = oi_analyzer.on_option_chain(snap_prod)
@@ -318,6 +320,7 @@ def test_fyers_option_chain_parser_synchronization_and_timestamp_provenance():
         ],
     }
     snap_explicit = FyersRestClient.parse_option_chain_payload(payload_with_ts, "NSE:NIFTY50-INDEX")
+    snap_explicit.api_timestamp = t0 + timedelta(seconds=1)
     profile_explicit = oi_analyzer.on_option_chain(snap_explicit)
     assert profile_explicit.strikes[25100.0].call_greeks_provenance == "EXPLICIT"
     assert profile_explicit.strikes[25100.0].call_greeks_timestamp is not None
@@ -361,6 +364,9 @@ def test_timestampless_option_chain_rejected_unless_quote_refreshed():
 
     snap = FyersRestClient.parse_option_chain_payload(payload, "NSE:NIFTY50-INDEX")
     assert snap.is_synchronized_snapshot is False
+    # The payload carries no server time, so the parser stamps the real receipt time. Pin it to the
+    # test's clock: otherwise the 26-Nov-2026 expiry counts as expired once the suite runs after that date.
+    snap.api_timestamp = now
 
     analyzer = OpenInterestAnalyzer()
     profile = analyzer.on_option_chain(snap)

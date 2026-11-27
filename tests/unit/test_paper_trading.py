@@ -26,6 +26,19 @@ from nifty_engine.paper_trading.models import ExitReason, OrderSide, PositionSta
 IST = pytz.timezone("Asia/Kolkata")
 
 
+@pytest.fixture
+def clock_on_test_session(monkeypatch):
+    """Pin the engine's wall clock to the morning of the tests' trading day (26-Nov-2026).
+
+    On restart the engine closes positions opened before today's date (missed EOD square-off).
+    Recovery tests open positions on 26-Nov-2026, so with the real clock they would be closed as
+    stale once the suite runs on any later date.
+    """
+    fixed = IST.localize(datetime(2026, 11, 26, 9, 15, 0))
+    monkeypatch.setattr("nifty_engine.paper_trading.engine.now_ist", lambda: fixed)
+    return fixed
+
+
 @pytest.fixture(autouse=True)
 def default_paper_engine_ready(monkeypatch, request):
     """In unit tests focusing on execution/fills/P&L, default engine to READY,
@@ -869,7 +882,7 @@ def test_tick_freshness_uses_receipt_time_vs_exchange_time():
     assert events == []
 
 
-def test_duckdb_recovery_restores_pending_triggers_quotes_and_trades(tmp_path):
+def test_duckdb_recovery_restores_pending_triggers_quotes_and_trades(tmp_path, clock_on_test_session):
     """Verify DuckDB state recovery restores pending exit triggers, quotes, and execution trades."""
     db_file = str(tmp_path / "paper_recovery_hardening.duckdb")
     store = DuckDBStore(db_path=db_file)
@@ -1128,7 +1141,7 @@ def test_atm_rotation_derives_protected_symbols_from_paper_engine():
     store.close()
 
 
-def test_one_lot_target1_and_pending_triggers_survive_restart(tmp_path):
+def test_one_lot_target1_and_pending_triggers_survive_restart(tmp_path, clock_on_test_session):
     """Verify 1-lot Target 1 breakeven SL and pending exit triggers survive engine restart."""
     db_file = str(tmp_path / "paper_1lot_pending.duckdb")
     store = DuckDBStore(db_path=db_file)
@@ -1200,7 +1213,7 @@ def test_one_lot_target1_and_pending_triggers_survive_restart(tmp_path):
     store.close()
 
 
-def test_recovered_open_positions_included_in_runner_initial_watchlist():
+def test_recovered_open_positions_included_in_runner_initial_watchlist(clock_on_test_session):
     """Verify runner _build_watchlist includes symbols for recovered open positions outside current ATM."""
     from run_market_data import MarketDataEngine
 
@@ -1380,7 +1393,7 @@ def test_ltp_only_ticks_do_not_refresh_bid_freshness():
     assert p.last_bid_time == t2
 
 
-def test_duckdb_stores_and_recovers_bid_ask_timestamps(tmp_path):
+def test_duckdb_stores_and_recovers_bid_ask_timestamps(tmp_path, clock_on_test_session):
     """Verify last_bid_time and last_ask_time persist and recover accurately in DuckDB."""
     db_file = str(tmp_path / "test_bid_ask_recovery.duckdb")
     store = DuckDBStore(db_path=db_file)
